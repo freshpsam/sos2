@@ -38,8 +38,8 @@ static struct framebuffer screen;
  * the whole chip sleeps 10 s at a time (chip_sleep.c; 1 s polls where it
  * cannot), and a press or release wakes it at once. While it sleeps, the
  * panel's, touch controller's and motion sensor's supply (L17) is off
- * (rails.c), so waking puts the motion sensor back to sleep. The battery's
- * current is averaged meanwhile. The next tap wakes the system with a full
+ * (rails.c), so waking puts the motion sensor back to sleep. The battery
+ * gauge is not read meanwhile. The next tap wakes the system with a full
  * redraw. */
 enum {
     STANDBY_POLL_US = 20000,
@@ -240,7 +240,8 @@ void kernel_main(const void *dtb) {
 #ifdef SOS2_BOARD_REDMI2
         enum phone_input_source source = PHONE_INPUT_TOUCH;
         if (phone_input_poll(&event, &source)) {
-            if (source == PHONE_INPUT_BACK_PRESS) haptics_tap();
+            if (source == PHONE_INPUT_KEY_PRESS) haptics_tap();
+            else if (source == PHONE_INPUT_HOME) page_host_home();
             else if (source == PHONE_INPUT_BACK) page_host_back();
             else page_host_input(&event);
         }

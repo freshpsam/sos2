@@ -114,10 +114,12 @@ header above a 480×752 page surface.
 
 - The desktop shows status lines, **WI-FI** and **UPDATES**, the address
   field with **Open**, the open pages and, at the bottom, the **Apps**
-  launcher.
-- A page's header has **Desktop** and **Close**, the UTC time and the
-  battery. Back (Alt+Left in QEMU) goes back in the page's history; in an app
-  it returns to the desktop unless the app takes it (`sos2_back_key`).
+  launcher, with room for all ten apps in two rows of five.
+- A page's header has **Close**, the UTC time and the battery. Home (Alt+Home
+  in QEMU) shows the desktop from a page, an app or the Wi-Fi screen. Back
+  (Alt+Left in QEMU) goes back within what is shown, never to the desktop: in
+  a page's history, in an app only if the app takes it (`sos2_back_key`), and
+  on the Wi-Fi screen from a network to the list.
 - Dragging scrolls; a movement of up to six pixels is a tap. On the phone,
   buttons and keys give a 15 ms buzz (`kernel/protection/haptics.c`).
 - Header, keyboard and desktop input, including Wi-Fi passwords, never
@@ -145,8 +147,7 @@ keep running. On the phone each device powers down as Linux and the vendor
 kernel do it: the display pipeline and panel, the touch controller, Wi-Fi's
 radio, the GPU, the secondary cores (the cluster slows to 200 MHz), and the
 whole chip between 1 s polls of the power key, with the PMIC rails lowered
-through the RPM. Standby draws 6.0 mA, about two weeks on the battery; the
-desktop shows the last standby's average current.
+through the RPM. Standby draws 6.0 mA, about two weeks on the battery.
 
 ## Time
 

@@ -8,8 +8,9 @@ It runs in QEMU and on the Xiaomi Redmi 2 (MSM8916, WT88047).
 The desktop is the browser shell: **WI-FI** and **UPDATES** buttons, an
 address field with **Open** above the open pages, an **Apps** launcher and a
 touch keyboard. Each page or app is an isolated process. A page's header has
-**Desktop**, **Close**, the UTC time and the battery; the phone's Back key
-(Alt+Left in QEMU) goes back and the power button toggles standby.
+**Close**, the UTC time and the battery; the phone's Home key (Alt+Home in
+QEMU) shows the desktop, its Back key (Alt+Left in QEMU) goes back but never
+to the desktop, and the power button toggles standby.
 
 Pages run HTML, CSS, JavaScript, images, CJK text and emoji over verified
 HTTPS, with cookies and web storage, drawn by Skia on the CPU (or the GPU with

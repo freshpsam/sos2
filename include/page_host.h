@@ -7,10 +7,15 @@
 void page_host_init(struct framebuffer *screen);
 bool page_host_input(const struct pointer_event *event);
 void page_host_keyboard(const struct user_input_event *event);
-/* The phone's Back key: a page or app that asked for it gets key 158;
- * otherwise a page goes back in its history, if it has any, and an app
- * returns to the desktop. Nothing happens on the desktop. */
+/* The phone's Back key, which never returns to the desktop: a page or app
+ * that asked for it gets key 158; otherwise a page goes back in its history,
+ * if it has any, and an app is left as it is. On the Wi-Fi screen a
+ * network's page returns to the list (desktop_wifi.h); nothing else happens
+ * on the desktop. */
 void page_host_back(void);
+/* The phone's Home key: the desktop, from a page, an app or the Wi-Fi
+ * screen; pages keep running. */
+void page_host_home(void);
 void page_host_wheel(const struct pointer_event *point, int32_t dx, int32_t dy);
 void page_host_render(void);
 int32_t page_host_present(unsigned slot, const struct vm_space *space, uint32_t address,

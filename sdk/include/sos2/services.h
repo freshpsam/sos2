@@ -32,7 +32,8 @@ int sos2_input_method(int enabled);
 /* Take the Back key (the phone's key below the display; Alt+Left in QEMU):
  * 1 delivers it as an INPUT_KEY press and release of code 158 (KEY_BACK).
  * 0, the default for every new process, leaves it to the desktop: a page
- * goes back in its history and an app returns to the desktop. */
+ * goes back in its history and an app gets nothing. Back never returns to
+ * the desktop; Home does. */
 int sos2_back_key(int enabled);
 /* A short buzz of the phone's vibrator (QEMU has none), for a finger landing
  * on one of the app's own buttons: once for each press the app was sent (four

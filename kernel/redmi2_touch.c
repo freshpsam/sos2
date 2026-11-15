@@ -19,12 +19,14 @@
  * https://www.androidheadlines.com/2015/02/featured-review-xiaomi-redmi-2-prince-pauper.html
  *
  * This is a single-pointer consumer, not a multitouch gesture engine; of the
- * keys, only Back is reported: as a finger lands on it, for feedback
- * (redmi2_touch_back_pressed), and as a tap (redmi2_touch_back). Firmware
- * model IDs are unreliable; successful reads establish a compatible report
- * layout, not an exact IC identity. M06 and the axis-swapped EV layout are not
- * silently treated as standard FT data. The only controller register write is
- * standby's hibernate request.
+ * keys, Home and Back are reported: as a finger lands on one, for feedback
+ * (redmi2_touch_key_pressed), and as a tap (redmi2_touch_key_tapped). No
+ * source gives the keys' contact positions; Back is the right third of the
+ * row, as taps on the handset confirmed, so Home is taken as the middle one.
+ * Firmware model IDs are unreliable; successful reads establish a compatible
+ * report layout, not an exact IC identity. M06 and the axis-swapped EV layout
+ * are not silently treated as standard FT data. The only controller register
+ * write is standby's hibernate request.
  */
 
 #include "platform.h"
@@ -39,7 +41,8 @@ enum {
     PREFIX_BYTES = 3 + PREFIX_RECORDS * 6,
     SENSOR_WIDTH = 720,
     SENSOR_HEIGHT = 1280,
-    /* Three keys share the width below the display; Back is the right one. */
+    /* Three keys share the width below the display: Menu, Home and Back. */
+    HOME_KEY_LEFT = SENSOR_WIDTH / 3,
     BACK_KEY_LEFT = SENSOR_WIDTH * 2 / 3,
     SAMPLE_INTERVAL_US = 8000,
     IDLE_INTERVAL_US = 50000,
@@ -64,11 +67,11 @@ static bool available, wait_for_all_up, down;
 static bool suspended, hibernating;
 static uint64_t start_after; /* After waking from hibernation: no reads before. */
 static uint8_t tracked_id;
-/* A contact that began below the display, whether it began on Back and has
+/* A contact that began below the display, the key it began on if it has
  * stayed there with nothing on the display, and its start and a finished tap
  * not yet taken. */
 static uint8_t key_id;
-static bool key_back, back_pressed, back_tapped;
+static enum redmi2_touch_key key, key_pressed, key_tapped;
 static uint16_t present; /* Contacts in the last valid report. */
 static unsigned failures;
 static uint32_t display_width, display_height, pointer_x, pointer_y;
@@ -154,8 +157,11 @@ static uint32_t scale_coordinate(uint16_t value, uint32_t extent, uint32_t senso
     return (uint32_t)((uint64_t)value * (extent - 1) / (sensor_extent - 1));
 }
 
-static bool back_key(uint16_t x, uint16_t y) {
-    return y >= SENSOR_HEIGHT && x >= BACK_KEY_LEFT && x < SENSOR_WIDTH;
+static enum redmi2_touch_key key_at(uint16_t x, uint16_t y) {
+    if (y < SENSOR_HEIGHT || x >= SENSOR_WIDTH) return REDMI2_TOUCH_NO_KEY;
+    return x >= BACK_KEY_LEFT   ? REDMI2_TOUCH_BACK
+           : x >= HOME_KEY_LEFT ? REDMI2_TOUCH_HOME
+                                : REDMI2_TOUCH_NO_KEY; /* Menu: unused */
 }
 
 /* A finger on the display or a key: reports must keep arriving. */
@@ -166,7 +172,7 @@ static bool cancel(struct pointer_event *event) {
     down = false;
     tracked_id = NO_CONTACT;
     key_id = NO_CONTACT;
-    key_back = false;
+    key = REDMI2_TOUCH_NO_KEY;
     wait_for_all_up = true;
     if (had_pointer) {
         *event = (struct pointer_event){
@@ -190,7 +196,7 @@ bool redmi2_touch_init(uint32_t width, uint32_t height) {
     suspended = hibernating = false;
     start_after = 0;
     key_id = NO_CONTACT;
-    key_back = back_pressed = back_tapped = false;
+    key = key_pressed = key_tapped = REDMI2_TOUCH_NO_KEY;
     present = 0;
     tracked_id = NO_CONTACT;
     pointer_x = pointer_y = 0;
@@ -225,15 +231,15 @@ bool redmi2_touch_init(uint32_t width, uint32_t height) {
     return true;
 }
 
-bool redmi2_touch_back_pressed(void) {
-    bool pressed = back_pressed;
-    back_pressed = false;
+enum redmi2_touch_key redmi2_touch_key_pressed(void) {
+    enum redmi2_touch_key pressed = key_pressed;
+    key_pressed = REDMI2_TOUCH_NO_KEY;
     return pressed;
 }
 
-bool redmi2_touch_back(void) {
-    bool tapped = back_tapped;
-    back_tapped = false;
+enum redmi2_touch_key redmi2_touch_key_tapped(void) {
+    enum redmi2_touch_key tapped = key_tapped;
+    key_tapped = REDMI2_TOUCH_NO_KEY;
     return tapped;
 }
 
@@ -241,7 +247,7 @@ void redmi2_touch_cancel(void) {
     down = false;
     tracked_id = NO_CONTACT;
     key_id = NO_CONTACT;
-    key_back = back_pressed = back_tapped = false;
+    key = key_pressed = key_tapped = REDMI2_TOUCH_NO_KEY;
     wait_for_all_up = true;
 }
 
@@ -332,11 +338,11 @@ bool redmi2_touch_poll(struct pointer_event *event) {
         /* A finger that slides from the keys onto the display is neither. */
         if (report.active & bit) return cancel(event);
         if (!(report.off_panel & bit)) {
-            if (key_back && !report.count) back_tapped = true;
+            if (key != REDMI2_TOUCH_NO_KEY && !report.count) key_tapped = key;
             key_id = NO_CONTACT;
-            key_back = false;
-        } else if (report.count || !back_key(report.x[key_id], report.y[key_id])) {
-            key_back = false;
+            key = REDMI2_TOUCH_NO_KEY;
+        } else if (report.count || key_at(report.x[key_id], report.y[key_id]) != key) {
+            key = REDMI2_TOUCH_NO_KEY;
         }
     } else if (!down && !report.count) {
         /* A key press starts with a new contact and nothing on the display, so
@@ -345,8 +351,8 @@ bool redmi2_touch_poll(struct pointer_event *event) {
         for (uint8_t id = 0; keys && id < CONTACTS; ++id)
             if (keys & (1u << id)) {
                 key_id = id;
-                key_back = back_key(report.x[id], report.y[id]);
-                if (key_back) back_pressed = true;
+                key = key_at(report.x[id], report.y[id]);
+                if (key != REDMI2_TOUCH_NO_KEY) key_pressed = key;
                 break;
             }
     }

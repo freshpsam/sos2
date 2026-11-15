@@ -4,10 +4,16 @@
 /* Call only after validating the board and framebuffer. */
 bool phone_input_init(uint32_t width, uint32_t height);
 
-/* PHONE_INPUT_BACK_PRESS: a finger landed on the Back key below the display,
- * which is only for feedback, since the tap may not follow; PHONE_INPUT_BACK:
- * a tap of that key. The pointer event is then left unchanged. */
-enum phone_input_source { PHONE_INPUT_TOUCH, PHONE_INPUT_BACK_PRESS, PHONE_INPUT_BACK };
+/* PHONE_INPUT_KEY_PRESS: a finger landed on the Home or Back key below the
+ * display, which is only for feedback, since the tap may not follow;
+ * PHONE_INPUT_HOME, PHONE_INPUT_BACK: a tap of that key. The pointer event
+ * is then left unchanged. */
+enum phone_input_source {
+    PHONE_INPUT_TOUCH,
+    PHONE_INPUT_KEY_PRESS,
+    PHONE_INPUT_HOME,
+    PHONE_INPUT_BACK
+};
 
 bool phone_input_poll(struct pointer_event *, enum phone_input_source *);
 /* Requires a fresh all-up report before the next touch, without touching the

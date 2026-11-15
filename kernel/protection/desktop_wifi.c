@@ -41,8 +41,11 @@ static char ip_address[16];
 static void render_password(struct framebuffer *, unsigned, unsigned);
 static void render_status(struct framebuffer *, unsigned, unsigned);
 
+/* The password row is laid out as the desktop's address row: a 336-pixel
+ * field showing 26 characters, then a 100-pixel Show/Hide button where Open
+ * is. */
 static void redraw_password(void) {
-    page_host_redraw_region(16, DETAIL_PASSWORD_Y, 356, 48, render_password);
+    page_host_redraw_region(16, DETAIL_PASSWORD_Y, 336, 48, render_password);
 }
 
 static void redraw_status(void) {
@@ -166,7 +169,7 @@ static unsigned paging_y(void) {
 static int hit(unsigned x, unsigned y) {
     if (!drawn.valid || x < 16 || x >= 464) return -1;
     if (!drawn.detail) {
-        if (y >= 104 && y < 148) return x < 312 ? SCAN : BACK;
+        if (y >= 104 && y < 148) return SCAN;
         if (drawn.saved && y >= 164 && y < 220) return SAVED;
         /* A short last page puts Previous where later rows would be. */
         if (y >= drawn.top && ((y - drawn.top) % 64) < 56 && (y - drawn.top) / 64 < drawn.rows)
@@ -177,9 +180,9 @@ static int hit(unsigned x, unsigned y) {
         }
     } else {
         if (y >= DETAIL_ACTIONS_Y && y < DETAIL_ACTIONS_Y + 44)
-            return x < 312 ? (drawn.forget ? FORGET : CONNECT) : BACK;
+            return drawn.forget ? FORGET : CONNECT;
         if (y >= DETAIL_PASSWORD_Y && y < DETAIL_PASSWORD_Y + 48 && security != WIFI_OPEN)
-            return x < 380 ? PASSWORD : SHOW;
+            return x < 352 ? PASSWORD : x >= 364 ? SHOW : -1;
         if (y >= DETAIL_SECURITY_Y && y < DETAIL_SECURITY_Y + 44) {
             if (x < 232 && (selected.modes & (1u << WIFI_WPA2_PSK))) return WPA2;
             if (x >= 248 && (selected.modes & (1u << WIFI_WPA3_SAE))) return WPA3;
@@ -194,8 +197,7 @@ static void action(unsigned action) {
     if (action == BACK) {
         clear_password();
         editing = false;
-        if (detail) detail = false;
-        else visible = false;
+        detail = false;
     } else if (action == SCAN) {
         if (wifi_setup_scan()) page = 0;
         else message = "Wi-Fi is busy or unavailable";
@@ -270,13 +272,12 @@ void desktop_wifi_pointer(const struct pointer_event *event, bool press, bool re
     if (!event->down) pressed = -1;
 }
 
+void desktop_wifi_back(void) {
+    if (visible && detail) action(BACK);
+}
+
 void desktop_wifi_key(const struct user_input_event *event, char text) {
-    if (!visible || !(event->flags & INPUT_DOWN)) return;
-    if (event->code == 1) {
-        action(BACK);
-        return;
-    }
-    if (!detail) return;
+    if (!visible || !detail || !(event->flags & INPUT_DOWN)) return;
     if (event->code == 28 || event->code == 96) {
         action(CONNECT);
         return;
@@ -369,15 +370,15 @@ static void row(struct framebuffer *s, unsigned y, const struct wifi_network *ne
 
 static void render_password(struct framebuffer *s, unsigned x, unsigned y) {
     if (!visible || !detail) return;
-    gfx_rect(s, x, y, 356, 48, all ? 0x32656d : 0xf1f5f6);
+    gfx_rect(s, x, y, 336, 48, all ? 0x32656d : 0xf1f5f6);
     if (cursor < offset) offset = cursor;
-    if (cursor > offset + 27) offset = cursor - 27;
-    char line[29] = {0};
-    for (unsigned i = 0; i < 28 && offset + i < length; ++i)
+    if (cursor > offset + 25) offset = cursor - 25;
+    char line[27] = {0};
+    for (unsigned i = 0; i < 26 && offset + i < length; ++i)
         line[i] = reveal ? password[offset + i] : '*';
     /* A WPA2 profile imported as a PMK alone has no password to show. */
     bool pmk_only = !length && !editing && saved_selection() && !wifi_setup_saved_password(0);
-    gfx_text(s, x + 8, y + 17,
+    gfx_text(s, x + 8, y + 16,
              pmk_only ? (wifi_setup_view()->session ? "Session password" : "Saved password") : line,
              2, all ? 0xf1f5f6 : 0x17232c);
     if (editing && !all) gfx_rect(s, x + 8 + (cursor - offset) * 12, y + 12, 2, 24, 0x17232c);
@@ -448,9 +449,9 @@ void desktop_wifi_render(struct framebuffer *s) {
     const struct wifi_setup_view *v = wifi_setup_view();
     gfx_rect(s, 0, 48, 480, 752, 0x17232c);
     gfx_text(s, 20, 68, "WI-FI", 2, 0xf1f5f6);
+    /* No Back buttons: the phone's Back key (Alt+Left in QEMU) is one. */
     if (!detail) {
-        button(s, 16, 104, 288, "SCAN NETWORKS", false);
-        button(s, 320, 104, 144, "BACK", false);
+        button(s, 16, 104, 448, "SCAN NETWORKS", false);
         if (v->has_saved) row(s, 164, &v->saved, true);
         for (unsigned i = 0; i < ROWS && page * ROWS + i < v->radio.count; ++i)
             row(s, list_top() + i * 64, &v->radio.networks[page * ROWS + i], false);
@@ -477,11 +478,11 @@ void desktop_wifi_render(struct framebuffer *s) {
         if (n > 72) gfx_text(s, 20, 118, name + 72, 1, 0xf1f5f6);
         const char *forget = v->session ? "FORGET NETWORK" : "FORGET SAVED NETWORK";
         drawn = (struct drawn_screen){.valid = true, .detail = true, .forget = saved_credential()};
-        button(s, 16, DETAIL_ACTIONS_Y, 288, drawn.forget ? forget : "CONNECT", false);
-        button(s, 320, DETAIL_ACTIONS_Y, 144, "BACK", false);
+        button(s, 16, DETAIL_ACTIONS_Y, 448, drawn.forget ? forget : "CONNECT", false);
         if (security != WIFI_OPEN) {
             render_password(s, 16, DETAIL_PASSWORD_Y);
-            button(s, 380, DETAIL_PASSWORD_Y + 2, 84, reveal ? "HIDE" : "SHOW", false);
+            gfx_rect(s, 364, DETAIL_PASSWORD_Y, 100, 48, 0x31515c);
+            gfx_text(s, 390, DETAIL_PASSWORD_Y + 16, reveal ? "HIDE" : "SHOW", 2, 0xf1f5f6);
         } else gfx_text(s, 20, DETAIL_PASSWORD_Y + 12, "OPEN NETWORK / NO PASSWORD", 1, 0xf1f5f6);
         if (selected.modes & (1u << WIFI_WPA2_PSK))
             button(s, 16, DETAIL_SECURITY_Y, 216, "WPA2", security == WIFI_WPA2_PSK);

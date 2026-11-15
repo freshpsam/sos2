@@ -30,8 +30,10 @@ bool phone_input_poll(struct pointer_event *event, enum phone_input_source *sour
     if (!event || !ready || suspended) return false;
     enum phone_input_source found = PHONE_INPUT_TOUCH;
     if (!redmi2_touch_poll(event)) {
-        if (redmi2_touch_back_pressed()) found = PHONE_INPUT_BACK_PRESS;
-        else if (redmi2_touch_back()) found = PHONE_INPUT_BACK;
+        enum redmi2_touch_key tapped;
+        if (redmi2_touch_key_pressed() != REDMI2_TOUCH_NO_KEY) found = PHONE_INPUT_KEY_PRESS;
+        else if ((tapped = redmi2_touch_key_tapped()) != REDMI2_TOUCH_NO_KEY)
+            found = tapped == REDMI2_TOUCH_HOME ? PHONE_INPUT_HOME : PHONE_INPUT_BACK;
         else return false;
     }
     if (source) *source = found;

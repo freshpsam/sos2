@@ -2,26 +2,73 @@
 #ifdef SOS2_BOARD_REDMI2
 #include "redmi2_battery.h"
 #endif
-/* Every 30 s awake, every 5 s in standby (there as the chip wakes, every
- * 10 s). The gauge's current follows a change slowly: just after the screen
- * goes off, or a charger is pulled, it still reads the awake or charging
- * current, enough to swing a short standby's average, even below zero. So a
- * standby's average leaves out its first minute, as the standby trial's
- * phases did, and the minute after the gauge last reported charging; a
- * charger, hundreds of mA against standby's few, is named, not averaged. */
-enum { AWAKE_US = 30000000, STANDBY_US = 5000000, SETTLE_US = 60000000 };
+/* The battery icon's level and charger, read every 30 s with the screen on,
+ * at once when it comes on, and never while it is off, when nothing shows
+ * them. A reading that fails leaves the icon as it was, until three in a
+ * row have.
+ * The level is the gauge's, steadied so that the icon does not jump: off a
+ * charger it only falls and on one it only rises, and a step of 5% or more
+ * is taken only once three readings in a row span at most two percentage
+ * points and a minute or more from first to last; smaller steps in that
+ * direction are taken at once, even after a brief wake. After standby or
+ * three failed reads, the same confirmation permits either direction: a
+ * charger may have come and gone while not polling.
+ * The gauge is never reset: a reset estimates the charge afresh from the
+ * voltage of the moment, which a load lowers, and on the handset the level
+ * then jumped between half and near empty. */
+enum { POLL_US = 30000000 };
 static struct battery_view view;
-static struct battery_standby last;
-static uint64_t next_poll, standby_since, settled_at;
-static bool standby, standby_charger;
-static int64_t standby_sum;
-static unsigned standby_samples, standby_percent;
+static uint64_t next_poll;
+static bool standby;
+#ifdef SOS2_BOARD_REDMI2
+enum { STEP = 5, AGREEING = 3, AGREE_SPREAD = 2, AGREE_US = 60000000, FAILURES = 3 };
+
+static uint64_t step_since;
+static unsigned shown, step_readings, step_low, step_high, failures;
+static bool shown_valid, resync, step_charger;
+
+/* The level to show for the gauge's reading. */
+static unsigned steady(unsigned percent, bool charger, uint64_t now) {
+    if (!shown_valid) {
+        shown_valid = true;
+        resync = false;
+        return percent;
+    }
+    bool toward = charger ? percent > shown : percent < shown;
+    unsigned step = !toward ? 0 : charger ? percent - shown : shown - percent;
+    /* A short wake still updates small steps in the expected direction.
+     * Keep resync pending for any later correction needing confirmation. */
+    if (step < STEP && (toward || !resync)) {
+        step_readings = 0;
+        return toward ? percent : shown;
+    }
+    unsigned low = step_readings && step_low < percent ? step_low : percent,
+             high = step_readings && step_high > percent ? step_high : percent;
+    if (!step_readings || charger != step_charger || high - low > AGREE_SPREAD) {
+        step_since = now;
+        step_readings = 1;
+        step_low = step_high = percent;
+        step_charger = charger;
+    } else {
+        step_low = low;
+        step_high = high;
+        if (step_readings < AGREEING) ++step_readings;
+    }
+    if (step_readings < AGREEING || now - step_since < AGREE_US) return shown;
+    step_readings = 0;
+    resync = false;
+    return percent;
+}
+#endif
 
 void battery_init(void) {
     view = (struct battery_view){0};
-    last = (struct battery_standby){0};
     next_poll = 0;
     standby = false;
+#ifdef SOS2_BOARD_REDMI2
+    shown_valid = resync = false;
+    step_readings = failures = 0;
+#endif
 }
 
 bool battery_supported(void) {
@@ -34,48 +81,37 @@ bool battery_supported(void) {
 
 const struct battery_view *battery_view(void) { return &view; }
 
-const struct battery_standby *battery_last_standby(void) { return &last; }
-
 void battery_standby(bool active) {
     if (active == standby || !battery_supported()) return;
     standby = active;
-    uint64_t now = time_us();
-    if (active) {
-        standby_since = now;
-        settled_at = now + SETTLE_US;
-        standby_sum = 0;
-        standby_samples = 0;
-        standby_charger = false;
-        standby_percent = view.available ? view.percent : 0;
-        next_poll = now + STANDBY_US;
-        return;
-    }
-    next_poll = now; /* A fresh reading for the desktop. */
-    if (!standby_samples && !(standby_charger && now - standby_since >= SETTLE_US)) return;
-    unsigned used =
-        view.available && standby_percent > view.percent ? standby_percent - view.percent : 0;
-    /* Below 0 off charger is only the gauge's lag or offset. */
-    int64_t average = standby_samples ? standby_sum / standby_samples : 0;
-    last = (struct battery_standby){standby_samples, (unsigned)((now - standby_since) / 60000000),
-                                    used, average > 0 ? (int)average : 0, standby_charger};
+    next_poll = active ? UINT64_MAX : time_us();
+#ifdef SOS2_BOARD_REDMI2
+    step_readings = 0;
+    if (!active) resync = true;
+#endif
 }
 
 bool battery_pending(void) { return battery_supported() && time_us() >= next_poll; }
 
 void battery_service(void *unused) {
     (void)unused;
-#ifdef SOS2_BOARD_REDMI2
-    struct battery_view sample = {0};
-    if (redmi2_battery_read(&sample)) view = sample;
-    else view = (struct battery_view){0};
-#endif
+    if (standby) return;
     uint64_t now = time_us();
-    if (standby && view.charging) {
-        standby_charger = true;
-        settled_at = now + SETTLE_US;
-    } else if (standby && view.current && now >= settled_at) {
-        standby_sum += view.milliamps;
-        ++standby_samples;
+    next_poll = now + POLL_US;
+#ifdef SOS2_BOARD_REDMI2
+    struct battery_view sample;
+    if (!redmi2_battery_read(&sample)) {
+        step_readings = 0;
+        if (failures < FAILURES) ++failures;
+        if (failures == FAILURES) {
+            view.available = false;
+            resync = true;
+        }
+        return;
     }
-    next_poll = now + (standby ? STANDBY_US : AWAKE_US);
+    failures = 0;
+    shown = steady(sample.percent, sample.charger, now);
+    view = sample;
+    view.percent = shown;
+#endif
 }

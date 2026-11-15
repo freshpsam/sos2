@@ -127,23 +127,15 @@ static void status_tick(void);
 static void status_render(struct framebuffer *, unsigned, unsigned);
 static uint64_t status_minute = UINT64_MAX;
 static struct battery_view status_battery;
-static char battery_message[80];
 
-enum {
-    ACTION_ADDRESS = 100,
-    ACTION_OPEN,
-    ACTION_CLOSE,
-    ACTION_DESKTOP,
-    ACTION_WIFI,
-    ACTION_UPDATES
-};
+enum { ACTION_ADDRESS = 100, ACTION_OPEN, ACTION_CLOSE, ACTION_WIFI, ACTION_UPDATES };
 
 /* Desktop, top to bottom: status lines, the WI-FI and UPDATES buttons, the
  * WEB PAGES label, the address row, an Open error, the page list and, at the
  * bottom, the APPS launcher. The address row moves only with the status
  * lines, which settle at startup, never while typing. */
 static unsigned settings_top(void) {
-    unsigned lines = 1 + battery_supported();
+    unsigned lines = 1;
     if (!entropy_ready) lines += 1 + (entropy_message[0] != 0);
     return STATUS_TOP + lines * 18 + 8;
 }
@@ -152,8 +144,12 @@ static unsigned address_top(void) { return settings_top() + 92; }
 
 static unsigned list_top(void) { return address_top() + 64 + (browser_message ? 18 : 0); }
 
-/* APP_COLUMNS square buttons per row, ending 16 pixels above the bottom. */
-static unsigned launcher_rows(void) { return (apps_count() + APP_COLUMNS - 1) / APP_COLUMNS; }
+/* Room for as many apps as the launcher lists (APP_LIMIT) however many there
+ * are, in rows of APP_COLUMNS square buttons ending 16 pixels above the
+ * bottom; none without apps. */
+static unsigned launcher_rows(void) {
+    return apps_count() ? (APP_LIMIT + APP_COLUMNS - 1) / APP_COLUMNS : 0;
+}
 
 static unsigned launcher_top(void) {
     unsigned rows = launcher_rows();
@@ -383,7 +379,7 @@ void page_host_init(struct framebuffer *screen) {
     composed_view = UINT32_MAX;
     screen_active = true;
     web_damage.right = web_damage.bottom = 0;
-    entropy_message[0] = address[0] = battery_message[0] = 0;
+    entropy_message[0] = address[0] = 0;
     address_length = address_cursor = address_offset = page_offset = 0;
     list_dragging = false;
     toolbar_press = pointer_owner = soft_owner = focused = -1;
@@ -422,10 +418,8 @@ bool page_host_input(const struct pointer_event *event) {
     bool release = pressed && !event->down && !event->cancelled,
          press = !pressed && event->down && !event->cancelled;
     int toolbar = -1;
-    if (!panel && event->y >= 6 && event->y < 42) {
-        if (event->x >= 12 && event->x < 120) toolbar = ACTION_DESKTOP;
-        else if (event->x >= 132 && event->x < 216) toolbar = ACTION_CLOSE;
-    }
+    if (!panel && event->y >= 6 && event->y < 42 && event->x >= 12 && event->x < 96)
+        toolbar = ACTION_CLOSE;
     if (press) {
         toolbar_press = toolbar;
         if (toolbar >= 0) {
@@ -548,7 +542,13 @@ void page_host_wheel(const struct pointer_event *point, int32_t dx, int32_t dy) 
 }
 
 void page_host_back(void) {
-    if (!display || panel) return;
+    if (!display) return;
+    if (desktop_wifi_visible()) {
+        desktop_wifi_back();
+        update_keyboard();
+        return;
+    }
+    if (panel) return;
     struct page *p = page(selected);
     if (p && p->back_key) {
         struct user_input_event key = {
@@ -558,15 +558,15 @@ void page_host_back(void) {
         enqueue(selected, key);
         return;
     }
-    if (p && p->app) {
-        browser_panel(true);
-        return;
-    }
-    if (!p || p->command.action || !(p->browser.flags & BROWSER_CAN_GO_BACK)) return;
+    if (!p || p->app || p->command.action || !(p->browser.flags & BROWSER_CAN_GO_BACK)) return;
     p->command = (struct user_browser_command){.action = BROWSER_BACK};
     p->keyboard_wanted = false;
     update_keyboard();
     set_focus((int)selected);
+}
+
+void page_host_home(void) {
+    if (display) browser_panel(true);
 }
 
 void page_host_keyboard(const struct user_input_event *event) {
@@ -585,16 +585,30 @@ void page_host_keyboard(const struct user_input_event *event) {
     }
     if (event->type != INPUT_KEY || event->code >= 256) return;
     current_modifiers = event->modifiers;
-    if (desktop_wifi_visible()) {
-        desktop_wifi_key(event, 0);
-        update_keyboard();
-        return;
-    }
     /* Shortcuts take only a fresh press, which then belongs to no page: its
      * repeats and release go nowhere. Keys pressed before a modifier keep
      * their owner, so a page still sees the release of a key it saw go down. */
     bool press = (event->flags & (INPUT_DOWN | INPUT_REPEAT)) == INPUT_DOWN,
          ctrl = event->modifiers & INPUT_CTRL;
+    /* QEMU has no phone Home or Back key: a keyboard's Home page and Back
+     * keys, or Alt+Home and Alt+Left. */
+    bool alt = event->modifiers & INPUT_ALT,
+         back = press && (event->code == 158 || (event->code == 105 && alt));
+    if (press && (event->code == 172 || (event->code == 102 && alt))) {
+        key_owners[event->code] = -1;
+        page_host_home();
+        return;
+    }
+    if (desktop_wifi_visible()) {
+        if (back) {
+            key_owners[event->code] = -1;
+            page_host_back();
+            return;
+        }
+        desktop_wifi_key(event, 0);
+        update_keyboard();
+        return;
+    }
     if (press && ctrl && event->code == 38) {
         key_owners[event->code] = -1;
         browser_panel(true);
@@ -610,8 +624,7 @@ void page_host_keyboard(const struct user_input_event *event) {
         address_key(event, 0);
         return;
     }
-    /* QEMU has no phone Back key: a keyboard's Back key or Alt+Left. */
-    if (press && (event->code == 158 || (event->code == 105 && (event->modifiers & INPUT_ALT)))) {
+    if (back) {
         key_owners[event->code] = -1;
         page_host_back();
         return;
@@ -993,10 +1006,6 @@ static void browser_action(unsigned action) {
         launch_app(action - ACTION_APP);
         return;
     }
-    if (action == ACTION_DESKTOP) {
-        browser_panel(true);
-        return;
-    }
     if (action == ACTION_UPDATES) {
         if (apps_updater()) open_app(apps_updater());
         else {
@@ -1178,10 +1187,9 @@ static void page_header_render(struct framebuffer *screen, unsigned x, unsigned 
         gfx_text(screen, 16, 16, "SOS2", 2, 0xf1f5f6);
         return;
     }
-    gfx_rect(screen, 12, 6, 108, 36, 0x31515c);
-    gfx_text(screen, 24, 16, "DESKTOP", 2, 0xf1f5f6);
-    gfx_rect(screen, 132, 6, 84, 36, 0x31515c);
-    gfx_text(screen, 144, 16, "CLOSE", 2, 0xf1f5f6);
+    /* No Desktop button: the phone's Home key (Alt+Home in QEMU) is one. */
+    gfx_rect(screen, 12, 6, 84, 36, 0x31515c);
+    gfx_text(screen, 24, 16, "CLOSE", 2, 0xf1f5f6);
 }
 
 static void status_render(struct framebuffer *screen, unsigned x, unsigned y) {
@@ -1198,8 +1206,10 @@ static void status_render(struct framebuffer *screen, unsigned x, unsigned y) {
         time[4] = '0' + minute % 10;
     }
     gfx_text(screen, 360, 16, time, 2, 0xf1f5f6);
+    /* Green on a charger, with a plus while it charges; without a gauge an
+     * empty outline. */
     unsigned color = !status_battery.available      ? 0xb9c9d0
-                     : status_battery.charging      ? 0x61e0bd
+                     : status_battery.charger       ? 0x61e0bd
                      : status_battery.percent <= 15 ? 0xef7766
                                                     : 0xf1f5f6;
     gfx_rect(screen, 436, 14, 24, 20, color);
@@ -1216,48 +1226,13 @@ static void status_render(struct framebuffer *screen, unsigned x, unsigned y) {
     }
 }
 
-static char *current(char *out, int milliamps) {
-    if (milliamps < 0) {
-        out = stpcpy(out, "charging ");
-        milliamps = -milliamps;
-    }
-    return stpcpy(decimal(out, (unsigned)milliamps), " mA");
-}
-
-/* The gauge's current and the last standby's average, what the phone draws,
- * e.g. "Battery 95 mA; standby 142 mA for 9 min, 1%". A standby the gauge
- * reported charging in says so in place of the charge it used, or of its
- * average too when it was all on charger. At most 63 characters (2.5 A gauge
- * range, minutes capped), which fit the desktop. */
-static void battery_text(char out[80]) {
-    const struct battery_view *b = battery_view();
-    const struct battery_standby *s = battery_last_standby();
-    char *p = stpcpy(out, "Battery ");
-    if (b->available && b->current) p = current(p, b->milliamps);
-    else p = stpcpy(p, "unavailable");
-    if (!s->samples && !s->charger) return;
-    p = stpcpy(p, "; standby ");
-    if (s->samples) p = stpcpy(current(p, s->milliamps), " for ");
-    else p = stpcpy(p, "on charger for ");
-    p = stpcpy(decimal(p, s->minutes < 9999 ? s->minutes : 9999), " min");
-    if (s->samples && s->charger) stpcpy(p, ", charger");
-    else if (s->samples) stpcpy(decimal(stpcpy(p, ", "), s->percent_used), "%");
-}
-
 static void status_tick(void) {
-    if (battery_supported()) {
-        char text[sizeof(battery_message)];
-        battery_text(text);
-        if (strcmp(text, battery_message)) {
-            memcpy(battery_message, text, sizeof(text));
-            if (panel) dirty = true;
-        }
-    }
     uint64_t us = 0, minute = system_clock_read(&us) ? us / 60000000 : UINT64_MAX;
     struct battery_view battery = *battery_view();
     if (battery.percent > 100) battery.available = false;
     if (minute != status_minute || battery.available != status_battery.available ||
-        battery.percent != status_battery.percent || battery.charging != status_battery.charging) {
+        battery.percent != status_battery.percent || battery.charger != status_battery.charger ||
+        battery.charging != status_battery.charging) {
         status_minute = minute;
         status_battery = battery;
         page_host_redraw_region(352, 0, 128, WEB_TOP, status_render);
@@ -1272,10 +1247,6 @@ static void browser_render(struct framebuffer *screen) {
     }
     gfx_rect(screen, 0, WEB_TOP, 480, 800 - WEB_TOP, 0x17232c);
     unsigned y = STATUS_TOP;
-    if (battery_supported()) {
-        gfx_text(screen, 20, y, battery_message, 1, 0xb9c9d0);
-        y += 18;
-    }
     gfx_text(screen, 20, y,
              storage_session ? "TEMPORARY SESSION / DATA CLEARS ON REBOOT"
              : storage_ready ? "PERSISTENT STORAGE READY"

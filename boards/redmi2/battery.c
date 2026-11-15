@@ -2,13 +2,26 @@
 #include "msm8916_i2c.h"
 
 /* WT88047: SMB1360 at 0x14 on BLSP1 QUP4 (GPIO14/15, mux 2).
- * Only read the already-configured gauge's shadow SOC and charging status;
- * do not change charger limits, calibration, OTP, shutdown or IRQ settings.
+ * Only read the already-configured gauge's shadow SOC, its charging status
+ * and its USB input; do not change charger limits, calibration, OTP,
+ * shutdown or IRQ settings, nor reset the gauge.
  * Primary register/wiring references:
  * https://github.com/msm8916-mainline/linux/blob/wip/msm8916/7.0/drivers/power/supply/smb1360.c
  * https://github.com/msm8916-mainline/linux/blob/wip/msm8916/7.0/arch/arm64/boot/dts/qcom/msm8916-wingtech-wt88047.dts
  * https://github.com/torvalds/linux/blob/master/drivers/clk/qcom/gcc-msm8916.c
  */
+enum {
+    SMB1360 = 0x14,
+    STATUS_3 = 0x4b,
+    REVISION = 0x4f,
+    IRQ_E = 0x54, /* interrupt status; even bits live */
+    MSYS_SOC = 0x61,
+    VTG_NOW = 0x69,
+    CHARGE_TYPE = 3 << 1, /* STATUS_3: none, pre, fast or taper */
+    HOLD_OFF = 1 << 3,    /* STATUS_3 */
+    USBIN_UV = 1 << 0,    /* IRQ_E: USB input under voltage, no charger */
+};
+
 static uint32_t read32(uintptr_t p) {
     uint32_t value = mmio_read32(p);
     barrier();
@@ -49,29 +62,28 @@ static bool prepare(void) {
     return msm8916_i2c_bus_init(&bus);
 }
 
+static bool read8(uint8_t reg, uint8_t *value) {
+    return msm8916_i2c_bus_read(&bus, SMB1360, reg, value, 1);
+}
+
 bool redmi2_battery_read(struct battery_view *out) {
     if (!out || (!bus.ready && !prepare())) return false;
-    uint8_t revision, status, soc, voltage[2], current[2];
-    if (!msm8916_i2c_bus_read(&bus, 0x14, 0x4f, &revision, 1) || revision == 0xff ||
-        !msm8916_i2c_bus_read(&bus, 0x14, 0x61, &soc, 1) ||
-        !msm8916_i2c_bus_read(&bus, 0x14, 0x69, voltage, 2) ||
-        !msm8916_i2c_bus_read(&bus, 0x14, 0x4b, &status, 1))
+    uint8_t revision, status, input, soc, voltage[2];
+    if (!read8(REVISION, &revision) || revision == 0xff || !read8(MSYS_SOC, &soc) ||
+        !msm8916_i2c_bus_read(&bus, SMB1360, VTG_NOW, voltage, 2) || !read8(STATUS_3, &status) ||
+        !read8(IRQ_E, &input))
         return false;
     /* A missing/uninitialized gauge can return a flat 0/0xff register bank.
      * Validate a live shadow voltage before publishing its SOC. */
     unsigned raw = voltage[0] | (unsigned)voltage[1] << 8;
     unsigned millivolts = raw * 5000u / 32767u;
     if (millivolts < 2000 || millivolts > 5000) return false;
+    /* A charger is its live USB input, as the drivers report online. */
+    bool charger = !(input & USBIN_UV);
+    bool charging = charger && (status & CHARGE_TYPE) && !(status & HOLD_OFF);
     *out = (struct battery_view){.available = true,
-                                 .percent = (soc * 100u + 127) / 255,
-                                 .charging = (status & 6) && !(status & 8)};
-    /* Shadow CURR_NOW: signed, full scale 2.5 A, positive while discharging
-     * (smb1360.c reports its negation as current_now; on the WT88047 the
-     * charge falls while it reads positive). Optional. */
-    if (msm8916_i2c_bus_read(&bus, 0x14, 0x6b, current, 2)) {
-        int16_t value = (int16_t)(current[0] | (uint16_t)current[1] << 8);
-        out->milliamps = (int)((int32_t)value * 2500 / 32767);
-        out->current = true;
-    }
+                                 .charger = charger,
+                                 .charging = charging,
+                                 .percent = (soc * 100u + 127) / 255};
     return true;
 }

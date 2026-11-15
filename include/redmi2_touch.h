@@ -8,14 +8,18 @@
  */
 bool redmi2_touch_init(uint32_t width, uint32_t height);
 bool redmi2_touch_poll(struct pointer_event *event);
-/* True once per tap of Back, the right-hand capacitive key below the display,
- * after the redmi2_touch_poll call that saw it lift. A tap starts on Back with
- * nothing on the display and lifts there; one that slides away, meets a finger
- * on the display or loses reports is no tap. */
-bool redmi2_touch_back(void);
-/* True once as a finger lands on Back with nothing on the display, after the
+
+/* The capacitive keys below the display that are reported: Home in the
+ * middle, Back on the right (Menu, on the left, is not). */
+enum redmi2_touch_key { REDMI2_TOUCH_NO_KEY, REDMI2_TOUCH_HOME, REDMI2_TOUCH_BACK };
+/* Once per tap of a key, after the redmi2_touch_poll call that saw it lift;
+ * otherwise REDMI2_TOUCH_NO_KEY. A tap starts on the key with nothing on the
+ * display and lifts there; one that slides away, meets a finger on the
+ * display or loses reports is no tap. */
+enum redmi2_touch_key redmi2_touch_key_tapped(void);
+/* Once as a finger lands on a key with nothing on the display, after the
  * redmi2_touch_poll call that saw it: the start of what may become a tap. */
-bool redmi2_touch_back_pressed(void);
+enum redmi2_touch_key redmi2_touch_key_pressed(void);
 /* Ends any gesture and requires new valid all-up contact data before the next
  * one; the controller keeps scanning. */
 void redmi2_touch_cancel(void);

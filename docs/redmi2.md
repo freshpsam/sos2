@@ -150,10 +150,23 @@ failure stops storage for the boot, and writes are never retried.
   below the 90 MiB lk2nd maps for `fastboot boot`. Images ask lk2nd to move
   its framebuffer (`lk2nd.pass-simplefb=autorefresh,relocate`).
 - **Keys:** Menu, Home and Back report through the touch controller below the
-  display rows; only Back is used.
+  display rows; Home shows the desktop and Back goes back, never to the
+  desktop. Menu is unused.
 - **Devices:** FT5x06 touch; PM8916 power key, backlight, vibrator, RTC and
   restart; SMB1360 battery gauge; CPU-jitter entropy; WCN3620
   [Wi-Fi](redmi2-wifi.md); the eMMC; an optional Adreno 306. All four cores
   start; a core that does not is skipped.
 - **Restart:** a PMIC hard reset through PS_HOLD, as lk2nd's `reboot_device`
   does.
+- **Battery:** the header's icon shows the SMB1360 gauge's level and its
+  charger's USB input, which alone marks the battery charging, read every
+  30 s with the screen on and never in standby. SOS2 only reads the gauge: it
+  sets no charger limit and never resets it. The level is steadied: off a
+  charger it only falls, on one it only rises, and a step of 5% or more waits
+  for three consecutive readings within two percentage points, spanning at
+  least a minute. Smaller steps in that direction update immediately, even
+  during brief wake-ups. After standby or three failed reads, that
+  confirmation allows either direction, since charging may have changed
+  while unobserved.
+  Below the current Linux's setup counts as standby (200 mA) the gauge
+  refreshes its readings rarely, so the level can lag.
