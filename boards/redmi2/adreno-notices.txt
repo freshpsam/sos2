@@ -1,0 +1,42 @@
+Adreno native display support
+
+Linux initialization and memory-protection sequences are adapted from Linux v6.12:
+ drivers/gpu/drm/msm/adreno/a3xx_gpu.c
+ drivers/clk/qcom/gcc-msm8916.c
+ drivers/iommu/arm/arm-smmu/qcom_iommu.c
+Copyright (C) 2013 Red Hat, Rob Clark
+Copyright (c) 2014 The Linux Foundation. All rights reserved.
+GPL-2.0-only; see ../../third_party/adreno/LICENSE.GPL-2.
+
+A3xx 32-bit memory-wait packet semantics follow Qualcomm KGSL adreno.h:
+https://android.googlesource.com/kernel/msm/+/bcd7b3e3790eb8156580c1b48f545a8a986b6bcd/drivers/gpu/msm/adreno.h
+Copyright (c) The Linux Foundation. GPL-2.0-only.
+
+Compute register setup and instruction encodings are derived from
+https://github.com/freedreno/freedreno (fdre-a3xx and includes/instr-a3xx.h).
+/*
+ * Copyright (c) 2012 Rob Clark <robdclark@gmail.com>
+ * Copyright (c) 2013 Rob Clark <robdclark@gmail.com>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+Firmware is separate, unmodified, and not covered by these source licenses.
+Its pinned redistribution license and notice are included with the boot resources.

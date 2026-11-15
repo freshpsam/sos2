@@ -1,0 +1,93 @@
+--- a/Source/ThirdParty/skia/src/opts/SkRasterPipeline_opts.h
++++ b/Source/ThirdParty/skia/src/opts/SkRasterPipeline_opts.h
+@@ -211,16 +211,19 @@
+     using U16 = V<uint16_t>;
+     using U8  = V<uint8_t >;
+ 
++    // Bare-metal GCC uses long lanes in its NEON types, while SOS2 uses int32_t
++    // == int. Equal-size vector casts at intrinsic boundaries preserve lane bits
++    // without weakening vector type checking for the rest of the library.
+     // We polyfill a few routines that Clang doesn't build into ext_vector_types.
+     SI F   min(F a, F b)     { return vminq_f32(a,b); }
+-    SI I32 min(I32 a, I32 b) { return vminq_s32(a,b); }
+-    SI U32 min(U32 a, U32 b) { return vminq_u32(a,b); }
++    SI I32 min(I32 a, I32 b) { return (I32)vminq_s32((int32x4_t)a,(int32x4_t)b); }
++    SI U32 min(U32 a, U32 b) { return (U32)vminq_u32((uint32x4_t)a,(uint32x4_t)b); }
+     SI F   max(F a, F b)     { return vmaxq_f32(a,b); }
+-    SI I32 max(I32 a, I32 b) { return vmaxq_s32(a,b); }
+-    SI U32 max(U32 a, U32 b) { return vmaxq_u32(a,b); }
++    SI I32 max(I32 a, I32 b) { return (I32)vmaxq_s32((int32x4_t)a,(int32x4_t)b); }
++    SI U32 max(U32 a, U32 b) { return (U32)vmaxq_u32((uint32x4_t)a,(uint32x4_t)b); }
+ 
+     SI F   abs_  (F v)       { return vabsq_f32(v); }
+-    SI I32 abs_  (I32 v)     { return vabsq_s32(v); }
++    SI I32 abs_  (I32 v)     { return (I32)vabsq_s32((int32x4_t)v); }
+     SI F   rcp_approx(F v)   { auto e = vrecpeq_f32(v);  return vrecpsq_f32 (v,e  ) * e; }
+     SI F   rcp_precise(F v)  { auto e = rcp_approx(v);   return vrecpsq_f32 (v,e  ) * e; }
+     SI F   rsqrt_approx(F v) { auto e = vrsqrteq_f32(v); return vrsqrtsq_f32(v,e*e) * e; }
+@@ -228,8 +231,8 @@
+     SI U16 pack(U32 v)       { return __builtin_convertvector(v, U16); }
+     SI U8  pack(U16 v)       { return __builtin_convertvector(v,  U8); }
+ 
+-    SI F   if_then_else(I32 c, F   t, F   e) { return vbslq_f32((U32)c,t,e); }
+-    SI I32 if_then_else(I32 c, I32 t, I32 e) { return vbslq_s32((U32)c,t,e); }
++    SI F   if_then_else(I32 c, F   t, F   e) { return vbslq_f32((uint32x4_t)c,t,e); }
++    SI I32 if_then_else(I32 c, I32 t, I32 e) { return (I32)vbslq_s32((uint32x4_t)c,(int32x4_t)t,(int32x4_t)e); }
+ 
+     #if defined(SK_CPU_ARM64)
+         SI bool any(I32 c) { return vmaxvq_u32((U32)c) != 0; }
+@@ -267,11 +270,11 @@
+         }
+ 
+         SI I32 iround(F v) {
+-            return vcvtq_s32_f32(v + 0.5f);
++            return (I32)vcvtq_s32_f32(v + 0.5f);
+         }
+ 
+         SI U32 round(F v) {
+-            return vcvtq_u32_f32(v + 0.5f);
++            return (U32)vcvtq_u32_f32(v + 0.5f);
+         }
+     #endif
+ 
+--- a/Source/ThirdParty/skia/include/private/SkFeatures.h
++++ b/Source/ThirdParty/skia/include/private/SkFeatures.h
+@@ -170,10 +170,8 @@
+ #endif
+ 
+ // All 64-bit ARM chips have NEON.  Many 32-bit ARM chips do too.
+-// The generic ARM compiler's intrinsic uint32 vectors use unsigned long,
+-// while SOS2's C++ ABI uses unsigned int. Use portable raster paths until
+-// the explicit vector conversions are ported; compiler vectorization remains.
+-#if !defined(SK_ARM_HAS_NEON) && defined(__ARM_NEON) && !defined(__sos2__)
++// SOS2 supplies explicit equal-width vector conversions at intrinsic boundaries.
++#if !defined(SK_ARM_HAS_NEON) && defined(__ARM_NEON)
+     #define SK_ARM_HAS_NEON
+ #endif
+ 
+--- a/Source/ThirdParty/skia/src/core/SkVx.h
++++ b/Source/ThirdParty/skia/src/core/SkVx.h
+@@ -887,10 +887,10 @@
+ 
+     Vec<4, uint32_t> divide(const Vec<4, uint32_t>& numerator) const {
+ #if SKVX_USE_SIMD && defined(SK_ARM_HAS_NEON)
+-        uint64x2_t hi = vmull_n_u32(vget_high_u32(to_vext(numerator)), fDivisorFactor);
+-        uint64x2_t lo = vmull_n_u32(vget_low_u32(to_vext(numerator)),  fDivisorFactor);
+-
+-        return to_vec<4, uint32_t>(vcombine_u32(vshrn_n_u64(lo,32), vshrn_n_u64(hi,32)));
++        uint64x2_t hi = vmull_n_u32(vget_high_u32(sk_bit_cast<uint32x4_t>(numerator)), fDivisorFactor);
++        uint64x2_t lo = vmull_n_u32(vget_low_u32(sk_bit_cast<uint32x4_t>(numerator)),  fDivisorFactor);
++
++        return sk_bit_cast<Vec<4, uint32_t>>(vcombine_u32(vshrn_n_u64(lo,32), vshrn_n_u64(hi,32)));
+ #else
+         return cast<uint32_t>((cast<uint64_t>(numerator) * fDivisorFactor) >> 32);
+ #endif
+@@ -926,7 +926,7 @@
+ #if SKVX_USE_SIMD && defined(SK_ARM_HAS_NEON)
+     // NEON can do four u16*u16 -> u32 in one instruction, vmull_u16
+     if constexpr (N == 4) {
+-        return to_vec<4,uint32_t>(vmull_u16(to_vext(x), to_vext(y)));
++        return sk_bit_cast<Vec<4,uint32_t>>(vmull_u16(to_vext(x), to_vext(y)));
+     } else if constexpr (N < 4) {
+         return mull(join(x,x), join(y,y)).lo;
+     } else { // N > 4

@@ -1,0 +1,46 @@
+{
+  "fonts": [
+    {
+      "family": "Noto Sans CJK SC",
+      "style": "Regular",
+      "version": "2.004",
+      "release": "https://github.com/notofonts/noto-cjk/releases/tag/Sans2.004",
+      "file": "NotoSansCJKsc-Regular.otf",
+      "license": "NotoSansCJKsc-LICENSE.txt"
+    },
+    {
+      "family": "Noto Color Emoji",
+      "format": "COLRv1",
+      "version": "2.051",
+      "release": "https://github.com/googlefonts/noto-emoji/releases/tag/v2.051",
+      "file": "Noto-COLRv1.ttf",
+      "license": "NotoColorEmoji-LICENSE.txt"
+    }
+  ],
+  "assets": [
+    {
+      "file": "NotoSansCJKsc-Regular.otf",
+      "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/523d033d6cb47f4a80c58a35753646f5c3608a78/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+      "sha256": "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b",
+      "bytes": 16437364
+    },
+    {
+      "file": "NotoSansCJKsc-LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/523d033d6cb47f4a80c58a35753646f5c3608a78/LICENSE",
+      "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2",
+      "bytes": 4301
+    },
+    {
+      "file": "Noto-COLRv1.ttf",
+      "url": "https://raw.githubusercontent.com/googlefonts/noto-emoji/8998f5dd683424a73e2314a8c1f1e359c19e8742/fonts/Noto-COLRv1.ttf",
+      "sha256": "0ae57fe58645638523ba35f388d93739d292539a9acb84df5700c81b1e1a28d2",
+      "bytes": 4991984
+    },
+    {
+      "file": "NotoColorEmoji-LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/googlefonts/noto-emoji/8998f5dd683424a73e2314a8c1f1e359c19e8742/fonts/LICENSE",
+      "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2",
+      "bytes": 4301
+    }
+  ]
+}

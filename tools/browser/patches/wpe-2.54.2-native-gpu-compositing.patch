@@ -1,0 +1,158 @@
+--- a/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp
+@@ -26,7 +26,7 @@
+ #include "config.h"
+ #include "PlatformDisplay.h"
+ 
+-#if USE(SKIA) && !OS(SOS2)
++#if USE(SKIA)
+ #include "FontRenderOptions.h"
+ #include "GLContext.h"
+ 
+@@ -42,6 +42,10 @@
+ #if USE(LIBEPOXY)
+ #include <epoxy/egl.h>
+ #include <skia/gpu/ganesh/gl/epoxy/GrGLMakeEpoxyEGLInterface.h>
++#elif OS(SOS2)
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <skia/gpu/ganesh/gl/GrGLAssembleInterface.h>
+ #else
+ #include <EGL/egl.h>
+ #include <EGL/eglext.h>
+@@ -85,6 +89,11 @@
+     static NeverDestroyed<sk_sp<const GrGLInterface>> grGLInterface {
+ #if USE(LIBEPOXY)
+         GrGLInterfaces::MakeEpoxyEGL()
++#elif OS(SOS2)
++        // Mesa is linked statically: its EGL resolves every GLES entry point.
++        GrGLMakeAssembledGLESInterface(nullptr, [](void*, const char* name) -> GrGLFuncPtr {
++            return eglGetProcAddress(name);
++        })
+ #else
+         GrGLInterfaces::MakeEGL()
+ #endif
+@@ -248,12 +257,17 @@
+ 
+ static size_t initializeMaxResourceCacheBytes(GrDirectContext* grContext)
+ {
++#if OS(SOS2)
++    // Uploaded textures keep a shadow copy in page memory, which has a quota.
++    grContext->setResourceCacheLimit(32 * MB);
++#else
+     size_t memorySize = WTF::ramSize();
+     if (memorySize < s_lowEndDeviceMemoryThresholdBytes)
+         grContext->setResourceCacheLimit(s_lowEndMaxResourceCacheBytes);
+     else if (memorySize < s_highEndDeviceMemoryThresholdBytes)
+         grContext->setResourceCacheLimit(s_maxResourceCacheBytes);
+     // Use GrDirectContext default (256MB) for high end devices.
++#endif
+     return grContext->getResourceCacheLimit();
+ }
+ 
+@@ -346,8 +360,13 @@
+         // lookup which is a slow-path in certain tiled GPUs (such as Vivante/etnaviv). Since we
+         // don't use any mipmapping, it's safe to disable that, and avoid performance hits.
+         options.fSharpenMipmappedTextures = false;
++#if OS(SOS2)
++        // SYS_GPU has no multisampled resources, and pages paint on one thread.
++        options.fInternalMultisampleCount = 0;
++#else
+         thread_local std::unique_ptr<SkExecutor> s_executor = SkExecutor::MakeFIFOThreadPool(2);
+         options.fExecutor = s_executor.get();
++#endif
+         if (auto bytes = glyphCacheTextureMaximumBytes())
+             options.fGlyphCacheTextureMaximumBytes = *bytes;
+ 
+@@ -369,7 +388,7 @@
+ 
+ GLContext* PlatformDisplay::skiaGLContext()
+ {
+-#if PLATFORM(GTK) || PLATFORM(WPE) || (PLATFORM(PLAYSTATION) && !USE(COORDINATED_GRAPHICS))
++#if PLATFORM(GTK) || PLATFORM(WPE) || OS(SOS2) || (PLATFORM(PLAYSTATION) && !USE(COORDINATED_GRAPHICS))
+     if (!s_skiaGLContext) {
+         s_skiaGLContext = SkiaGLContext::create(*this);
+         m_skiaGLContexts.add(*s_skiaGLContext);
+--- a/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp
+@@ -180,9 +180,7 @@
+ 
+ Ref<SkiaRecordingResult> SkiaPaintingEngine::record(const GraphicsLayerCoordinated& layer, const IntRect& recordRect, bool contentsOpaque, float contentsScale, unsigned dirtyTilesCount)
+ {
+-    // ### Asynchronous rendering on worker threads ###
+-    ASSERT(m_paintingWorkerPool);
+-
++    // ### Asynchronous rendering on worker threads, or on this thread without a pool ###
+     auto renderingMode = canPerformAcceleratedRendering() ? RenderingMode::Accelerated : RenderingMode::Unaccelerated;
+ 
+     WTFBeginSignpost(this, RecordTile);
+@@ -257,7 +255,7 @@
+     auto buffer = createBuffer(renderingMode, bufferSize, recording->contentsOpaque());
+     buffer->beginPainting();
+ 
+-    m_paintingWorkerPool->postTask([platformLayer = WTF::move(platformLayer), buffer = Ref { buffer }, tileRect, dirtyRect, recording = WTF::move(recording), threadSafeGrContext = WTF::move(threadSafeGrContext)]() mutable {
++    auto paint = [platformLayer = WTF::move(platformLayer), buffer = Ref { buffer }, tileRect, dirtyRect, recording = WTF::move(recording), threadSafeGrContext = WTF::move(threadSafeGrContext)]() mutable {
+         if (auto* canvas = buffer->canvas()) {
+             auto replayPicture = [](const sk_sp<SkPicture>& picture, SkCanvas* canvas, const IntRect& recordRect, const IntRect& tileRect, const IntRect& dirtyRect, bool isDDLBuffer) {
+                 canvas->save();
+@@ -288,7 +286,11 @@
+ 
+         buffer->completePainting();
+         platformLayer->didPaintTile();
+-    });
++    };
++    if (m_paintingWorkerPool)
++        m_paintingWorkerPool->postTask(WTF::move(paint));
++    else
++        paint();
+ 
+     return buffer;
+ }
+@@ -299,14 +301,20 @@
+     static unsigned numberOfThreads = 0;
+ 
+     std::call_once(onceFlag, [] {
++#if OS(SOS2)
++        // Tiles are painted on the calling thread, which then composites them.
++        numberOfThreads = 0;
++#else
+         numberOfThreads = std::max(1, std::min(8, WTF::numberOfProcessorCores() / 2)); // By default, use half the CPU cores, capped at 8.
++#endif
+ 
++        // Zero paints tiles on the calling thread.
+         if (const char* envString = getenv("WEBKIT_SKIA_CPU_PAINTING_THREADS")) {
+             auto newValue = parseInteger<unsigned>(StringView::fromLatin1(envString));
+-            if (newValue && *newValue >= 1 && *newValue <= 8)
++            if (newValue && *newValue <= 8)
+                 numberOfThreads = *newValue;
+             else
+-                WTFLogAlways("The number of Skia painting threads is not between 1 and 8. Using the default value %u\n", numberOfThreads);
++                WTFLogAlways("The number of Skia painting threads is not between 0 and 8. Using the default value %u\n", numberOfThreads);
+         }
+     });
+ 
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperGLHeaders.h
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperGLHeaders.h
+@@ -36,6 +36,10 @@
+ #define GL_BGRA 0x80E1
+ #endif
+ 
++#ifndef GL_RGBA8
++#define GL_RGBA8 0x8058
++#endif
++
+ #ifndef GL_TEXTURE_RECTANGLE_ARB
+ #define GL_TEXTURE_RECTANGLE_ARB 0x84F5
+ #endif
+--- a/Source/WTF/wtf/PlatformUse.h
++++ b/Source/WTF/wtf/PlatformUse.h
+@@ -83,7 +83,8 @@
+ #define USE_SOUP 1
+ #endif
+ 
+-#if USE(COORDINATED_GRAPHICS) && USE(THEME_ADWAITA) && USE(SKIA)
++/* SOS2 has no scrolling thread; WebCore paints its scrollbars. */
++#if USE(COORDINATED_GRAPHICS) && USE(THEME_ADWAITA) && USE(SKIA) && !OS(SOS2)
+ #define USE_COORDINATED_GRAPHICS_ASYNC_SCROLLBAR 1
+ #endif
+ 

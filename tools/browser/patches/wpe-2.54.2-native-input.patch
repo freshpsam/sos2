@@ -1,0 +1,30 @@
+--- a/Source/WebCore/html/HTMLFormControlElement.cpp
++++ b/Source/WebCore/html/HTMLFormControlElement.cpp
+@@ -228,7 +228,7 @@
+ 
+ bool HTMLFormControlElement::isMouseFocusable() const
+ {
+-#if (PLATFORM(GTK) || PLATFORM(WPE))
++#if (PLATFORM(GTK) || PLATFORM(WPE) || PLATFORM(SOS2))
+     return HTMLElement::isMouseFocusable();
+ #else
+     // FIXME: We can remove needsFormControlToBeMouseFocusable if there are no more quirks
+--- a/Source/WebCore/loader/EmptyClients.h
++++ b/Source/WebCore/loader/EmptyClients.h
+@@ -103,7 +103,15 @@
+     RefPtr<PopupMenu> createPopupMenu(PopupMenuClient&) const final;
+     RefPtr<SearchPopupMenu> createSearchPopupMenu(PopupMenuClient&) const final;
+ 
+-    KeyboardUIMode keyboardUIMode() final { return KeyboardAccessDefault; }
++    KeyboardUIMode keyboardUIMode() final
++    {
++#if PLATFORM(SOS2)
++        // Native pages must support keyboard focus on controls and links.
++        return static_cast<KeyboardUIMode>(KeyboardAccessFull | KeyboardAccessTabsToLinks);
++#else
++        return KeyboardAccessDefault;
++#endif
++    }
+ 
+     bool hasAccessoryMousePointingDevice() const final { return false; }
+     bool hoverSupportedByPrimaryPointingDevice() const final { return false; };

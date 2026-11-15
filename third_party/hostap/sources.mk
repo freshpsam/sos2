@@ -1,0 +1,35 @@
+HOSTAP_SOURCES := third_party/hostap/src/common/sae.c \
+    third_party/hostap/src/common/dragonfly.c \
+    third_party/hostap/src/common/wpa_common.c \
+    third_party/hostap/src/common/ieee802_11_common.c \
+    third_party/hostap/src/rsn_supp/wpa.c \
+    third_party/hostap/src/rsn_supp/wpa_ie.c \
+    third_party/hostap/src/rsn_supp/pmksa_cache.c \
+    third_party/hostap/src/utils/common.c \
+    third_party/hostap/src/utils/wpabuf.c \
+    third_party/hostap/src/crypto/sha1.c \
+    third_party/hostap/src/crypto/sha1-internal.c \
+    third_party/hostap/src/crypto/sha1-prf.c \
+    third_party/hostap/src/crypto/sha1-pbkdf2.c \
+    third_party/hostap/src/crypto/sha256.c \
+    third_party/hostap/src/crypto/sha256-internal.c \
+    third_party/hostap/src/crypto/sha256-prf.c \
+    third_party/hostap/src/crypto/sha256-kdf.c \
+    third_party/hostap/src/crypto/sha384.c \
+    third_party/hostap/src/crypto/sha384-internal.c \
+    third_party/hostap/src/crypto/sha384-prf.c \
+    third_party/hostap/src/crypto/sha384-kdf.c \
+    third_party/hostap/src/crypto/sha512.c \
+    third_party/hostap/src/crypto/sha512-internal.c \
+    third_party/hostap/src/crypto/sha512-prf.c \
+    third_party/hostap/src/crypto/sha512-kdf.c \
+    third_party/hostap/src/crypto/md5.c \
+    third_party/hostap/src/crypto/md5-internal.c \
+    third_party/hostap/src/crypto/aes-internal.c \
+    third_party/hostap/src/crypto/aes-internal-enc.c \
+    third_party/hostap/src/crypto/aes-internal-dec.c \
+    third_party/hostap/src/crypto/aes-wrap.c \
+    third_party/hostap/src/crypto/aes-unwrap.c \
+    third_party/hostap/src/crypto/aes-omac1.c \
+    third_party/hostap/src/crypto/aes-ccm.c \
+    third_party/hostap/src/crypto/dh_groups.c

@@ -1,0 +1,13 @@
+.*
+!.gitattributes
+!.gitignore
+
+~*
+*~
+
+*.log
+*.pyc
+*.swp
+
+build/
+__pycache__/

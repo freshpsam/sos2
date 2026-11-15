@@ -1,0 +1,146 @@
+--- a/encoding.c
++++ b/encoding.c
+@@ -1572,7 +1572,8 @@
+             return(XML_ENC_ERR_INTERNAL);
+         }
+ 
+-        ret = func(out, outlen, in, inlen);
++        int result = func(out, outlen, in, inlen);
++        ret = result < 0 ? result : XML_ENC_ERR_SUCCESS;
+     } else {
+         xmlCharEncConvFunc func = handler->input.func;
+         int oldInlen;
+@@ -1627,7 +1628,8 @@
+             return(XML_ENC_ERR_INTERNAL);
+         }
+ 
+-        ret = func(out, outlen, in, inlen);
++        int result = func(out, outlen, in, inlen);
++        ret = result < 0 ? result : XML_ENC_ERR_SUCCESS;
+     } else {
+         xmlCharEncConvFunc func = handler->output.func;
+ 
+@@ -2148,7 +2150,7 @@
+         inlen = outlen;
+         ret = XML_ENC_ERR_SPACE;
+     } else {
+-        ret = inlen;
++        ret = XML_ENC_ERR_SUCCESS;
+     }
+ 
+     inend = in + inlen;
+@@ -2205,7 +2207,7 @@
+         in++;
+     }
+ 
+-    ret = out - outstart;
++    ret = XML_ENC_ERR_SUCCESS;
+ 
+ done:
+     *outlen = out - outstart;
+@@ -2232,8 +2234,9 @@
+ int
+ xmlIsolat1ToUTF8(unsigned char* out, int *outlen,
+                  const unsigned char* in, int *inlen) {
+-    return(latin1ToUTF8(/* ctxt */ NULL, out, outlen, in, inlen,
+-                        /* flush */ 0));
++    int result = latin1ToUTF8(/* ctxt */ NULL, out, outlen, in, inlen,
++                              /* flush */ 0);
++    return(result < 0 ? result : *outlen);
+ }
+ 
+ static xmlCharEncError
+@@ -2255,7 +2258,7 @@
+         ret = XML_ENC_ERR_SPACE;
+     } else {
+ 	len = *inlen;
+-        ret = len;
++        ret = XML_ENC_ERR_SUCCESS;
+     }
+ 
+     memcpy(out, in, len);
+@@ -2311,7 +2314,7 @@
+         in++;
+     }
+ 
+-    ret = out - outstart;
++    ret = XML_ENC_ERR_SUCCESS;
+ 
+ done:
+     *outlen = out - outstart;
+@@ -2341,8 +2344,9 @@
+     if ((out == NULL) || (outlen == NULL) || (in == NULL) || (inlen == NULL))
+         return(XML_ENC_ERR_INTERNAL);
+ 
+-    return(UTF8ToLatin1(/* ctxt */ NULL, out, outlen, in, inlen,
+-                        /* flush */ 0));
++    int result = UTF8ToLatin1(/* ctxt */ NULL, out, outlen, in, inlen,
++                              /* flush */ 0);
++    return(result < 0 ? result : *outlen);
+ }
+ #endif /* LIBXML_OUTPUT_ENABLED */
+ 
+@@ -2407,7 +2411,7 @@
+         }
+     }
+ 
+-    ret = out - outstart;
++    ret = XML_ENC_ERR_SUCCESS;
+ 
+ done:
+     *outlen = out - outstart;
+@@ -2511,7 +2515,7 @@
+         }
+     }
+ 
+-    ret = out - outstart;
++    ret = XML_ENC_ERR_SUCCESS;
+ 
+ done:
+     *outlen = out - outstart;
+@@ -2604,7 +2608,7 @@
+         }
+     }
+ 
+-    ret = out - outstart;
++    ret = XML_ENC_ERR_SUCCESS;
+ 
+ done:
+     *outlen = out - outstart;
+@@ -2707,7 +2711,7 @@
+         }
+     }
+ 
+-    ret = out - outstart;
++    ret = XML_ENC_ERR_SUCCESS;
+ 
+ done:
+     *outlen = out - outstart;
+@@ -2722,7 +2726,8 @@
+                   unsigned char *out, int *outlen,
+                   const unsigned char *in, int *inlen,
+                   int flush ATTRIBUTE_UNUSED) {
+-    return(htmlUTF8ToHtml(out, outlen, in, inlen));
++    int result = htmlUTF8ToHtml(out, outlen, in, inlen);
++    return(result < 0 ? result : XML_ENC_ERR_SUCCESS);
+ }
+ #endif
+ 
+@@ -2803,7 +2808,7 @@
+         *out++ = d;
+     }
+ 
+-    ret = out - outstart;
++    ret = XML_ENC_ERR_SUCCESS;
+ 
+ done:
+     *outlen = out - outstart;
+@@ -2857,7 +2862,7 @@
+         in += 1;
+     }
+ 
+-    ret = out - outstart;
++    ret = XML_ENC_ERR_SUCCESS;
+ 
+ done:
+     *outlen = out - outstart;

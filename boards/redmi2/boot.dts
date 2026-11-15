@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: MIT
+/dts-v1/;
+
+// Boot handoff for this native kernel, not a Linux hardware DTB.
+// CPU topology and cold boot use the verified MSM8916 ACC/SCM interface.
+// lk2nd fills memory from SMEM and inserts the active display's framebuffer.
+// Contract: msm8916-mainline/lk2nd 3e86db90765468c55e1be507cb897efd20876b71
+// See docs/redmi2.md for sources, assumptions, and untested device prerequisites.
+/ {
+    model = "Xiaomi Redmi 2 (wt88047), sos2 boot handoff";
+    compatible = "wingtech,wt88047", "qcom,msm8916";
+    #address-cells = <2>;
+    #size-cells = <2>;
+
+    chosen {
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+    };
+
+    memory@80000000 {
+        device_type = "memory";
+        reg = <0 0x80000000 0 0>;
+    };
+
+    reserved-memory {
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+    };
+};

@@ -1,0 +1,341 @@
+SOS2 port of Mesa 26.2.0 (tools/build_native_mesa.py): a POSIX-like host
+system named 'sos2' with static EGL, GLES and Gallium archives, no regex,
+sockets, SA_SIGINFO or per-thread CPU clocks, and a 32-bit off_t. Futexes map
+to the SDK's sos2_wait/sos2_wake, so Mesa's many small locks never take one
+of the SDK's fixed pthread mutex slots. Like other systems with libdrm, SOS2
+asks the render node for PRIME support, which its libdrm shim provides for
+EGL's dma-buf export.
+
+--- a/include/c99_alloca.h
++++ b/include/c99_alloca.h
+@@ -35,7 +35,7 @@
+ 
+ #  define alloca _alloca
+ 
+-#elif defined(__sun) || defined(__CYGWIN__)
++#elif defined(__sun) || defined(__CYGWIN__) || defined(__sos2__)
+ 
+ #  include <alloca.h>
+ 
+--- a/meson.build
++++ b/meson.build
+@@ -29,6 +29,14 @@
+ else
+   libname_prefix = 'lib'
+   libname_suffix = 'so'
++endif
++
++# SOS2 programs are static executables: build the API libraries and the
++# Gallium driver as archives instead of shared objects.
++if host_machine.system() == 'sos2'
++  mesa_library_type = 'library'
++else
++  mesa_library_type = 'shared_library'
+ endif
+ 
+ cc = meson.get_compiler('c')
+@@ -159,7 +167,7 @@
+ 
+ with_any_opengl = with_opengl or with_gles1 or with_gles2
+ 
+-system_has_kms_drm = ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm'].contains(host_machine.system())
++system_has_kms_drm = ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm', 'sos2'].contains(host_machine.system())
+ 
+ gallium_drivers = get_option('gallium-drivers')
+ if gallium_drivers.contains('auto')
+@@ -1862,7 +1870,8 @@
+ # it's not linux and wont
+ dep_m = cc.find_library('m', required : false)
+ 
+-if host_machine.system() == 'windows'
++# SOS2's C library has no regex: drop the driconf application patterns.
++if host_machine.system() in ['windows', 'sos2']
+   dep_regex = meson.get_compiler('c').find_library('regex', required : false)
+   if not dep_regex.found()
+     dep_regex = declare_dependency(compile_args : ['-DNO_REGEX'])
+--- a/src/egl/meson.build
++++ b/src/egl/meson.build
+@@ -204,9 +204,10 @@
+   c_args_for_egl += '-D_EGL_NATIVE_PLATFORM=_EGL_PLATFORM_@0@'.format(egl_native_platform.to_upper())
+ endif
+ 
+-libegl = shared_library(
++libegl = build_target(
+   egl_lib_name,
+   files_egl,
++  target_type : mesa_library_type,
+   c_args : [
+     c_args_for_egl,
+   ],
+--- a/src/gallium/auxiliary/hud/hud_context.c
++++ b/src/gallium/auxiliary/hud/hud_context.c
+@@ -80,7 +80,7 @@
+ static int hud_rotate = HUD_DEFAULT_ROTATION;
+ static float hud_opacity = HUD_DEFAULT_OPACITY / 100.0f;
+ 
+-#if DETECT_OS_POSIX
++#if DETECT_OS_POSIX && !DETECT_OS_SOS2
+ static void
+ signal_visible_handler(int sig, siginfo_t *siginfo, void *context)
+ {
+@@ -1984,7 +1984,7 @@
+    }
+    const char *env = debug_get_option("GALLIUM_HUD",
+       emulate_libgl_show_fps ? "stdout,fps" : NULL);
+-#if DETECT_OS_POSIX
++#if DETECT_OS_POSIX && !DETECT_OS_SOS2
+    unsigned signo = debug_get_num_option("GALLIUM_HUD_TOGGLE_SIGNAL", 0);
+    static bool sig_handled = false;
+    struct sigaction action;
+@@ -2078,7 +2078,7 @@
+    list_inithead(&hud->pane_list);
+ 
+    /* setup sig handler once for all hud contexts */
+-#if DETECT_OS_POSIX
++#if DETECT_OS_POSIX && !DETECT_OS_SOS2
+    if (!sig_handled && signo != 0) {
+       action.sa_sigaction = &signal_visible_handler;
+       action.sa_flags = SA_SIGINFO;
+--- a/src/gallium/auxiliary/util/u_screen.c
++++ b/src/gallium/auxiliary/util/u_screen.c
+@@ -132,7 +132,7 @@
+ 
+    caps->throttle = true;
+ 
+-#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_MANAGARM)
++#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_MANAGARM || DETECT_OS_SOS2)
+    if (pscreen->get_screen_fd) {
+       uint64_t cap;
+       int fd = pscreen->get_screen_fd(pscreen);
+--- a/src/gallium/auxiliary/target-helpers/inline_sw_helper.h
++++ b/src/gallium/auxiliary/target-helpers/inline_sw_helper.h
+@@ -20,7 +20,7 @@
+ #include "llvmpipe/lp_public.h"
+ #endif
+ 
+-#ifdef GALLIUM_VIRGL
++#if defined(GALLIUM_VIRGL) && !defined(__sos2__)
+ #include "virgl/virgl_public.h"
+ #include "virgl/vtest/virgl_vtest_public.h"
+ #endif
+@@ -39,7 +39,7 @@
+       screen = llvmpipe_create_screen(winsys);
+ #endif
+ 
+-#if defined(GALLIUM_VIRGL)
++#if defined(GALLIUM_VIRGL) && !defined(__sos2__)
+    if (screen == NULL && strcmp(driver, "virpipe") == 0) {
+       struct virgl_winsys *vws;
+       vws = virgl_vtest_winsys_wrap(winsys);
+--- a/src/gallium/auxiliary/target-helpers/sw_helper.h
++++ b/src/gallium/auxiliary/target-helpers/sw_helper.h
+@@ -28,7 +28,7 @@
+ #include "llvmpipe/lp_public.h"
+ #endif
+ 
+-#ifdef GALLIUM_VIRGL
++#if defined(GALLIUM_VIRGL) && !defined(__sos2__)
+ #include "virgl/virgl_public.h"
+ #include "virgl/vtest/virgl_vtest_public.h"
+ #endif
+@@ -43,7 +43,7 @@
+       screen = llvmpipe_create_screen(winsys);
+ #endif
+ 
+-#if defined(GALLIUM_VIRGL)
++#if defined(GALLIUM_VIRGL) && !defined(__sos2__)
+    if (screen == NULL && strcmp(driver, "virpipe") == 0) {
+       struct virgl_winsys *vws;
+       vws = virgl_vtest_winsys_wrap(winsys);
+--- a/src/gallium/drivers/virgl/meson.build
++++ b/src/gallium/drivers/virgl/meson.build
+@@ -27,7 +27,9 @@
+ virgl_deps = [libvirgl]
+ if not with_platform_windows
+   virgl_deps += libvirgldrm
+-  virgl_deps += libvirglvtest
++  if host_machine.system() != 'sos2'
++    virgl_deps += libvirglvtest
++  endif
+ endif
+ 
+ driver_virgl = declare_dependency(
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -172,7 +172,9 @@
+   subdir('winsys/virgl/common')
+   if not with_platform_windows
+     subdir('winsys/virgl/drm')
+-    subdir('winsys/virgl/vtest')
++    if host_machine.system() != 'sos2'
++      subdir('winsys/virgl/vtest')
++    endif
+   endif
+   subdir('drivers/virgl')
+ else
+--- a/src/gallium/targets/dri/meson.build
++++ b/src/gallium/targets/dri/meson.build
+@@ -39,9 +39,10 @@
+   libgallium_name = 'gallium-@0@'.format(meson.project_version())
+ endif
+ 
+-libgallium_dri = shared_library(
++libgallium_dri = build_target(
+   libgallium_name,
+   files('dri_target.c'),
++  target_type : mesa_library_type,
+   include_directories : [
+     inc_include, inc_src, inc_mesa, inc_gallium, inc_gallium_aux, inc_util, inc_gallium_drivers,
+     inc_gallium_winsys, include_directories('../../frontends/dri'),
+@@ -64,7 +65,7 @@
+     driver_asahi, driver_crocus, driver_rocket, driver_ethosu
+   ],
+   install : true,
+-  name_suffix : libname_suffix,
++  name_suffix : host_machine.system() == 'sos2' ? 'a' : libname_suffix,
+ )
+ 
+ shared_glapi_lib = libgallium_dri
+--- a/src/mesa/glapi/es2api/meson.build
++++ b/src/mesa/glapi/es2api/meson.build
+@@ -22,9 +22,10 @@
+   command : gen_vs_module_defs_normal_command,
+ )
+ 
+-libgles2 = shared_library(
++libgles2 = build_target(
+   'GLESv2' + get_option('gles-lib-suffix'),
+   ['libgles2_public.c', es2_glapi_mapi_tmp_h],
++  target_type : mesa_library_type,
+   vs_module_defs : gles2_def,
+   c_args : [
+     c_msvc_compat_args,
+--- a/src/util/detect_os.h
++++ b/src/util/detect_os.h
+@@ -91,6 +91,11 @@
+ #define DETECT_OS_POSIX 1
+ #endif
+ 
++#if defined(__sos2__)
++#define DETECT_OS_SOS2 1
++#define DETECT_OS_POSIX 1
++#endif
++
+ 
+ /*
+  * Make sure DETECT_OS_* are always defined, so that they can be used with #if
+@@ -134,6 +139,9 @@
+ #ifndef DETECT_OS_SOLARIS
+ #define DETECT_OS_SOLARIS 0
+ #endif
++#ifndef DETECT_OS_SOS2
++#define DETECT_OS_SOS2 0
++#endif
+ #ifndef DETECT_OS_POSIX
+ #define DETECT_OS_POSIX 0
+ #endif
+--- a/src/util/futex.c
++++ b/src/util/futex.c
+@@ -114,6 +114,41 @@
+    return futex(addr, FUTEX_WAIT, value, &tsrel, NULL);
+ }
+ 
++#elif defined(__sos2__)
++
++#include <errno.h>
++#include <time.h>
++#include <sos2/services.h>
++
++int futex_wake(uint32_t *addr, int32_t count)
++{
++   sos2_wake(addr, count < 0 ? 0u : (unsigned)count);
++   return 0;
++}
++
++/* The timeout is absolute on CLOCK_MONOTONIC, as with Linux's
++ * FUTEX_WAIT_BITSET; an SOS2 wait takes microseconds from now. */
++int futex_wait(uint32_t *addr, int32_t value, const struct timespec *timeout)
++{
++   uint32_t us = USER_WAIT_FOREVER;
++   if (timeout) {
++      struct timespec now;
++      clock_gettime(CLOCK_MONOTONIC, &now);
++      int64_t left = ((int64_t)timeout->tv_sec - now.tv_sec) * 1000000 +
++                     (timeout->tv_nsec - now.tv_nsec) / 1000;
++      if (left <= 0) {
++         errno = ETIMEDOUT;
++         return -1;
++      }
++      us = left >= USER_WAIT_FOREVER ? USER_WAIT_FOREVER - 1 : (uint32_t)left;
++   }
++   int result = sos2_wait(addr, (uint32_t)value, us);
++   if (result >= 0)
++      return 0;
++   errno = sos2_errno(result);
++   return -1;
++}
++
+ #elif defined(_WIN32) && !defined(WINDOWS_NO_FUTEX)
+ 
+ #include <windows.h>
+--- a/src/util/futex.h
++++ b/src/util/futex.h
+@@ -33,6 +33,8 @@
+ #define UTIL_FUTEX_SUPPORTED 1
+ #elif defined(__OpenBSD__)
+ #define UTIL_FUTEX_SUPPORTED 1
++#elif defined(__sos2__)
++#define UTIL_FUTEX_SUPPORTED 1
+ #elif defined(_WIN32) && !defined(WINDOWS_NO_FUTEX)
+ #define UTIL_FUTEX_SUPPORTED 1
+ #else
+--- a/src/util/os_misc.c
++++ b/src/util/os_misc.c
+@@ -60,7 +60,7 @@
+ #  include <unistd.h>
+ #  include <android/log.h>
+ #  include <sys/system_properties.h>
+-#elif DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM
++#elif DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM || DETECT_OS_SOS2
+ #  include <unistd.h>
+ #elif DETECT_OS_OPENBSD || DETECT_OS_FREEBSD
+ #  include <sys/resource.h>
+--- a/src/util/os_mman.h
++++ b/src/util/os_mman.h
+@@ -59,6 +59,14 @@
+ #  define os_munmap(addr, length) \
+              munmap(addr, length)
+ 
++#elif DETECT_OS_SOS2
++/* SOS2 has a 32-bit off_t; Mesa maps only DRM objects, at small offsets. */
++#  define os_mmap(addr, length, prot, flags, fd, offset) \
++             mmap(addr, length, prot, flags, fd, offset)
++
++#  define os_munmap(addr, length) \
++             munmap(addr, length)
++
+ #else
+ /* assume large file support exists */
+ #  define os_mmap(addr, length, prot, flags, fd, offset) \
+--- a/src/util/u_endian.h
++++ b/src/util/u_endian.h
+@@ -82,7 +82,7 @@
+ # define UTIL_ARCH_BIG_ENDIAN 1
+ #endif
+ 
+-#elif defined(_WIN32) || defined(__ANDROID__)
++#elif defined(_WIN32) || defined(__ANDROID__) || defined(__sos2__)
+ 
+ #define UTIL_ARCH_LITTLE_ENDIAN 1
+ #define UTIL_ARCH_BIG_ENDIAN 0
+--- a/src/util/u_thread.c
++++ b/src/util/u_thread.c
+@@ -176,7 +176,7 @@
+ int64_t
+ util_thread_get_time_nano(thrd_t thread)
+ {
+-#if defined(HAVE_PTHREAD) && !defined(__APPLE__) && !defined(__HAIKU__) && !defined(__managarm__)
++#if defined(HAVE_PTHREAD) && !defined(__APPLE__) && !defined(__HAIKU__) && !defined(__managarm__) && !DETECT_OS_SOS2
+    struct timespec ts;
+    clockid_t cid;
+ 

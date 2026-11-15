@@ -1,0 +1,79 @@
+--- a/Source/WebCore/platform/graphics/skia/FontCacheSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/FontCacheSkia.cpp
+@@ -138,7 +138,41 @@
+ 
+     bool isEmoji = (codePointsIterator != codePoints.end() && *codePointsIterator == emojiVariationSelector) || preferColoredFont == PreferColoredFont::Yes;
+ 
+-#if OS(ANDROID) || OS(SOS2) || PLATFORM(WIN)
++#if OS(SOS2)
++    // Skia's directory manager discovers fonts but its character fallback is
++    // deliberately empty. Select a face that covers the whole visible cluster;
++    // joiners and variation selectors are handled by HarfBuzz, not cmap lookup.
++    auto& manager = fontManager();
++    auto style = skiaFontStyle(description);
++    auto coversCluster = [&](const sk_sp<SkTypeface>& candidate) {
++        if (!candidate)
++            return false;
++        for (auto character : stringView.codePoints()) {
++            if (!isDefaultIgnorableCodePoint(character) && !candidate->unicharToGlyph(character))
++                return false;
++        }
++        return true;
++    };
++    sk_sp<SkTypeface> typeface;
++    if (isEmoji) {
++        auto candidate = manager.matchFamilyStyle("Noto Color Emoji", style);
++        if (coversCluster(candidate))
++            typeface = WTF::move(candidate);
++    }
++    // Text presentation prefers an outline font; color-only characters can
++    // still fall back to emoji if no outline face covers their cluster.
++    for (unsigned pass = 0; pass < 2 && !typeface; ++pass) {
++        for (int i = 0; i < manager.countFamilies(); ++i) {
++            SkString family;
++            manager.getFamilyName(i, &family);
++            auto candidate = manager.matchFamilyStyle(family.c_str(), style);
++            if (!coversCluster(candidate) || (!pass && FontPlatformData::skiaTypefaceHasAnySupportedColorTable(*candidate)))
++                continue;
++            typeface = WTF::move(candidate);
++            break;
++        }
++    }
++#elif OS(ANDROID) || PLATFORM(WIN)
+     // FIXME: handle locale.
+     Vector<const char*, 1> bcp47;
+     if (isEmoji)
+--- a/Source/WebCore/platform/graphics/FontCascadeFonts.cpp
++++ b/Source/WebCore/platform/graphics/FontCascadeFonts.cpp
+@@ -546,7 +546,15 @@
+ 
+     auto& cacheEntry = m_cachedPages[resolvedEmojiPolicy].ensure(pageNumber, [&] {
+         // Initialize cache with a full page of glyph mappings from a single font.
+-        return GlyphPageCacheEntry { glyphPageFromFontRanges(pageNumber, realizeFallbackRangesAt(description, fontSelector, 0)) };
++        auto& primaryRanges = realizeFallbackRangesAt(description, fontSelector, 0);
++#if OS(SOS2)
++        // A generic outline face can contain monochrome emoji. Its prefilled
++        // glyph page would bypass the presentation policy in glyphDataForVariant.
++        // Resolve these entries individually and cache the chosen fallback.
++        if (primaryRanges.isGenericFontFamily() && resolvedEmojiPolicy != ResolvedEmojiPolicy::NoPreference)
++            return GlyphPageCacheEntry { };
++#endif
++        return GlyphPageCacheEntry { glyphPageFromFontRanges(pageNumber, primaryRanges) };
+     }).iterator->value;
+ 
+     GlyphData glyphData = cacheEntry.glyphDataForCharacter(c);
+--- a/Source/WebCore/platform/graphics/FontCascade.cpp
++++ b/Source/WebCore/platform/graphics/FontCascade.cpp
+@@ -869,6 +869,12 @@
+             if (!U16_IS_TRAIL(next))
+                 continue;
+ 
++#if OS(SOS2)
++            // The simple path inserts an extra glyph for the trailing surrogate,
++            // but this port has no Font::applyTransforms to remove it. Let
++            // HarfBuzz shape supplementary characters as complete code points.
++            return CodePath::Complex;
++#endif
+             char32_t supplementaryCharacter = U16_GET_SUPPLEMENTARY(c, next);
+ 
+             if (supplementaryCharacter < 0x10A00)

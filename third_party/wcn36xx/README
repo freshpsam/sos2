@@ -1,0 +1,6 @@
+WCN36xx hardware wire definitions, Linux v6.12, ISC licensed (not Linux ABI).
+Source: https://github.com/torvalds/linux/tree/v6.12/drivers/net/wireless/ath/wcn36xx
+hal.h unchanged. dxe.h and txrx.h (bd.h here) retain only wire definitions;
+Linux includes and driver bookkeeping/prototypes removed. config.h extracts
+the WCN36xx production startup defaults from smd.c. Each file retains license.
+SOS2 implements its own scheduler, transport, DMA and station state machines.

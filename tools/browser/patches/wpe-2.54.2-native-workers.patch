@@ -1,0 +1,21 @@
+--- a/Source/WebCore/dom/Document.cpp
++++ b/Source/WebCore/dom/Document.cpp
+@@ -5091,5 +5091,9 @@
+ IDBClient::IDBConnectionProxy* Document::idbConnectionProxy()
+ {
++    // Creating a worker must not contact an unavailable IndexedDB provider
++    // when the API is disabled in the document and inherited worker settings.
++    if (!settings().indexedDBAPIEnabled())
++        return nullptr;
+     if (RefPtr connectionProxy = m_idbConnectionProxy; connectionProxy && !connectionProxy->isValid())
+         m_idbConnectionProxy = nullptr;
+     if (!m_idbConnectionProxy) {
+--- a/Source/WebCore/workers/WorkerGlobalScope.cpp
++++ b/Source/WebCore/workers/WorkerGlobalScope.cpp
+@@ -241,4 +241,6 @@
+ IDBClient::IDBConnectionProxy* WorkerGlobalScope::idbConnectionProxy()
+ {
++    if (!settingsValues().indexedDBAPIEnabled)
++        return nullptr;
+     if (RefPtr connectionProxy = m_connectionProxy; connectionProxy && connectionProxy->isValid())
+         return m_connectionProxy.get();
