@@ -1,26 +1,31 @@
 #include "battery.h"
 #ifdef SOS2_BOARD_REDMI2
 #include "redmi2_battery.h"
+#define board_battery_read redmi2_battery_read
+#elif defined(SOS2_BOARD_GTA7LITE)
+#include "gta7lite.h"
+#define board_battery_read gta7lite_battery_read
 #endif
 /* The battery icon's level and charger, read every 30 s with the screen on,
  * at once when it comes on, and never while it is off, when nothing shows
  * them. A reading that fails leaves the icon as it was, until three in a
  * row have.
- * The level is the gauge's, steadied so that the icon does not jump: off a
- * charger it only falls and on one it only rises, and a step of 5% or more
- * is taken only once three readings in a row span at most two percentage
- * points and a minute or more from first to last; smaller steps in that
- * direction are taken at once, even after a brief wake. After standby or
- * three failed reads, the same confirmation permits either direction: a
+ * The level is the phone's gauge's, or the tablet's estimate from the
+ * battery's voltage (boards/gta7lite/pmic.c), steadied so that the icon does
+ * not jump: off a charger it only falls and on one it only rises, and a step
+ * of 5% or more is taken only once three readings in a row span at most two
+ * percentage points and a minute or more from first to last; smaller steps
+ * in that direction are taken at once, even after a brief wake. After standby
+ * or three failed reads, the same confirmation permits either direction: a
  * charger may have come and gone while not polling.
- * The gauge is never reset: a reset estimates the charge afresh from the
- * voltage of the moment, which a load lowers, and on the handset the level
- * then jumped between half and near empty. */
+ * The phone's gauge is never reset: a reset estimates the charge afresh from
+ * the voltage of the moment, which a load lowers, and on the handset the
+ * level then jumped between half and near empty. */
 enum { POLL_US = 30000000 };
 static struct battery_view view;
 static uint64_t next_poll;
 static bool standby;
-#ifdef SOS2_BOARD_REDMI2
+#ifdef board_battery_read
 enum { STEP = 5, AGREEING = 3, AGREE_SPREAD = 2, AGREE_US = 60000000, FAILURES = 3 };
 
 static uint64_t step_since;
@@ -65,14 +70,15 @@ void battery_init(void) {
     view = (struct battery_view){0};
     next_poll = 0;
     standby = false;
-#ifdef SOS2_BOARD_REDMI2
+#ifdef board_battery_read
     shown_valid = resync = false;
     step_readings = failures = 0;
 #endif
 }
 
-bool battery_supported(void) {
-#ifdef SOS2_BOARD_REDMI2
+/* Whether this board has a battery gauge (QEMU has none). */
+static bool battery_supported(void) {
+#ifdef board_battery_read
     return true;
 #else
     return false; /* QEMU virt has no battery; never invent a percentage. */
@@ -85,7 +91,7 @@ void battery_standby(bool active) {
     if (active == standby || !battery_supported()) return;
     standby = active;
     next_poll = active ? UINT64_MAX : time_us();
-#ifdef SOS2_BOARD_REDMI2
+#ifdef board_battery_read
     step_readings = 0;
     if (!active) resync = true;
 #endif
@@ -98,9 +104,9 @@ void battery_service(void *unused) {
     if (standby) return;
     uint64_t now = time_us();
     next_poll = now + POLL_US;
-#ifdef SOS2_BOARD_REDMI2
+#ifdef board_battery_read
     struct battery_view sample;
-    if (!redmi2_battery_read(&sample)) {
+    if (!board_battery_read(&sample)) {
         step_readings = 0;
         if (failures < FAILURES) ++failures;
         if (failures == FAILURES) {

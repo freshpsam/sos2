@@ -1,0 +1,30 @@
+--- a/Source/WebCore/loader/EmptyClients.h
++++ b/Source/WebCore/loader/EmptyClients.h
+@@ -178,10 +178,10 @@ class EmptyChromeClient : public ChromeClient {
+     void scrollContainingScrollViewsToRevealRect(const IntRect&) const final { }
+     void scrollMainFrameToRevealRect(const IntRect&) const final { }
+ 
+-    void attachRootGraphicsLayer(LocalFrame&, GraphicsLayer*) final { }
+-    void attachViewOverlayGraphicsLayer(GraphicsLayer*) final { }
+-    void setNeedsOneShotDrawingSynchronization() final { }
+-    void triggerRenderingUpdate() final { }
++    void attachRootGraphicsLayer(LocalFrame&, GraphicsLayer*) override { }
++    void attachViewOverlayGraphicsLayer(GraphicsLayer*) override { }
++    void setNeedsOneShotDrawingSynchronization() override { }
++    void triggerRenderingUpdate() override { }
+ 
+ #if PLATFORM(WIN)
+     void AXStartFrameLoad() final { }
+--- a/Source/WebCore/rendering/RenderLayerBacking.cpp
++++ b/Source/WebCore/rendering/RenderLayerBacking.cpp
+@@ -3674,7 +3674,9 @@ LayoutSize RenderLayerBacking::offsetRelativeToRendererOriginForDescendantLayers
+ 
+ bool RenderLayerBacking::paintsIntoWindow() const
+ {
+-#if USE(COORDINATED_GRAPHICS)
++    // SOS2 composites on the CPU: like Coordinated Graphics, the RenderView
++    // paints into its own layer, so root-level negative z-order layers stay below.
++#if USE(COORDINATED_GRAPHICS) || OS(SOS2)
+         return false;
+ #endif
+ 

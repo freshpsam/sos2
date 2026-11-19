@@ -47,12 +47,25 @@ arm_process_vectors:
     str     r1, [sp, #76]
     mov     r0, sp
     bl      arm_trap_dispatch
+    cmp     r0, #0
+    bne     1f
     add     sp, sp, #80
     cps     #0x13
     mrc     p15, 0, sp, c13, c0, 4
     ldr     sp, [sp]
     add     sp, sp, #4
     pop     {r4-r11, pc}
+    /* Handled on this CPU: resume the user context from the frame. */
+1:  ldr     r0, [sp, #64]
+    msr     spsr_cxsf, r0
+    add     r0, sp, #52
+    ldmia   r0, {sp, lr}^
+    nop
+    ldr     lr, [sp, #60]
+    ldmia   sp, {r0-r12}
+    add     sp, sp, #80
+    clrex
+    movs    pc, lr
     .endm
     trap    trap_reset, 0
     trap    trap_undefined, 1, 4

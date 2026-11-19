@@ -3,7 +3,7 @@
 #include "graphics.h"
 #include "user_input.h"
 bool input_init(const uintptr_t *bases, size_t count, uint32_t width, uint32_t height);
-/* Runtime failure produces one cancelled event, then no events until reinit. */
+/* Runtime failure produces one cancelled event, then no more events. */
 bool input_poll_extended(struct pointer_event *event, int32_t *wheel_x, int32_t *wheel_y);
 /* Optional, independent virtio keyboard. A failure emits one INPUT_RESET. */
 bool keyboard_init(const uintptr_t *bases, size_t count);

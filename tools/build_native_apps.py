@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Build the native C programs for the resource bundle: the system's updater
 and the apps in apps/.
 
@@ -18,11 +17,10 @@ from pathlib import Path
 import re
 import struct
 import subprocess
-import sys
+import arch
+import build_native_runtime as runtime
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT/'tools'))
-import build_native_runtime as runtime  # noqa: E402
 
 APPS = ROOT/'apps'
 OUT = runtime.BASE/'apps'
@@ -75,11 +73,11 @@ def program(directory, out, libraries):
         raise RuntimeError(f'{directory}: no C sources')
     out.mkdir(parents=True, exist_ok=True)
     linked, stripped = out/'program.elf', out/'program'
-    subprocess.run(['arm-none-eabi-gcc', *runtime.sdk_flags(), '-Wall', '-Wextra', '-Werror',
+    subprocess.run([arch.tool('gcc'), *runtime.sdk_flags(), '-Wall', '-Wextra', '-Werror',
                     *map(str, sources), str(ROOT/'kernel/graphics.c'), '-o', str(linked),
                     *runtime.link_flags(), *[f'-l{library}' for library in libraries],
                     *runtime.link_libraries()], cwd=ROOT, check=True)
-    subprocess.run(['arm-none-eabi-strip', '--strip-unneeded', '-o', str(stripped), str(linked)], check=True)
+    subprocess.run([arch.tool('strip'), '--strip-unneeded', '-o', str(stripped), str(linked)], check=True)
     return stripped
 
 
@@ -109,15 +107,3 @@ def files():
     for directory in directories:
         entries.update(build(directory))
     return entries
-
-
-def main():
-    try:
-        for name in sorted(files()):
-            print(name)
-    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
-        sys.exit(str(error))
-
-
-if __name__ == '__main__':
-    main()

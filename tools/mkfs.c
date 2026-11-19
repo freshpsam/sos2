@@ -7,8 +7,8 @@
 #include "lfs.h"
 
 /* Creates a NEW regular image holding one littlefs volume with the SOS2
- * layout (/settings, /profiles). Never formats an existing path or device.
- * Guest mount failures never call format. */
+ * layout (/settings, /profiles). Never formats an existing path or device;
+ * nor does the kernel format such a disk when it does not mount. */
 static int read_blocks(const struct lfs_config *c, lfs_block_t block, lfs_off_t off, void *data,
                        lfs_size_t size) {
     FILE *file = c->context;

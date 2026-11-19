@@ -1,0 +1,845 @@
+--- a/Source/JavaScriptCore/runtime/JSCBytecodeCacheVersion.cpp
++++ b/Source/JavaScriptCore/runtime/JSCBytecodeCacheVersion.cpp
+@@ -31,7 +31,7 @@
+ #include <wtf/NeverDestroyed.h>
+ #include <wtf/text/SuperFastHash.h>
+ 
+-#if OS(UNIX)
++#if OS(UNIX) && !OS(SOS2)
+ #include <dlfcn.h>
+ #if OS(DARWIN)
+ #include <mach-o/dyld.h>
+@@ -68,7 +68,7 @@ uint32_t computeJSCBytecodeCacheVersion()
+         }
+         cacheVersion.construct(0);
+         dataLogLnIf(JSCBytecodeCacheVersionInternal::verbose, "Failed to get UUID for JavaScriptCore framework");
+-#elif OS(UNIX) && !PLATFORM(PLAYSTATION) && !OS(HAIKU) && !OS(QNX)
++#elif OS(UNIX) && !PLATFORM(PLAYSTATION) && !OS(HAIKU) && !OS(QNX) && !OS(SOS2)
+         auto result = ([&] -> std::optional<uint32_t> {
+             Dl_info info { };
+             if (!dladdr(jsFunctionAddr, &info))
+--- a/Source/ThirdParty/ANGLE/include/EGL/eglplatform.h
++++ b/Source/ThirdParty/ANGLE/include/EGL/eglplatform.h
+@@ -139,7 +139,7 @@ typedef void              *EGLNativeDisplayType;
+ typedef khronos_uintptr_t  EGLNativePixmapType;
+ typedef khronos_uintptr_t  EGLNativeWindowType;
+ 
+-#elif defined(__Fuchsia__)
++#elif defined(__Fuchsia__) || defined(__sos2__)
+ 
+ typedef void              *EGLNativeDisplayType;
+ typedef khronos_uintptr_t  EGLNativePixmapType;
+--- a/Source/ThirdParty/skia/CMakeLists.txt
++++ b/Source/ThirdParty/skia/CMakeLists.txt
+@@ -1,9 +1,14 @@
+ set_property(DIRECTORY . PROPERTY FOLDER "skia")
++if (SOS2_NATIVE_TARGET)
++    add_compile_definitions(SKCMS_PORTABLE SK_FREETYPE_MINIMUM_RUNTIME_VERSION_IS_BUILD_VERSION)
++endif ()
+ 
+ # Skia dependencies not used directly in WebKit.
+ if (NOT WIN32 AND NOT PLAYSTATION)
+     find_package(Freetype 2.9.0 REQUIRED)
+-    find_package(Fontconfig 2.13.0 REQUIRED)
++    if (NOT SOS2_NATIVE_TARGET)
++        find_package(Fontconfig 2.13.0 REQUIRED)
++    endif ()
+ endif ()
+ 
+ if (USE_SKIA_ENCODERS)
+@@ -828,7 +833,13 @@ else ()
+     )
+     target_link_libraries(Skia PRIVATE Freetype::Freetype)
+ 
+-    if (ANDROID)
++    if (SOS2_NATIVE_TARGET)
++        target_sources(Skia PRIVATE
++            src/ports/SkFontMgr_custom.cpp
++            src/ports/SkFontMgr_custom_directory.cpp
++            src/utils/SkOSPath.cpp
++        )
++    elseif (ANDROID)
+         target_sources(Skia PRIVATE
+             src/ports/SkDebug_android.cpp
+             src/ports/SkFontMgr_android.cpp
+@@ -846,7 +857,9 @@ else ()
+     endif ()
+ endif ()
+ 
+-if (USE_LIBEPOXY)
++if (SOS2_NATIVE_TARGET)
++    target_sources(Skia PRIVATE src/gpu/ganesh/gl/GrGLMakeNativeInterface_none.cpp)
++elseif (USE_LIBEPOXY)
+     target_sources(Skia PRIVATE src/gpu/ganesh/gl/epoxy/GrGLMakeEpoxyEGLInterface.cpp)
+     target_link_libraries(Skia PRIVATE Epoxy::Epoxy)
+ else ()
+--- a/Source/ThirdParty/skia/include/private/base/SkFeatures.h
++++ b/Source/ThirdParty/skia/include/private/base/SkFeatures.h
+@@ -19,6 +19,10 @@
+         #define SK_BUILD_FOR_WIN
+     #elif defined(ANDROID) || defined(__ANDROID__)
+         #define SK_BUILD_FOR_ANDROID
++    #elif defined(__sos2__)
++        // Select the portable POSIX interfaces supplied by SOS2's SDK.
++        #define SK_BUILD_FOR_SOS2
++        #define SK_BUILD_FOR_UNIX
+     #elif defined(linux) || defined(__linux) || defined(__FreeBSD__) || \
+           defined(__OpenBSD__) || defined(__sun) || defined(__NetBSD__) || \
+           defined(__DragonFly__) || defined(__Fuchsia__) || \
+--- a/Source/WTF/wtf/FastMalloc.cpp
++++ b/Source/WTF/wtf/FastMalloc.cpp
+@@ -24,6 +24,9 @@
+  */
+ 
+ #include "config.h"
++#if OS(SOS2)
++#include <sos2/services.h>
++#endif
+ #include <wtf/FastMalloc.h>
+ 
+ #include <string.h>
+@@ -821,6 +824,10 @@ FastMallocStatistics fastMallocStatistics()
+     area_info info;
+     while (get_next_area_info(B_CURRENT_TEAM, &cookie, &info) == B_OK)
+         statistics.committedVMBytes += info.ram_size;
++#elif OS(SOS2)
++    user_memory_info memory;
++    if (!sos2_memory_info(&memory))
++        statistics.committedVMBytes = memory.peak_pages * memory.page_size;
+ #elif HAVE(RESOURCE_H)
+     struct rusage resourceUsage;
+     getrusage(RUSAGE_SELF, &resourceUsage);
+--- a/Source/WTF/wtf/PlatformHave.h
++++ b/Source/WTF/wtf/PlatformHave.h
+@@ -200,7 +200,7 @@
+ #define HAVE_RESOURCE_H 1
+ #endif
+ 
+-#if OS(UNIX) && !OS(FUCHSIA)
++#if OS(UNIX) && !OS(FUCHSIA) && !OS(SOS2)
+ #define HAVE_PTHREAD_SETSCHEDPARAM 1
+ #endif
+ 
+--- a/Source/WTF/wtf/PlatformLegacy.h
++++ b/Source/WTF/wtf/PlatformLegacy.h
+@@ -46,7 +46,9 @@
+ /* PLATFORM(IOS_SIMULATOR) */
+ /* PLATFORM(IOS_FAMILY_SIMULATOR) */
+ /* PLATFORM(WIN) */
+-#if defined(BUILDING_GTK__)
++#if defined(BUILDING_SOS2__)
++#define WTF_PLATFORM_SOS2 1
++#elif defined(BUILDING_GTK__)
+ #define WTF_PLATFORM_GTK 1
+ #elif defined(BUILDING_HAIKU__)
+ #define WTF_PLATFORM_HAIKU 1
+--- a/Source/WTF/wtf/PlatformOS.h
++++ b/Source/WTF/wtf/PlatformOS.h
+@@ -132,8 +132,13 @@
+ #endif
+ 
+ 
+-/* OS(UNIX) - Any Unix-like system */
+-#if    OS(AIX)              \
++#if defined(__sos2__)
++#define WTF_OS_SOS2 1
++#endif
++
++/* OS(UNIX) - Platforms providing the selected POSIX source interfaces. */
++#if    OS(SOS2)             \
++    || OS(AIX)             \
+     || OS(DARWIN)           \
+     || OS(FREEBSD)          \
+     || OS(FUCHSIA)          \
+--- a/Source/WTF/wtf/PlatformRegisters.h
++++ b/Source/WTF/wtf/PlatformRegisters.h
+@@ -29,7 +29,9 @@
+ #include <wtf/Platform.h>
+ #include <wtf/StdLibExtras.h>
+ 
+-#if OS(DARWIN)
++#if OS(SOS2)
++#include <user_abi.h>
++#elif OS(DARWIN)
+ #include <mach/exception_types.h>
+ #include <mach/thread_act.h>
+ #include <signal.h>
+@@ -72,6 +74,13 @@ inline PlatformRegisters& registersFromUContext(ucontext_t* ucontext)
+ 
+ using PlatformRegisters = CONTEXT;
+ 
++#elif OS(SOS2)
++
++struct PlatformRegisters {
++    user_thread_context native;
++    void* stackPointer;
++};
++
+ #elif HAVE(MACHINE_CONTEXT)
+ 
+ struct PlatformRegisters {
+--- a/Source/WTF/wtf/RAMSize.cpp
++++ b/Source/WTF/wtf/RAMSize.cpp
+@@ -38,6 +38,9 @@
+ #endif // OS(LINUX) || OS(FREEBSD) || OS(UNIX) || OS(HAIKU)
+ #else
+ #include <bmalloc/bmalloc.h>
++#if OS(SOS2)
++#include <unistd.h>
++#endif
+ #endif
+ 
+ #if OS(DARWIN)
+@@ -72,6 +75,14 @@ static size_t computeRAMSize()
+ #error "Missing a platform specific way of determining the available RAM"
+ #endif // OS(LINUX) || OS(FREEBSD) || OS(UNIX) || OS(HAIKU)
+ #else
++#if OS(SOS2)
++    // The process's memory quota, as 2.54's WTF::availableMemory reads it.
++    // bmalloc's reads it only with __unix__ and otherwise guesses 512 MiB.
++    long pages = sysconf(_SC_PHYS_PAGES);
++    long pageSize = sysconf(_SC_PAGE_SIZE);
++    if (pages > 0 && pageSize > 0)
++        return static_cast<size_t>(pages) * static_cast<size_t>(pageSize);
++#endif
+     return bmalloc::api::availableMemory();
+ #endif
+ }
+--- a/Source/WTF/wtf/RandomDevice.cpp
++++ b/Source/WTF/wtf/RandomDevice.cpp
+@@ -66,6 +66,10 @@ NEVER_INLINE NO_RETURN_DUE_TO_CRASH static void crashUnableToReadFromURandom()
+ #if !OS(DARWIN) && !OS(FUCHSIA) && !OS(WINDOWS)
+ RandomDevice::RandomDevice()
+ {
++#if OS(SOS2)
++    // Native entropy is a kernel service, not a special filesystem pathname.
++    m_fd = -1;
++#else
+     int ret = 0;
+     do {
+         ret = open("/dev/urandom", O_RDONLY, 0);
+@@ -73,13 +77,16 @@ RandomDevice::RandomDevice()
+     m_fd = ret;
+     if (m_fd < 0)
+         crashUnableToOpenURandom(); // We need /dev/urandom for this API to work...
++#endif
+ }
+ #endif
+ 
+ #if !OS(DARWIN) && !OS(FUCHSIA) && !OS(WINDOWS)
+ RandomDevice::~RandomDevice()
+ {
++#if !OS(SOS2)
+     close(m_fd);
++#endif
+ }
+ #endif
+ 
+@@ -91,6 +98,12 @@ void RandomDevice::cryptographicallyRandomValues(std::span<uint8_t> buffer)
+     RELEASE_ASSERT(!CCRandomGenerateBytes(buffer.data(), buffer.size()));
+ #elif OS(FUCHSIA)
+     zx_cprng_draw(buffer.data(), buffer.size());
++#elif OS(SOS2)
++    while (!buffer.empty()) {
++        auto chunk = buffer.first(std::min<size_t>(buffer.size(), 256));
++        RELEASE_ASSERT(!getentropy(chunk.data(), chunk.size()));
++        buffer = buffer.subspan(chunk.size());
++    }
+ #elif OS(UNIX)
+     ssize_t amountRead = 0;
+     while (static_cast<size_t>(amountRead) < buffer.size()) {
+--- a/Source/WTF/wtf/Threading.h
++++ b/Source/WTF/wtf/Threading.h
+@@ -53,7 +53,7 @@
+ #include <wtf/WordLock.h>
+ #include <wtf/text/AtomStringTable.h>
+ 
+-#if USE(PTHREADS) && !OS(DARWIN)
++#if USE(PTHREADS) && !OS(DARWIN) && !OS(SOS2)
+ #include <signal.h>
+ #endif
+ 
+@@ -329,7 +329,7 @@ protected:
+     void establishPlatformSpecificHandle(PlatformThreadHandle, ThreadIdentifier);
+ #endif
+ 
+-#if USE(PTHREADS) && !OS(DARWIN)
++#if USE(PTHREADS) && !OS(DARWIN) && !OS(SOS2)
+     static void signalHandlerSuspendResume(int, siginfo_t*, void* ucontext);
+ #endif
+ 
+--- a/Source/WTF/wtf/generic/MemoryFootprintGeneric.cpp
++++ b/Source/WTF/wtf/generic/MemoryFootprintGeneric.cpp
+@@ -27,7 +27,9 @@
+ #include <wtf/MemoryFootprint.h>
+ #include <wtf/Platform.h>
+ 
+-#if !USE(SYSTEM_MALLOC) && (OS(LINUX) || OS(FREEBSD))
++#if OS(SOS2)
++#include <sos2/services.h>
++#elif !USE(SYSTEM_MALLOC) && (OS(LINUX) || OS(FREEBSD))
+ #include <bmalloc/bmalloc.h>
+ #endif
+ 
+@@ -35,7 +37,10 @@ namespace WTF {
+ 
+ size_t memoryFootprint()
+ {
+-#if !USE(SYSTEM_MALLOC) && (OS(LINUX) || OS(FREEBSD))
++#if OS(SOS2)
++    user_memory_info memory;
++    return sos2_memory_info(&memory) ? 0 : memory.current_pages * memory.page_size;
++#elif !USE(SYSTEM_MALLOC) && (OS(LINUX) || OS(FREEBSD))
+     return bmalloc::api::memoryFootprint();
+ #else
+     return 0;
+--- a/Source/WTF/wtf/posix/OSAllocatorPOSIX.cpp
++++ b/Source/WTF/wtf/posix/OSAllocatorPOSIX.cpp
+@@ -101,12 +101,19 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
+         return result.leakSpan().data();
+ 
+     if (numGuardPagesToAddOnEachEnd) {
++#if OS(SOS2)
++        // Native mappings are owned allocations; protect their guard pages
++        // instead of asking mmap to replace an existing allocation.
++        RELEASE_ASSERT(!mprotect(result.mutableSpan().first(guardSize).data(), guardSize, PROT_NONE));
++        RELEASE_ASSERT(!mprotect(result.mutableSpan().last(guardSize).data(), guardSize, PROT_NONE));
++#else
+         // We use mmap to remap the guardpages rather than using mprotect as
+         // mprotect results in multiple references to the code region. This
+         // breaks the madvise based mechanism we use to return physical memory
+         // to the OS.
+         mmap(result.mutableSpan().first(guardSize).data(), guardSize, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, fd, 0);
+         mmap(result.mutableSpan().last(guardSize).data(), guardSize, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, fd, 0);
++#endif
+     }
+     // Since we're only interested in the starting address, we don't have to specify the actual end of the
+     // subspan to exclude the trailing guard pages.
+--- a/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
++++ b/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
+@@ -59,7 +59,9 @@
+ 
+ #if !OS(DARWIN) && OS(UNIX)
+ 
++#if !OS(SOS2)
+ #include <semaphore.h>
++#endif
+ #include <sys/mman.h>
+ #include <unistd.h>
+ #include <pthread.h>
+@@ -83,7 +85,7 @@ namespace WTF {
+ 
+ Thread::~Thread() = default;
+ 
+-#if !OS(DARWIN)
++#if !OS(DARWIN) && !OS(SOS2)
+ class Semaphore final {
+     WTF_MAKE_NONCOPYABLE(Semaphore);
+     WTF_DEPRECATED_MAKE_FAST_ALLOCATED(Semaphore);
+@@ -190,7 +192,7 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
+     }
+     g_wtfConfig.isThreadSuspendResumeSignalConfigured = true;
+ 
+-#if !OS(DARWIN)
++#if !OS(DARWIN) && !OS(SOS2)
+     globalSemaphoreForSuspendResume.construct(0);
+ 
+     // Signal handlers are process global configuration.
+@@ -231,7 +233,7 @@ ThreadIdentifier Thread::currentID()
+ 
+ void Thread::initializeCurrentThreadEvenIfNonWTFCreated()
+ {
+-#if !OS(DARWIN)
++#if !OS(DARWIN) && !OS(SOS2)
+     RELEASE_ASSERT(g_wtfConfig.isThreadSuspendResumeSignalConfigured);
+     sigset_t mask;
+     sigemptyset(&mask);
+@@ -447,17 +449,29 @@ Thread& Thread::initializeCurrentTLS()
+ 
+ bool Thread::signal(int signalNumber)
+ {
++#if OS(SOS2)
++    UNUSED_PARAM(signalNumber);
++    return false;
++#else
+     Locker locker { m_mutex };
+-    if (hasExited())
++    if (m_didExit)
+         return false;
+-    int errNo = pthread_kill(m_handle, signalNumber);
+-    return !errNo; // A 0 errNo means success.
++    return !pthread_kill(m_handle, signalNumber);
++#endif
+ }
+ 
+ auto Thread::suspend(const ThreadSuspendLocker&) -> Expected<void, PlatformSuspendError>
+ {
+     RELEASE_ASSERT_WITH_MESSAGE(this != &Thread::currentSingleton(), "We do not support suspending the current thread itself.");
+-#if OS(DARWIN)
++#if OS(SOS2)
++    if (!m_suspendCount) {
++        int error = sos2_thread_suspend(m_handle);
++        if (error)
++            return makeUnexpected(error);
++    }
++    ++m_suspendCount;
++    return { };
++#elif OS(DARWIN)
+     kern_return_t result = thread_suspend(m_platformThread);
+     if (result != KERN_SUCCESS)
+         return makeUnexpected(result);
+@@ -486,7 +500,11 @@ auto Thread::suspend(const ThreadSuspendLocker&) -> Expected<void, PlatformSuspe
+ 
+ void Thread::resume(const ThreadSuspendLocker&)
+ {
+-#if OS(DARWIN)
++#if OS(SOS2)
++    RELEASE_ASSERT(m_suspendCount);
++    if (!--m_suspendCount)
++        RELEASE_ASSERT(!sos2_thread_resume(m_handle));
++#elif OS(DARWIN)
+     thread_resume(m_platformThread);
+ #else
+     if (m_suspendCount == 1) {
+@@ -543,7 +561,12 @@ static ThreadStateMetadata threadStateMetadata()
+ 
+ size_t Thread::getRegisters(const ThreadSuspendLocker&, PlatformRegisters& registers)
+ {
+-#if OS(DARWIN)
++#if OS(SOS2)
++    RELEASE_ASSERT(m_suspendCount);
++    RELEASE_ASSERT(!sos2_thread_context(m_handle, &registers.native));
++    registers.stackPointer = reinterpret_cast<void*>(registers.native.sp);
++    return sizeof(registers);
++#elif OS(DARWIN)
+     auto metadata = threadStateMetadata();
+     kern_return_t result = thread_get_state(m_platformThread, metadata.flavor, (thread_state_t)&registers, &metadata.userCount);
+     if (result != KERN_SUCCESS) {
+--- a/Source/WTF/wtf/threads/Signals.cpp
++++ b/Source/WTF/wtf/threads/Signals.cpp
+@@ -485,6 +485,7 @@ void addSignalHandler(Signal signal, SignalHandler&& handler)
+     g_wtfConfig.signalHandlers.add(signal, WTF::move(handler));
+ }
+ 
++#if !OS(SOS2)
+ static void jscSignalHandler(int sig, siginfo_t* info, void* ucontext)
+ {
+     Signal signal = fromSystemSignal(sig);
+@@ -555,6 +556,8 @@ static void jscSignalHandler(int sig, siginfo_t* info, void* ucontext)
+     }
+ }
+ 
++#endif
++
+ void SignalHandlers::initialize()
+ {
+     SignalHandlers& handlers = g_wtfConfig.signalHandlers;
+@@ -584,6 +587,12 @@ void SignalHandlers::finalize()
+         initMachExceptionHandlerThread();
+ #endif
+ 
++#if OS(SOS2)
++    // Native suspension serves GC. No Unix signal delivery is implemented;
++    // reject an engine configuration that attempts to depend on it.
++    for (unsigned i = 0; i < numberOfSignals; ++i)
++        RELEASE_ASSERT(!handlers.numberOfHandlers[i]);
++#else
+     if (!handlers.useMach) {
+         for (unsigned i = 0; i < numberOfSignals; ++i) {
+             if (!handlers.numberOfHandlers[i])
+@@ -606,6 +615,7 @@ void SignalHandlers::finalize()
+             RELEASE_ASSERT(!result);
+         }
+     }
++#endif
+ }
+ 
+ } // namespace WTF
+--- a/Source/WebCore/CMakeLists.txt
++++ b/Source/WebCore/CMakeLists.txt
+@@ -2170,7 +2170,7 @@ if (USE_ANGLE_EGL)
+     )
+ elseif (USE_LIBEPOXY)
+     list(APPEND WebCore_LIBRARIES Epoxy::Epoxy)
+-else ()
++elseif (NOT SOS2_NATIVE_TARGET)
+     list(APPEND WebCore_LIBRARIES OpenGL::GLES)
+ 
+     list(APPEND WebCore_SYSTEM_INCLUDE_DIRECTORIES
+@@ -3127,3 +3127,7 @@ if (${WebCore_LIBRARY_TYPE} MATCHES "SHARED")
+     set_target_properties(WebCore PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
+     install(TARGETS WebCore DESTINATION "${LIB_INSTALL_DIR}")
+ endif ()
++
++if (SOS2_NATIVE_TARGET)
++    include("${SOS2_ROOT}/programs/browser/web_target.cmake")
++endif ()
+--- a/Source/WebCore/accessibility/AXCoreObject.h
++++ b/Source/WebCore/accessibility/AXCoreObject.h
+@@ -78,7 +78,7 @@ class AccessibilityObjectAtspi;
+ 
+ typedef WebCore::AccessibilityObjectAtspi AccessibilityObjectWrapper;
+ 
+-#elif PLATFORM(PLAYSTATION) || PLATFORM(HAIKU)
++#elif PLATFORM(PLAYSTATION) || PLATFORM(HAIKU) || OS(SOS2)
+ class AccessibilityObjectWrapper : public RefCounted<AccessibilityObjectWrapper> { };
+ #else
+ class AccessibilityObjectWrapper;
+@@ -1399,7 +1399,7 @@ private:
+     RetainPtr<WebAccessibilityObjectWrapper> m_wrapper;
+ #elif PLATFORM(WIN)
+     COMPtr<AccessibilityObjectWrapper> m_wrapper;
+-#elif PLATFORM(PLAYSTATION) || PLATFORM(HAIKU)
++#elif PLATFORM(PLAYSTATION) || PLATFORM(HAIKU) || OS(SOS2)
+     RefPtr<AccessibilityObjectWrapper> m_wrapper;
+ #elif USE(ATSPI)
+     RefPtr<AccessibilityObjectAtspi> m_wrapper;
+--- a/Source/WebCore/crypto/keys/CryptoKeyEC.h
++++ b/Source/WebCore/crypto/keys/CryptoKeyEC.h
+@@ -63,6 +63,10 @@ using PlatformECKeyContainer = WebCore::EvpPKeyPtr;
+ namespace WebCore {
+ 
+ struct JsonWebKey;
++#if OS(SOS2)
++// No native asymmetric-key backend is registered in the initial port.
++using PlatformECKeyContainer = std::nullptr_t;
++#endif
+ template<typename> class ExceptionOr;
+ 
+ class CryptoKeyEC final : public CryptoKey {
+--- a/Source/WebCore/crypto/keys/CryptoKeyRSA.h
++++ b/Source/WebCore/crypto/keys/CryptoKeyRSA.h
+@@ -28,6 +28,12 @@
+ #include "CryptoKey.h"
+ #include <wtf/Function.h>
+ 
++#if OS(SOS2)
++struct SOS2UnavailableRSAKey { };
++using PlatformRSAKey = SOS2UnavailableRSAKey*;
++using PlatformRSAKeyContainer = std::unique_ptr<SOS2UnavailableRSAKey>;
++#endif
++
+ #if OS(DARWIN) && !PLATFORM(GTK)
+ #include "CommonCryptoUtilities.h"
+ 
+--- a/Source/WebCore/page/Page.cpp
++++ b/Source/WebCore/page/Page.cpp
+@@ -4912,7 +4912,7 @@ OptionSet<FilterRenderingMode> Page::preferredFilterRenderingModes(const Graphic
+         modes.add(FilterRenderingMode::Accelerated);
+ #endif
+ 
+-#if USE(SKIA)
++#if USE(SKIA) && !OS(SOS2)
+     if (settings().acceleratedCompositingEnabled())
+         modes.add(FilterRenderingMode::Accelerated);
+ #endif
+--- a/Source/WebCore/platform/Pasteboard.h
++++ b/Source/WebCore/platform/Pasteboard.h
+@@ -107,7 +107,7 @@ struct PasteboardWebContent {
+     bool canSmartCopyOrDelete;
+     String text;
+     String markup;
+-#elif USE(LIBWPE)
++#elif USE(LIBWPE) || PLATFORM(SOS2)
+     String text;
+     String markup;
+ #endif
+--- a/Source/WebCore/platform/SharedMemory.h
++++ b/Source/WebCore/platform/SharedMemory.h
+@@ -62,7 +62,9 @@ WEBCORE_EXPORT bool isMemoryAttributionDisabled();
+ class SharedMemoryHandle {
+ public:
+     using Type =
+-#if USE(UNIX_DOMAIN_SOCKETS)
++#if OS(SOS2)
++        uintptr_t; // Reserved representation; this port does not export or map handles.
++#elif USE(UNIX_DOMAIN_SOCKETS)
+         UnixFileDescriptor;
+ #elif OS(DARWIN)
+         MachSendRight;
+--- a/Source/WebCore/platform/graphics/FontCache.h
++++ b/Source/WebCore/platform/graphics/FontCache.h
+@@ -83,7 +83,7 @@ struct IDWriteFontCollection;
+ #if USE(SKIA)
+ #include "SkiaHarfBuzzFontCache.h"
+ #include <skia/core/SkFontMgr.h>
+-#if !OS(ANDROID) && !PLATFORM(WIN)
++#if !OS(ANDROID) && !OS(SOS2) && !PLATFORM(WIN)
+ #include "SkiaSystemFallbackFontCache.h"
+ #endif
+ #endif
+@@ -285,7 +285,7 @@ private:
+ #if USE(SKIA)
+     mutable sk_sp<SkFontMgr> m_fontManager;
+     SkiaHarfBuzzFontCache m_harfBuzzFontCache;
+-#if !OS(ANDROID) && !PLATFORM(WIN)
++#if !OS(ANDROID) && !OS(SOS2) && !PLATFORM(WIN)
+     SkiaSystemFallbackFontCache m_skiaSystemFallbackFontCache;
+ #endif
+ #endif
+--- a/Source/WebCore/platform/graphics/skia/FontCacheSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/FontCacheSkia.cpp
+@@ -42,7 +42,9 @@
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/ports/SkFontScanner_FreeType.h>
+ 
+-#if OS(ANDROID)
++#if OS(SOS2)
++#include <skia/ports/SkFontMgr_directory.h>
++#elif OS(ANDROID)
+ #include <skia/ports/SkFontMgr_android.h>
+ #elif PLATFORM(WIN)
+ #include <dwrite.h>
+@@ -61,7 +63,9 @@ void FontCache::platformInit()
+ SkFontMgr& FontCache::fontManager() const
+ {
+     if (!m_fontManager) {
+-#if OS(ANDROID)
++#if OS(SOS2)
++        m_fontManager = SkFontMgr_New_Custom_Directory("/fonts");
++#elif OS(ANDROID)
+         m_fontManager = SkFontMgr_New_Android(nullptr, SkFontScanner_Make_FreeType());
+ #elif OS(WINDOWS)
+         auto result = createDWriteFactory();
+@@ -134,7 +138,7 @@ RefPtr<Font> FontCache::systemFallbackForCharacterCluster(const FontDescription&
+ 
+     bool isEmoji = (codePointsIterator != codePoints.end() && *codePointsIterator == emojiVariationSelector) || preferColoredFont == PreferColoredFont::Yes;
+ 
+-#if OS(ANDROID) || PLATFORM(WIN)
++#if OS(ANDROID) || OS(SOS2) || PLATFORM(WIN)
+     // FIXME: handle locale.
+     Vector<const char*, 1> bcp47;
+     if (isEmoji)
+@@ -179,7 +183,9 @@ bool FontCache::isSystemFontForbiddenForEditing(const String&)
+ 
+ Ref<Font> FontCache::lastResortFallbackFont(const FontDescription& fontDescription)
+ {
+-#if PLATFORM(WIN)
++#if OS(SOS2)
++    const auto defaultFontName = "DejaVu Sans"_s;
++#elif PLATFORM(WIN)
+     const auto defaultFontName = "Times New Roman"_s;
+ #else
+     const auto defaultFontName = "serif"_s;
+@@ -432,7 +438,7 @@ void FontCache::platformInvalidate()
+ void FontCache::platformPurgeInactiveFontData()
+ {
+     m_harfBuzzFontCache.clear();
+-#if !OS(ANDROID) && !PLATFORM(WIN)
++#if !OS(ANDROID) && !OS(SOS2) && !PLATFORM(WIN)
+     m_skiaSystemFallbackFontCache.clear();
+ #endif
+ }
+--- a/Source/WebCore/platform/graphics/skia/SkiaSystemFallbackFontCache.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaSystemFallbackFontCache.cpp
+@@ -26,7 +26,7 @@
+ #include "config.h"
+ #include "SkiaSystemFallbackFontCache.h"
+ 
+-#if USE(SKIA) && !OS(ANDROID) && !PLATFORM(WIN)
++#if USE(SKIA) && !OS(ANDROID) && !OS(SOS2) && !PLATFORM(WIN)
+ #include "FontCache.h"
+ #include <fontconfig/fontconfig.h>
+ #include <wtf/FileSystem.h>
+@@ -222,4 +222,4 @@ void SkiaSystemFallbackFontCache::clear()
+ 
+ } // namepsace WebCore
+ 
+-#endif // USE(SKIA) && !OS(ANDROID) && !PLATFORM(WIN)
++#endif // USE(SKIA) && !OS(ANDROID) && !OS(SOS2) && !PLATFORM(WIN)
+--- a/Source/WebCore/platform/graphics/skia/SkiaSystemFallbackFontCache.h
++++ b/Source/WebCore/platform/graphics/skia/SkiaSystemFallbackFontCache.h
+@@ -25,7 +25,7 @@
+ 
+ #pragma once
+ 
+-#if USE(SKIA) && !OS(ANDROID) && !PLATFORM(WIN)
++#if USE(SKIA) && !OS(ANDROID) && !OS(SOS2) && !PLATFORM(WIN)
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/core/SkFontStyle.h>
+ #include <skia/core/SkTypeface.h>
+@@ -51,4 +51,4 @@ private:
+ 
+ } // namespace WebCore
+ 
+-#endif // USE(SKIA) && !OS(ANDROID) && !PLATFORM(WIN)
++#endif // USE(SKIA) && !OS(ANDROID) && !OS(SOS2) && !PLATFORM(WIN)
+--- a/Source/WebCore/platform/network/DNSResolveQueue.cpp
++++ b/Source/WebCore/platform/network/DNSResolveQueue.cpp
+@@ -27,7 +27,9 @@
+ #include "config.h"
+ #include "DNSResolveQueue.h"
+ 
+-#if USE(GLIB)
++#if OS(SOS2)
++#include "DNSResolveQueueSOS2.h"
++#elif USE(GLIB)
+ #include "DNSResolveQueueGLib.h"
+ #elif USE(CURL)
+ #include "DNSResolveQueueCurl.h"
+--- a/Source/cmake/OptionsJSCOnly.cmake
++++ b/Source/cmake/OptionsJSCOnly.cmake
+@@ -1,4 +1,11 @@
+-find_package(Threads REQUIRED)
++if (SOS2_NATIVE_TARGET)
++    # The SDK links its tested native thread runtime into every executable.
++    # FindThreads' cancellation probe is not part of this platform contract.
++    add_library(Threads::Threads INTERFACE IMPORTED)
++    set(Threads_FOUND TRUE)
++else ()
++    find_package(Threads REQUIRED)
++endif ()
+ 
+ if (MSVC)
+     include(OptionsMSVC)
+@@ -46,13 +53,13 @@ set(ENABLE_WEBINSPECTORUI OFF)
+ set(ENABLE_WEBGL OFF)
+ set(ENABLE_WEBGPU OFF)
+ 
+-if (WIN32)
++if (WIN32 OR SOS2_NATIVE_TARGET)
+     set(ENABLE_API_TESTS OFF)
+ else ()
+     set(ENABLE_API_TESTS ON)
+ endif ()
+ 
+-if (WTF_CPU_ARM OR WTF_CPU_MIPS)
++if (ENABLE_JIT AND (WTF_CPU_ARM OR WTF_CPU_MIPS))
+     SET_AND_EXPOSE_TO_BUILD(USE_CAPSTONE TRUE)
+ endif ()
+ 
+--- a/Source/cmake/WebKitCommon.cmake
++++ b/Source/cmake/WebKitCommon.cmake
+@@ -45,6 +45,7 @@ if (NOT HAS_RUN_WEBKIT_COMMON)
+     set(ALL_PORTS
+         GTK
+         JSCOnly
++        SOS2
+         Mac
+         PlayStation
+         WPE
+@@ -140,7 +141,11 @@ if (NOT HAS_RUN_WEBKIT_COMMON)
+     # -----------------------------------------------------------------------------
+     # Determine the operating system
+     # -----------------------------------------------------------------------------
+-    if (UNIX)
++    if (SOS2_NATIVE_TARGET)
++        set(WTF_OS_SOS2 1)
++        set(WTF_OS_UNIX 1)
++        set(UNIX TRUE)
++    elseif (UNIX)
+         if (APPLE)
+             set(WTF_OS_MACOS 1)
+         elseif (CMAKE_SYSTEM_NAME MATCHES "Linux")
+--- a/Source/cmake/WebKitCompilerFlags.cmake
++++ b/Source/cmake/WebKitCompilerFlags.cmake
+@@ -494,10 +494,6 @@ int main() {
+     if (NOT ATOMICS_ARE_BUILTIN)
+         set(CMAKE_REQUIRED_LIBRARIES atomic)
+         check_cxx_source_compiles("${ATOMIC_TEST_SOURCE}" ATOMICS_REQUIRE_LIBATOMIC)
+-        # If we failed to build the test source with libatomic then something is wrong
+-        if (NOT ATOMICS_REQUIRE_LIBATOMIC)
+-            message(FATAL_ERROR "Failed to detect support for atomic variables")
+-        endif ()
+     endif ()
+     cmake_pop_check_state()
+ 
+--- a/Source/WTF/wtf/posix/FileHandlePOSIX.cpp
++++ b/Source/WTF/wtf/posix/FileHandlePOSIX.cpp
+@@ -32,7 +32,6 @@
+ #include <sys/file.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+-#include <sys/uio.h>
+ #include <unistd.h>
+ #include <wtf/CheckedArithmetic.h>
+ #include <wtf/FileSystem.h>
+--- a/Source/JavaScriptCore/jit/PCToCodeOriginMap.h
++++ b/Source/JavaScriptCore/jit/PCToCodeOriginMap.h
+@@ -43,6 +43,7 @@ namespace B3 {
+ class PCToOriginMap;
+ }
+ 
++#if ENABLE(WEBASSEMBLY)
+ namespace Wasm {
+ class WasmOrigin {
+     MAKE_VALIDATED_REINTERPRET_CAST
+@@ -61,6 +62,7 @@ public:
+ MAKE_VALIDATED_REINTERPRET_CAST_IMPL("WasmOrigin", WasmOrigin)
+ 
+ } // namespace Wasm
++#endif
+ 
+ class LinkBuffer;
+ class PCToCodeOriginMapBuilder;
+--- a/Source/JavaScriptCore/runtime/MathCommon.cpp
++++ b/Source/JavaScriptCore/runtime/MathCommon.cpp
+@@ -604,7 +604,7 @@ JSC_DEFINE_NOEXCEPT_JIT_OPERATION(f64_nearest, double, (double operand))
+     return std::nearbyint(operand);
+ }
+ 
+-#if (OS(LINUX) && !defined(__GLIBC__)) || OS(HAIKU)
++#if (OS(LINUX) && !defined(__GLIBC__)) || OS(HAIKU) || OS(SOS2)
+ static inline float roundevenf(float operand)
+ {
+     float rounded = roundf(operand);
+--- a/Source/WebCore/bindings/js/JSHTMLMediaElementCustom.cpp
++++ b/Source/WebCore/bindings/js/JSHTMLMediaElementCustom.cpp
+@@ -24,6 +24,9 @@
+  */
+ 
+ #include "config.h"
++
++#if ENABLE(VIDEO)
++
+ #include "JSHTMLMediaElement.h"
+ 
+ #include "TrackOpaqueRoot.h"
+@@ -40,3 +43,5 @@ void JSHTMLMediaElement::visitAdditionalChildren(Visitor& visitor)
+ DEFINE_VISIT_ADDITIONAL_CHILDREN(JSHTMLMediaElement);
+ 
+ } // namespace WebCore
++
++#endif
+--- a/Source/WebCore/loader/DocumentLoader.cpp
++++ b/Source/WebCore/loader/DocumentLoader.cpp
+@@ -53,6 +53,7 @@
+ #include "DocumentWriter.h"
+ #include "ElementChildIteratorInlines.h"
+ #include "Event.h"
++#include "EventLoop.h"
+ #include "EventNames.h"
+ #include "ExtensionStyleSheets.h"
+ #include "FormSubmission.h"
+--- a/Source/WebCore/platform/graphics/PlatformDisplay.h
++++ b/Source/WebCore/platform/graphics/PlatformDisplay.h
+@@ -60,6 +60,10 @@ public:
+ #if !PLATFORM(WIN)
+     WEBCORE_EXPORT static void setSharedDisplay(std::unique_ptr<PlatformDisplay>&&);
+     WEBCORE_EXPORT static PlatformDisplay* sharedDisplayIfExists();
++#endif
++#if OS(SOS2)
++    // From WebKit 2.54: a browser that cannot paint with it drops it again.
++    WEBCORE_EXPORT static void destroySharedDisplay();
+ #endif
+     virtual ~PlatformDisplay();
+ 
+--- a/Source/WebCore/platform/graphics/PlatformDisplay.cpp
++++ b/Source/WebCore/platform/graphics/PlatformDisplay.cpp
+@@ -76,6 +76,16 @@ PlatformDisplay* PlatformDisplay::sharedDisplayIfExists()
+ {
+     return s_sharedDisplay.get();
+ }
++
++#if OS(SOS2)
++void PlatformDisplay::destroySharedDisplay()
++{
++    RELEASE_ASSERT(isMainThread());
++    if (s_sharedDisplay)
++        s_sharedDisplay->clearGLContexts();
++    s_sharedDisplay = nullptr;
++}
++#endif
+ #endif
+ 
+ static HashSet<PlatformDisplay*>& eglDisplays()

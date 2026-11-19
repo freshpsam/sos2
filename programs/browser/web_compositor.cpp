@@ -417,7 +417,7 @@ void LayerCompositor::drawLayer(SkCanvas &canvas, CompositingLayer &layer) {
         auto clipping = layer.contentsClippingRect();
         bool clipsToContents =
             !layer.preserves3D() && layer.contentsRectClipsDescendants() &&
-            (clipping.hasNonZeroRadii() || !clipping.rect().contains(layer.contentsRect()));
+            (clipping.isRounded() || !clipping.rect().contains(layer.contentsRect()));
         bool masks = !layer.preserves3D() && layer.masksToBounds();
         if (clipsToContents || masks) {
             canvas.save();
@@ -458,7 +458,7 @@ void LayerCompositor::drawContents(SkCanvas &canvas, CompositingLayer &layer, fl
     }
     if (layer.m_solidColor.isValid() && layer.m_solidColor.isVisible()) {
         auto clipping = layer.contentsClippingRect();
-        if (clipping.hasNonZeroRadii() || !clipping.rect().contains(layer.contentsRect()))
+        if (clipping.isRounded() || !clipping.rect().contains(layer.contentsRect()))
             canvas.clipRRect(SkRRect(clipping), !integer);
         paint.setColor(SkColor(layer.m_solidColor.colorWithAlphaMultipliedBy(alpha)));
         canvas.drawRect(SkRect(layer.contentsRect()), paint);

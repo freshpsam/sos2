@@ -12,8 +12,7 @@ struct net_device {
     bool (*send)(const void *, unsigned);
     void (*stop)(void);
     uint8_t mac[6];
-    uint32_t rx_packets, tx_packets, rx_discarded;
-    const char *tx_status;
+    uint32_t rx_packets, tx_packets;
 };
 
 bool virtio_net_init(const struct platform_devices *, struct net_device *);

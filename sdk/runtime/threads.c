@@ -1,5 +1,6 @@
 #include "internal.h"
 #include <errno.h>
+#include <malloc.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,20 +16,47 @@ static struct {
 } keys[SOS2_KEYS];
 
 extern char __tls_start[], __tls_data_end[], __tls_end[], __tls_align[];
+
+/* Variant 1 TLS, as both ARM ABIs specify: the thread pointer addresses a
+ * TCB_SIZE-byte TCB, whose first word points to the thread's struct
+ * sos2_thread, and the TLS block follows it at the block's alignment. */
+#ifdef __aarch64__
+#define TCB_SIZE 16
+
+static inline void *thread_pointer(void) {
+    void *pointer;
+    __asm__("mrs %0, tpidr_el0" : "=r"(pointer));
+    return pointer;
+}
+
+/* __tls_align is an absolute symbol, out of PC-relative reach of the image
+ * window: load it from a literal. */
+static inline unsigned tls_align(void) {
+    uintptr_t value;
+    __asm__("ldr %0, =__tls_align" : "=r"(value));
+    return (unsigned)value;
+}
+#else
+#define TCB_SIZE 8
 extern void *__aeabi_read_tp(void);
+
+static inline void *thread_pointer(void) { return __aeabi_read_tp(); }
+
+static inline unsigned tls_align(void) { return (uintptr_t)__tls_align; }
+#endif
 
 /* ARM ELF general-dynamic TLS uses a module/offset pair even in static PIC
  * libraries. There is exactly one TLS module in a native SOS2 executable. */
-void *__tls_get_addr(const uint32_t index[2]) {
-    unsigned alignment = (uintptr_t)__tls_align;
-    unsigned header = (8 + alignment - 1) & ~(alignment - 1);
-    void *pointer = __aeabi_read_tp();
+void *__tls_get_addr(const sos2_word index[2]) {
+    unsigned alignment = tls_align();
+    unsigned header = (TCB_SIZE + alignment - 1) & ~(alignment - 1);
+    void *pointer = thread_pointer();
     if (!pointer || index[0] != 1 || index[1] > (uintptr_t)(__tls_end - __tls_start)) abort();
     return (char *)pointer + header + index[1];
 }
 
 struct sos2_thread *sos2_self(void) {
-    void *pointer = __aeabi_read_tp();
+    void *pointer = thread_pointer();
     return pointer ? *(struct sos2_thread **)pointer : NULL;
 }
 static struct _reent bootstrap = _REENT_INIT(bootstrap);
@@ -108,16 +136,131 @@ void __retarget_lock_release(_LOCK_T lock) { sos2_unlock(&lock->lock); }
 
 void __retarget_lock_release_recursive(_LOCK_T lock) { sos2_unlock(&lock->lock); }
 
+#ifdef __aarch64__
+/* The Arm GNU Toolchain's GCC for aarch64-none-elf is built without native
+ * TLS (--disable-tls) and for a single thread, so every __thread and
+ * thread_local, in the SDK's libraries too, calls __emutls_get_address, and
+ * libgcc's version shares one copy among all threads. This one gives each
+ * thread its own, allocated on first use; libsos2 links ahead of libgcc.
+ * Never from malloc: the engine's (mimalloc) has thread-local variables
+ * itself. They are carved from the rest of the thread's TLS pages, then from
+ * pages mapped for the thread, and unmapped when its record is released. */
+struct __emutls_object {
+    uintptr_t size, align;
+
+    union {
+        uintptr_t index; /* 1-based, assigned on first use by any thread */
+        void *pointer;
+    } location;
+
+    void *initializer; /* NULL: zero-initialized */
+};
+
+struct emutls_chunk {
+    struct emutls_chunk *next;
+    unsigned pages;
+};
+
+static struct sos2_lock emutls_lock;
+static uintptr_t emutls_indices;
+/* The main thread's variables until sos2_threads_init gives it a record. */
+static struct sos2_thread emutls_early;
+
+/* Zeroed: carved space is never reused while the thread lives. */
+static void *emutls_alloc(struct sos2_thread *t, uintptr_t size, uintptr_t align) {
+    uintptr_t at = (t->emutls_free + align - 1) & ~(align - 1);
+    if (!t->emutls_free || at > t->emutls_end || size > t->emutls_end - at) {
+        unsigned pages = (sizeof(struct emutls_chunk) + align + size + 4095) / 4096;
+        sos2_status mapped = sos2_map(pages, 3);
+        if (mapped < 0) abort();
+        struct emutls_chunk *chunk = (void *)(uintptr_t)mapped;
+        chunk->next = t->emutls_chunks;
+        chunk->pages = pages;
+        t->emutls_chunks = chunk;
+        t->emutls_end = (uintptr_t)chunk + pages * 4096ul;
+        at = ((uintptr_t)(chunk + 1) + align - 1) & ~(align - 1);
+    }
+    t->emutls_free = at + size;
+    return (void *)at;
+}
+
+void __emutls_register_common(void *registered, unsigned long size, unsigned long align,
+                              void *initializer) {
+    struct __emutls_object *object = registered;
+    if (object->size < size) {
+        object->size = size;
+        object->initializer = NULL;
+    }
+    if (object->align < align) object->align = align;
+    if (initializer && size == object->size) object->initializer = initializer;
+}
+
+/* A variable's first use on this thread, and an index's by any thread. */
+static __attribute__((noinline)) void *emutls_first_use(struct __emutls_object *object) {
+    uintptr_t index = __atomic_load_n(&object->location.index, __ATOMIC_ACQUIRE);
+    if (!index) {
+        sos2_lock(&emutls_lock);
+        index = object->location.index;
+        if (!index)
+            __atomic_store_n(&object->location.index, index = ++emutls_indices, __ATOMIC_RELEASE);
+        sos2_unlock(&emutls_lock);
+    }
+    struct sos2_thread *t = sos2_self();
+    if (!t) t = &emutls_early;
+    if (index > t->emutls_count) {
+        uintptr_t count = index < 2 * t->emutls_count ? 2 * t->emutls_count : index + 31;
+        void **grown = emutls_alloc(t, count * sizeof(*grown), sizeof(*grown));
+        if (t->emutls_count) memcpy(grown, t->emutls, t->emutls_count * sizeof(*grown));
+        t->emutls = grown;
+        t->emutls_count = count;
+    }
+    void *variable = t->emutls[index - 1];
+    if (!variable) {
+        uintptr_t align = object->align > sizeof(void *) ? object->align : sizeof(void *);
+        variable = emutls_alloc(t, object->size, align);
+        if (object->initializer) memcpy(variable, object->initializer, object->size);
+        t->emutls[index - 1] = variable;
+    }
+    return variable;
+}
+
+/* Every access to a thread-local variable, such as mimalloc's heap on each
+ * allocation and Mesa's dispatch table on each GL call: frameless, with any
+ * first use on the slow path. */
+void *__emutls_get_address(void *requested) {
+    struct __emutls_object *object = requested;
+    uintptr_t index = __atomic_load_n(&object->location.index, __ATOMIC_ACQUIRE);
+    struct sos2_thread *t = sos2_self();
+    if (index && t && index <= t->emutls_count) {
+        void *variable = t->emutls[index - 1];
+        if (variable) return variable;
+    }
+    return emutls_first_use(object);
+}
+
+static void emutls_release(struct sos2_thread *t) {
+    for (struct emutls_chunk *chunk = t->emutls_chunks, *next; chunk; chunk = next) {
+        next = chunk->next;
+        call3(SYS_VM_UNMAP, sos2_ptr(chunk), chunk->pages, 0);
+    }
+}
+#endif
+
 static int init_tls(struct sos2_thread *thread) {
-    unsigned alignment = (uintptr_t)__tls_align;
+    unsigned alignment = tls_align();
     if (alignment > 4096) return ENOTSUP;
-    unsigned header = (8 + alignment - 1) & ~(alignment - 1), size = __tls_end - __tls_start;
+    unsigned header = (TCB_SIZE + alignment - 1) & ~(alignment - 1), size = __tls_end - __tls_start;
     thread->tls_pages = (header + size + 4095) / 4096;
-    int result = sos2_map(thread->tls_pages, 3);
+    sos2_status result = sos2_map(thread->tls_pages, 3);
     if (result < 0) return sos2_errno(result);
     thread->tls = (void *)(uintptr_t)result;
     *(struct sos2_thread **)thread->tls = thread;
     memcpy((char *)thread->tls + header, __tls_start, __tls_data_end - __tls_start);
+#ifdef __aarch64__
+    /* Emulated TLS variables start in the rest of these pages. */
+    thread->emutls_free = (uintptr_t)thread->tls + header + size;
+    thread->emutls_end = (uintptr_t)thread->tls + thread->tls_pages * 4096ul;
+#endif
     _REENT_INIT_PTR(&thread->reent);
     return 0;
 }
@@ -127,6 +270,12 @@ void sos2_threads_init(void) {
     main->used = 1;
     main->tid = call(SYS_THREAD_ID, 0, 0);
     if (init_tls(main)) finish(120);
+#ifdef __aarch64__
+    /* Keep the variables the main thread used before it had this record. */
+    main->emutls = emutls_early.emutls;
+    main->emutls_count = emutls_early.emutls_count;
+    main->emutls_chunks = emutls_early.emutls_chunks;
+#endif
     if (call(SYS_THREAD_TLS, sos2_ptr(main->tls), 0)) finish(121);
 }
 
@@ -145,6 +294,9 @@ static struct sos2_thread *lookup(pthread_t id) {
 }
 
 static void release(struct sos2_thread *t) {
+#ifdef __aarch64__
+    emutls_release(t);
+#endif
     if (t->mapping) call3(SYS_VM_UNMAP, sos2_ptr(t->mapping), t->pages, 0);
     if (t->tls) call3(SYS_VM_UNMAP, sos2_ptr(t->tls), t->tls_pages, 0);
     memset(t, 0, sizeof(*t));
@@ -190,7 +342,7 @@ int pthread_create(pthread_t *id, const pthread_attr_t *attr, void *(*entry)(voi
     if (!stack) {
         size = (size + 4095) & ~4095u;
         t->pages = size / 4096 + 2;
-        int mapping = sos2_map(t->pages, 3);
+        sos2_status mapping = sos2_map(t->pages, 3);
         if (mapping < 0) result = sos2_errno(mapping);
         else {
             t->mapping = (void *)(uintptr_t)mapping;
@@ -318,7 +470,7 @@ int pthread_attr_getstacksize(const pthread_attr_t *a, size_t *n) {
 }
 
 int pthread_attr_setstack(pthread_attr_t *a, void *p, size_t n) {
-    if (!p || (sos2_ptr(p) & 7) || (n & 7)) return EINVAL;
+    if (!p || (sos2_ptr(p) & (USER_STACK_ALIGN - 1)) || (n & (USER_STACK_ALIGN - 1))) return EINVAL;
     int r = pthread_attr_setstacksize(a, n);
     if (!r) a->stackaddr = p;
     return r;

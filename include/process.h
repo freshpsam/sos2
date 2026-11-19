@@ -1,27 +1,15 @@
 #ifndef SOS2_PROCESS_H
 #define SOS2_PROCESS_H
 #include "fdt.h"
-
-/* Layout shared with arch/arm/process.S; CPSR is never supplied by a syscall. */
-struct arm_context {
-    uint32_t r[13], sp, lr, pc, cpsr;
-};
-
-struct arm_trap {
-    struct arm_context context;
-    uint32_t vector, status, address;
-};
-
-struct arm_runtime_context {
-    uint64_t d[32];
-    uint32_t fpscr, tls, tls_ro, padding;
-};
+#include "arch/context.h"
 
 void arm_runtime_init(void);
 void arm_runtime_save(struct arm_runtime_context *context);
 void arm_runtime_restore(const struct arm_runtime_context *context);
 void arm_user_run(struct arm_context *context);
-void arm_trap_dispatch(struct arm_trap *trap);
+/* True when the trap was handled on this CPU and its user context resumes at
+ * once (ARM32's SYS_ICACHE_SYNC); otherwise the slice ends. */
+bool arm_trap_dispatch(struct arm_trap *trap);
 bool process_init(struct platform_devices *devices, uintptr_t dtb);
 /* Collect worker completions and dispatch bounded slices between UI iterations.
  * On one CPU, executes one slice locally. Kernel services stay on the boot CPU. */

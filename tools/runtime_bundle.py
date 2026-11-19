@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
 """Pack read-only guest files for SOS2's bounded WebKit runtime."""
-import argparse
 from pathlib import Path
 import struct
 
@@ -28,20 +26,3 @@ def bundle(output, files):
     partial.write_bytes(payload)
     partial.replace(output)
 
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('output', type=Path)
-    parser.add_argument('files', nargs='+', help='absolute guest path=local source')
-    args = parser.parse_args()
-    files = {}
-    for spec in args.files:
-        name, source = spec.split('=', 1)
-        if name in files:
-            parser.error(f'duplicate path: {name}')
-        files[name] = Path(source)
-    bundle(args.output, files)
-
-
-if __name__ == '__main__':
-    main()

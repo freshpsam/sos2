@@ -1,4 +1,4 @@
-#include "board.h"
+#include "arch/smp.h"
     .syntax unified
     .arm
     .section .text.boot, "ax", %progbits
@@ -112,7 +112,7 @@ secondary_stacks:
     mrc     p15, 0, r0, c0, c0, 5
     bic     r0, r0, #0xFF000000
     ldr     r4, =arm_cpu_boot
-    mov     r5, #4
+    mov     r5, #ARCH_CPU_MAX
 3:  ldr     r1, [r4]
     cmp     r0, r1
     beq     4f

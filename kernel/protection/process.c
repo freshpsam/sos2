@@ -23,11 +23,6 @@
 #endif
 #include <stddef.h>
 
-_Static_assert(sizeof(struct arm_trap) == 80, "assembly trap size");
-_Static_assert(offsetof(struct arm_context, sp) == 52, "assembly user SP");
-_Static_assert(offsetof(struct arm_context, pc) == 60, "assembly PC");
-_Static_assert(offsetof(struct arm_context, cpsr) == 64, "assembly CPSR");
-
 enum state { RUNNABLE, FAULTED, EXITED };
 
 enum thread_state { T_UNUSED, T_READY, T_SLEEP, T_WAIT, T_SERVICE, T_QUIESCE, T_DONE };
@@ -36,15 +31,36 @@ struct thread {
     struct arm_context context;
     struct arm_runtime_context runtime;
     enum thread_state state;
-    uint32_t id, stack, size, completion, result, wait_address, suspended;
+    uint32_t id;
+    user_ptr stack;
+    uint32_t size;
+    user_ptr completion;
+    uint32_t result;
+    user_ptr wait_address;
+    uint32_t suspended;
     unsigned running_cpu;
     bool resume;
     uint64_t deadline, cpu_us, slice_deadline;
 };
 
+/* What first-fit searches in the heap or the JIT window found: no free run of
+ * count pages or more starts between the range's start and address. Mapping
+ * keeps that true and unmapping lowers it (lower_hints), so a search for
+ * count pages starts at address instead of walking every mapped page's table
+ * entries (uncached) from the start, as JavaScriptCore's per-block mappings
+ * would otherwise make every search do. */
+struct range_hint {
+    user_ptr address;
+    unsigned count; /* 0: unused */
+};
+
+#define RANGE_HINTS 4
+
 struct process {
     struct process *next;
     struct vm_space space;
+    struct range_hint hints[2][RANGE_HINTS]; /* The heap's, then the JIT window's */
+    unsigned next_hint[2];
     struct gpu_client *gpu; /* SYS_GPU context and resources, if any */
     struct thread threads[USER_THREAD_LIMIT];
     unsigned next_thread, next_service_thread;
@@ -55,8 +71,7 @@ struct process {
     uint64_t cpu_us;
     bool reap_pending, restart;
     const struct app *app; /* Its program and storage; NULL: a web page */
-    unsigned running_cpu;  /* First active CPU + 1, for diagnostics. */
-    unsigned running_mask, peak_parallel;
+    unsigned running_mask;
 };
 
 #define PROCESS_PAGES ((sizeof(struct process) + PAGE_SIZE - 1) / PAGE_SIZE)
@@ -96,6 +111,26 @@ static struct thread *io_thread;
 static bool background_turn;
 extern char __image_start[], __image_end[];
 
+/* sos2.jsc=OPTIONS: JavaScriptCore options for every web page process,
+ * comma-separated (programs/browser/web_main.cpp), to compare the engine's
+ * tiers without rebuilding it. */
+static char engine_options[USER_ENGINE_OPTIONS_MAX];
+
+static void engine_options_init(const char *args) {
+    static const char prefix[] = "sos2.jsc=";
+    const size_t skip = sizeof(prefix) - 1;
+    while (*args) {
+        args += strspn(args, " \t");
+        size_t n = strcspn(args, " \t");
+        const char *token = args;
+        args += n;
+        if (n < skip || memcmp(token, prefix, skip)) continue;
+        if (engine_options[0] || n - skip >= sizeof(engine_options))
+            panic("invalid sos2.jsc boot argument");
+        memcpy(engine_options, token + skip, n - skip);
+    }
+}
+
 static bool spawn(struct process *p, uint32_t pid, const struct app *app) {
     *p = (struct process){.next = p->next, .pid = pid, .state = RUNNABLE, .app = app};
     const struct runtime_file *program = app ? app->program : runtime_file_find("/bin/sos2-web");
@@ -118,7 +153,8 @@ static bool spawn(struct process *p, uint32_t pid, const struct app *app) {
     }
     /* An installed app's program comes from the app store, checked against
      * its SHA-256, into pages released once it is loaded. */
-    uint32_t entry, size = program ? program->size : 0;
+    user_ptr entry;
+    uint32_t size = program ? program->size : 0;
     const void *image = program ? runtime_file_data(program) : 0;
     unsigned char *read = 0;
     unsigned read_pages = 0;
@@ -126,10 +162,17 @@ static bool spawn(struct process *p, uint32_t pid, const struct app *app) {
     bool loaded = elf_load(&p->space, image, size, !app, &entry);
     if (read) vm_cpu_free(read, read_pages);
     if (!loaded) goto failed;
-    uint32_t bottom = WEB_STACK_BOTTOM, top = WEB_STACK_TOP;
-    for (uint32_t page = bottom; page < top; page += PAGE_SIZE) {
+    user_ptr bottom = WEB_STACK_BOTTOM, top = WEB_STACK_TOP;
+    for (user_ptr page = bottom; page < top; page += PAGE_SIZE) {
         if (!vm_map(&p->space, page, VM_READ | VM_WRITE)) goto failed;
         if ((page & 0xffffu) == 0xf000u) kernel_io_wait();
+    }
+    user_ptr options = 0;
+    if (!app && engine_options[0]) {
+        size_t n = strlen(engine_options) + 1;
+        top = (top - n) & ~(user_ptr)(USER_STACK_ALIGN - 1);
+        options = top;
+        if (!vm_copy_to_user(&p->space, options, engine_options, n)) goto failed;
     }
     /* A desktop Close/Open can arrive while the worker yields. Keep the
      * partial image owned until reaping, and never run a cancelled load. */
@@ -137,12 +180,13 @@ static bool spawn(struct process *p, uint32_t pid, const struct app *app) {
     p->threads[0] = (struct thread){.state = T_READY,
                                     .id = 1,
                                     .stack = bottom,
-                                    .size = top - bottom,
-                                    .context = {.sp = top, .pc = entry, .cpsr = 0x150}};
+                                    .size = (uint32_t)(top - bottom),
+                                    .context = {USER_CONTEXT_FIELDS(entry, top)}};
     p->next_tid = 2;
     p->peak_pages = p->space.mapped_pages;
     p->threads[0].context.r[0] = 0;
     p->threads[0].context.r[1] = pid;
+    p->threads[0].context.r[2] = options;
 
     return true;
 failed:
@@ -152,13 +196,12 @@ failed:
 }
 
 bool process_init(struct platform_devices *devices, uintptr_t dtb) {
-#if defined(SOS2_RESOURCES) || defined(SOS2_BOARD_REDMI2)
     if (!runtime_files_init(devices, dtb, (uintptr_t)__image_start, (uintptr_t)__image_end)) {
         if (devices->has_initrd_start || devices->has_initrd_end) return false;
     }
-#endif
-    apps_init();
+    engine_options_init(devices->bootargs);
     system_update_init(devices);
+    apps_init();
     page_host_redraw();
     boot_progress_report(BOOT_MEMORY, 0, 0);
     if (!arm_machine_init(devices) || !vm_init(devices, dtb)) return false;
@@ -176,8 +219,7 @@ bool process_init(struct platform_devices *devices, uintptr_t dtb) {
     system_clock_init(&clock);
     battery_init();
     battery_service(0); /* First bus setup/sample belongs to the loading screen. */
-    page_host_device_status(system_clock_view()->ready, random_ready, fs_persistent_ready(),
-                            fs_session_only());
+    page_host_device_status(random_ready, fs_persistent_ready(), fs_session_only());
     page_host_entropy_status(random_ready, entropy_error());
 #ifdef SOS2_BOARD_REDMI2
     /* Long-lived driver buffers belong to the system, not a browser process.
@@ -196,24 +238,23 @@ static struct thread *thread_by_id(struct process *p, uint32_t id) {
     return 0;
 }
 
-static bool store_word(struct process *p, uint32_t address, uint32_t value) {
+static bool store_word(struct process *p, user_ptr address, uint32_t value) {
     uint32_t *word = (uint32_t *)vm_resolve(&p->space, address, VM_WRITE);
     if ((address & 3) || !word) return false;
-    /* ARMv7 barriers: the QEMU kernel targets the Cortex-A15. */
-    __asm__ volatile("dmb ish" ::: "memory");
+    arch_memory_barrier();
     __atomic_store_n(word, value, __ATOMIC_RELAXED);
     return true;
 }
 
-static bool load_word(struct process *p, uint32_t address, uint32_t *value) {
+static bool load_word(struct process *p, user_ptr address, uint32_t *value) {
     const uint32_t *word = (const uint32_t *)vm_resolve(&p->space, address, VM_READ);
     if ((address & 3) || !word) return false;
     *value = __atomic_load_n(word, __ATOMIC_RELAXED);
-    __asm__ volatile("dmb ish" ::: "memory");
+    arch_memory_barrier();
     return true;
 }
 
-static unsigned wake_word(struct process *p, uint32_t address, unsigned count) {
+static unsigned wake_word(struct process *p, user_ptr address, unsigned count) {
     unsigned woken = 0;
     for (unsigned i = 0; i < USER_THREAD_LIMIT && woken < count; ++i) {
         struct thread *t = &p->threads[i];
@@ -226,11 +267,33 @@ static unsigned wake_word(struct process *p, uint32_t address, unsigned count) {
     return woken;
 }
 
-static int32_t create_thread(struct process *p, uint32_t address) {
+/* SYS_THREAD_CONTEXT's struct user_thread_context: the saved registers and,
+ * on arm64, the SIMD and floating-point state, which garbage collectors also
+ * scan for pointers. */
+static bool copy_thread_context(struct process *p, user_ptr address, const struct thread *t) {
+#ifdef __aarch64__
+    struct user_thread_context out;
+    _Static_assert(sizeof(out.r) + 3 * sizeof(out.sp) == sizeof(t->context) &&
+                       sizeof(out.v) == sizeof(t->runtime.v),
+                   "thread context layout");
+    memcpy(&out, &t->context, sizeof(t->context));
+    memcpy(out.v, t->runtime.v, sizeof(out.v));
+    out.fpsr = t->runtime.fpsr;
+    out.fpcr = t->runtime.fpcr;
+    return vm_copy_to_user(&p->space, address, &out, sizeof(out));
+#else
+    _Static_assert(sizeof(struct user_thread_context) == sizeof(t->context),
+                   "thread context layout");
+    return vm_copy_to_user(&p->space, address, &t->context, sizeof(t->context));
+#endif
+}
+
+static int32_t create_thread(struct process *p, user_ptr address) {
     struct user_thread_start start;
     if (!vm_copy_from_user(&p->space, &start, address, sizeof(start))) return USER_EFAULT;
-    if ((start.entry & 3) || !vm_resolve(&p->space, start.entry, VM_EXEC) || (start.stack & 7) ||
-        (start.size & 7) || start.size < PAGE_SIZE || start.size > 4 * 1024 * 1024 ||
+    if ((start.entry & 3) || !vm_resolve(&p->space, start.entry, VM_EXEC) ||
+        (start.stack & (USER_STACK_ALIGN - 1)) || (start.size & (USER_STACK_ALIGN - 1)) ||
+        start.size < PAGE_SIZE || start.size > 4 * 1024 * 1024 ||
         !vm_accessible(&p->space, start.stack, start.size, VM_WRITE) ||
         (start.tls && !vm_accessible(&p->space, start.tls, 4, VM_READ)) ||
         (start.completion &&
@@ -241,16 +304,15 @@ static int32_t create_thread(struct process *p, uint32_t address) {
     if (index == USER_THREAD_LIMIT || p->next_tid > INT32_MAX) return USER_EAGAIN;
     uint32_t id = p->next_tid++;
     if (start.completion && !store_word(p, start.completion, id)) return USER_EFAULT;
-    p->threads[index] = (struct thread){.state = T_READY,
-                                        .id = id,
-                                        .stack = start.stack,
-                                        .size = start.size,
-                                        .completion = start.completion,
-                                        .runtime = {.tls_ro = start.tls},
-                                        .context = {.r = {start.argument},
-                                                    .sp = start.stack + start.size,
-                                                    .pc = start.entry,
-                                                    .cpsr = 0x150}};
+    p->threads[index] =
+        (struct thread){.state = T_READY,
+                        .id = id,
+                        .stack = start.stack,
+                        .size = (uint32_t)start.size,
+                        .completion = start.completion,
+                        .runtime = {.thread_pointer = start.tls},
+                        .context = {.r = {start.argument},
+                                    USER_CONTEXT_FIELDS(start.entry, start.stack + start.size)}};
     return (int32_t)id;
 }
 
@@ -266,16 +328,63 @@ static void exit_thread(struct process *p, struct thread *t, uint32_t result) {
     p->state = EXITED;
 }
 
-static int32_t memory_call(struct process *p, uint32_t number, uint32_t address, unsigned count,
-                           unsigned flags) {
+/* [lower, upper) lies in the engine's JIT window (include/user_abi.h), which
+ * only web page processes may use. */
+static bool jit_window(const struct process *p, user_ptr lower, user_ptr upper) {
+    return !p->app && lower >= USER_JIT_BASE && lower < upper && upper <= USER_JIT_END;
+}
+
+static unsigned hint_range(user_ptr address) {
+    return address >= USER_JIT_BASE && address < USER_JIT_END;
+}
+
+/* Pages from address on were unmapped: a run of count pages may now start up
+ * to count - 1 pages below it (runs below a hint are shorter than count). */
+static void lower_hints(struct process *p, user_ptr address) {
+    unsigned range = hint_range(address);
+    user_ptr base = range ? USER_JIT_BASE : USER_HEAP_BASE;
+    for (unsigned i = 0; i < RANGE_HINTS; ++i) {
+        struct range_hint *hint = &p->hints[range][i];
+        user_ptr reach = hint->count ? (user_ptr)(hint->count - 1) * PAGE_SIZE : 0;
+        user_ptr floor = address - base > reach ? address - reach : base;
+        if (hint->address > floor) hint->address = floor;
+    }
+}
+
+/* First-fit placement of count pages in [lower, upper), within the heap or
+ * the JIT window, resumed where earlier searches for count pages ended. */
+static user_ptr allocate_range(struct process *p, unsigned count, user_ptr lower, user_ptr upper,
+                               unsigned flags) {
+    unsigned range = hint_range(lower);
+    struct range_hint *hint = 0;
+    for (unsigned i = 0; i < RANGE_HINTS; ++i)
+        if (p->hints[range][i].count == count) hint = &p->hints[range][i];
+    user_ptr known = hint ? hint->address : range ? USER_JIT_BASE : USER_HEAP_BASE;
+    user_ptr from = known > lower ? known : lower;
+    if (from >= upper) return 0;
+    user_ptr address = vm_allocate_range(&p->space, count, from, upper, flags);
+    /* Only a search that covered the range from its start teaches anything;
+     * a failure may be the page pool running out, not a lack of room. */
+    if (address && from == known) {
+        if (!hint) {
+            hint = &p->hints[range][p->next_hint[range]];
+            p->next_hint[range] = (p->next_hint[range] + 1) % RANGE_HINTS;
+            hint->count = count;
+        }
+        hint->address = address + (user_ptr)count * PAGE_SIZE;
+    }
+    return address;
+}
+
+static user_result memory_call(struct process *p, uint32_t number, user_ptr address, unsigned count,
+                               unsigned flags) {
+    bool jit = jit_window(p, address, address + (user_ptr)count * PAGE_SIZE);
     if (!count || count > (USER_HEAP_END - USER_HEAP_BASE) / PAGE_SIZE || (flags & ~7u) ||
-        ((flags & 6) == 6) || (flags && !(flags & VM_READ)))
+        ((flags & 6) == 6 && !jit) || (flags && !(flags & VM_READ)))
         return USER_EINVAL;
     if (number == SYS_VM_MAP && !address) {
-        address = vm_allocate(&p->space, count);
-        if (!address) return USER_ENOMEM;
-        for (unsigned i = 0; i < count; ++i) vm_protect(&p->space, address + i * PAGE_SIZE, flags);
-        return (int32_t)address;
+        address = allocate_range(p, count, USER_HEAP_BASE, USER_HEAP_END, flags);
+        return address ? (user_result)address : USER_ENOMEM;
     }
     if (number == SYS_VM_CHECK) {
         if ((address & (PAGE_SIZE - 1)) || address < USER_BASE || address >= USER_END ||
@@ -285,8 +394,9 @@ static int32_t memory_call(struct process *p, uint32_t number, uint32_t address,
             if (!vm_mapped(&p->space, address + i * PAGE_SIZE)) return USER_EINVAL;
         return 0;
     }
-    if ((address & (PAGE_SIZE - 1)) || address < USER_HEAP_BASE || address >= USER_HEAP_END ||
-        count > (USER_HEAP_END - address) / PAGE_SIZE)
+    if ((address & (PAGE_SIZE - 1)) ||
+        (!jit && (address < USER_HEAP_BASE || address >= USER_HEAP_END ||
+                  count > (USER_HEAP_END - address) / PAGE_SIZE)))
         return USER_EINVAL;
     for (unsigned i = 0; i < count; ++i) {
         bool mapped = vm_mapped(&p->space, address + i * PAGE_SIZE);
@@ -294,18 +404,20 @@ static int32_t memory_call(struct process *p, uint32_t number, uint32_t address,
     }
     if (number == SYS_VM_MAP) {
         unsigned i = 0;
-        for (; i < count; ++i) {
-            if (!vm_map(&p->space, address + i * PAGE_SIZE, VM_READ | VM_WRITE)) break;
-            vm_protect(&p->space, address + i * PAGE_SIZE, flags);
-        }
-        if (i == count) return (int32_t)address;
-        while (i) vm_unmap(&p->space, address + --i * PAGE_SIZE);
+        while (i < count && vm_map(&p->space, address + i * PAGE_SIZE, flags)) ++i;
+        if (i == count) return (user_result)address;
+        if (i && !vm_release(&p->space, address, i)) panic("mapping rollback failed");
         return USER_ENOMEM;
     }
+    if (number == SYS_VM_UNMAP) {
+        /* One release, not a page at a time: it frees emptied tables once. */
+        if (!vm_release(&p->space, address, count)) return USER_EINVAL;
+        lower_hints(p, address);
+        return 0;
+    }
     for (unsigned i = 0; i < count; ++i) {
-        uint32_t at = address + i * PAGE_SIZE;
-        if (number == SYS_VM_UNMAP) vm_unmap(&p->space, at);
-        else if (number == SYS_VM_DISCARD) vm_clear(&p->space, at);
+        user_ptr at = address + i * PAGE_SIZE;
+        if (number == SYS_VM_DISCARD) vm_clear(&p->space, at);
         else vm_protect(&p->space, at, flags);
     }
     return 0;
@@ -313,16 +425,16 @@ static int32_t memory_call(struct process *p, uint32_t number, uint32_t address,
 
 static void syscall(struct process *p) {
     struct thread *t = current_thread;
-    uint32_t *r = t->context.r;
-    switch (r[7]) {
+    user_reg *r = t->context.r;
+    switch (r[SYSCALL_NUMBER]) {
         case SYS_EXIT: p->state = EXITED; break;
         case SYS_YIELD: r[0] = 0; break;
         case SYS_SLEEP:
-            if (r[0] > 1000000) {
-                r[0] = (uint32_t)USER_EINVAL;
+            if ((uint32_t)r[0] > 1000000) {
+                r[0] = (user_reg)USER_EINVAL;
                 break;
             }
-            t->deadline = time_us() + r[0];
+            t->deadline = time_us() + (uint32_t)r[0];
             t->state = T_SLEEP;
             r[0] = 0;
             break;
@@ -335,32 +447,32 @@ static void syscall(struct process *p) {
             r[0] = count > 1 ? count - 1 : 1;
             break;
         }
-        case SYS_THREAD_CREATE: r[0] = (uint32_t)create_thread(p, r[0]); break;
-        case SYS_THREAD_EXIT: exit_thread(p, t, r[0]); break;
+        case SYS_THREAD_CREATE: r[0] = (user_reg)create_thread(p, r[0]); break;
+        case SYS_THREAD_EXIT: exit_thread(p, t, (uint32_t)r[0]); break;
         case SYS_THREAD_ID: r[0] = t->id; break;
         case SYS_THREAD_TLS:
-            if (r[0] && !vm_accessible(&p->space, r[0], 4, VM_READ)) r[0] = (uint32_t)USER_EFAULT;
+            if (r[0] && !vm_accessible(&p->space, r[0], 4, VM_READ)) r[0] = (user_reg)USER_EFAULT;
             else {
-                t->runtime.tls_ro = r[0];
+                t->runtime.thread_pointer = r[0];
                 r[0] = 0;
             }
             break;
         case SYS_THREAD_JOIN: {
-            struct thread *target = thread_by_id(p, r[0]);
+            struct thread *target = thread_by_id(p, (uint32_t)r[0]);
             if (!target) {
-                r[0] = (uint32_t)USER_ESRCH;
+                r[0] = (user_reg)USER_ESRCH;
                 break;
             }
             if (target == t) {
-                r[0] = (uint32_t)USER_EDEADLK;
+                r[0] = (user_reg)USER_EDEADLK;
                 break;
             }
             if (target->state != T_DONE) {
-                r[0] = (uint32_t)USER_EAGAIN;
+                r[0] = (user_reg)USER_EAGAIN;
                 break;
             }
             if (r[1] && !vm_copy_to_user(&p->space, r[1], &target->result, 4)) {
-                r[0] = (uint32_t)USER_EFAULT;
+                r[0] = (user_reg)USER_EFAULT;
                 break;
             }
             *target = (struct thread){0};
@@ -368,94 +480,96 @@ static void syscall(struct process *p) {
             break;
         }
         case SYS_THREAD_INFO: {
-            struct thread *target = r[0] ? thread_by_id(p, r[0]) : t;
+            struct thread *target = (uint32_t)r[0] ? thread_by_id(p, (uint32_t)r[0]) : t;
             if (!target) {
-                r[0] = (uint32_t)USER_ESRCH;
+                r[0] = (user_reg)USER_ESRCH;
                 break;
             }
-            struct user_thread_info info = {target->id, target->stack, target->size,
-                                            target->runtime.tls_ro};
+            struct user_thread_info info = {.id = target->id,
+                                            .stack = target->stack,
+                                            .size = target->size,
+                                            .tls = target->runtime.thread_pointer};
             r[0] =
-                vm_copy_to_user(&p->space, r[1], &info, sizeof(info)) ? 0 : (uint32_t)USER_EFAULT;
+                vm_copy_to_user(&p->space, r[1], &info, sizeof(info)) ? 0 : (user_reg)USER_EFAULT;
             break;
         }
         case SYS_THREAD_SUSPEND:
         case SYS_THREAD_RESUME:
         case SYS_THREAD_CONTEXT: {
-            struct thread *target = thread_by_id(p, r[0]);
+            struct thread *target = thread_by_id(p, (uint32_t)r[0]);
             if (!target || target->state == T_DONE) {
-                r[0] = (uint32_t)USER_ESRCH;
+                r[0] = (user_reg)USER_ESRCH;
                 break;
             }
             if (target == t) {
-                r[0] = (uint32_t)USER_EDEADLK;
+                r[0] = (user_reg)USER_EDEADLK;
                 break;
             }
-            if (r[7] == SYS_THREAD_SUSPEND) {
-                if (target->suspended == 16) r[0] = (uint32_t)USER_EAGAIN;
+            if (r[SYSCALL_NUMBER] == SYS_THREAD_SUSPEND) {
+                if (target->suspended == 16) r[0] = (user_reg)USER_EAGAIN;
                 else {
                     ++target->suspended;
                     r[0] = 0;
                 }
-            } else if (!target->suspended) r[0] = (uint32_t)USER_EINVAL;
-            else if (r[7] == SYS_THREAD_RESUME) {
+            } else if (!target->suspended) r[0] = (user_reg)USER_EINVAL;
+            else if (r[SYSCALL_NUMBER] == SYS_THREAD_RESUME) {
                 --target->suspended;
                 r[0] = 0;
-            } else
-                r[0] = vm_copy_to_user(&p->space, r[1], &target->context, sizeof(target->context))
-                           ? 0
-                           : (uint32_t)USER_EFAULT;
+            } else r[0] = copy_thread_context(p, r[1], target) ? 0 : (user_reg)USER_EFAULT;
             break;
         }
         case SYS_WAIT_WORD:
         case SYS_WAKE_WORD: {
             uint32_t value;
             if (!load_word(p, r[0], &value)) {
-                r[0] = (uint32_t)USER_EFAULT;
+                r[0] = (user_reg)USER_EFAULT;
                 break;
             }
-            if (r[7] == SYS_WAKE_WORD) r[0] = wake_word(p, r[0], r[1]);
-            else if (value != r[1]) r[0] = (uint32_t)USER_EAGAIN;
-            else if (!r[2]) r[0] = (uint32_t)USER_ETIMEDOUT;
+            uint32_t expected = (uint32_t)r[1], timeout = (uint32_t)r[2];
+            if (r[SYSCALL_NUMBER] == SYS_WAKE_WORD) r[0] = wake_word(p, r[0], expected);
+            else if (value != expected) r[0] = (user_reg)USER_EAGAIN;
+            else if (!timeout) r[0] = (user_reg)USER_ETIMEDOUT;
             else {
                 t->state = T_WAIT;
                 t->wait_address = r[0];
-                t->deadline = r[2] == USER_WAIT_FOREVER ? UINT64_MAX : time_us() + r[2];
+                t->deadline = timeout == USER_WAIT_FOREVER ? UINT64_MAX : time_us() + timeout;
                 r[0] = 0;
             }
             break;
         }
         case SYS_CLOCK: {
-            if (r[0] > 3) {
-                r[0] = (uint32_t)USER_EINVAL;
+            uint32_t clock = (uint32_t)r[0];
+            if (clock > 3) {
+                r[0] = (user_reg)USER_EINVAL;
                 break;
             }
             uint64_t value = time_us();
-            if (r[0] == 1) {
+            if (clock == 1) {
                 if (!system_clock_read(&value)) {
-                    r[0] = (uint32_t)USER_ENODEV;
+                    r[0] = (user_reg)USER_ENODEV;
                     break;
                 }
-            } else if (r[0] == 2) value = p->cpu_us;
-            else if (r[0] == 3) value = t->cpu_us;
-            r[0] = vm_copy_to_user(&p->space, r[1], &value, 8) ? 0 : (uint32_t)USER_EFAULT;
+            } else if (clock == 2) value = p->cpu_us;
+            else if (clock == 3) value = t->cpu_us;
+            r[0] = vm_copy_to_user(&p->space, r[1], &value, 8) ? 0 : (user_reg)USER_EFAULT;
             break;
         }
         case SYS_RANDOM: {
-            if (r[1] > 256) {
-                r[0] = (uint32_t)USER_EINVAL;
+            uint32_t size = (uint32_t)r[1];
+            if (size > 256) {
+                r[0] = (user_reg)USER_EINVAL;
                 break;
             }
-            if (!r[1]) {
+            if (!size) {
                 r[0] = 0;
                 break;
             }
-            if (!vm_accessible(&p->space, r[0], r[1], VM_WRITE)) {
-                r[0] = (uint32_t)USER_EFAULT;
+            if (!vm_accessible(&p->space, r[0], size, VM_WRITE)) {
+                r[0] = (user_reg)USER_EFAULT;
                 break;
             }
             if (!random_ready) {
-                r[0] = (uint32_t)USER_ENODEV;
+                r[0] = (user_reg)USER_ENODEV;
                 break;
             }
             current_thread->state = T_SERVICE;
@@ -466,25 +580,23 @@ static void syscall(struct process *p) {
         case SYS_VM_PROTECT:
         case SYS_VM_UNMAP:
         case SYS_VM_DISCARD:
-        case SYS_VM_CHECK: r[0] = (uint32_t)memory_call(p, r[7], r[0], r[1], r[2]); break;
+        case SYS_VM_CHECK:
+            r[0] = (user_reg)memory_call(p, (uint32_t)r[SYSCALL_NUMBER], r[0], (uint32_t)r[1],
+                                         (uint32_t)r[2]);
+            break;
         case SYS_VM_ALLOC_RANGE: {
-            uint32_t lower = r[0], upper = r[1];
-            unsigned count = r[2], flags = r[3];
-            if (lower < USER_HEAP_BASE || upper > USER_HEAP_END || lower >= upper ||
+            user_ptr lower = r[0], upper = r[1];
+            unsigned count = (uint32_t)r[2], flags = (uint32_t)r[3];
+            bool jit = jit_window(p, lower, upper);
+            if (((lower < USER_HEAP_BASE || upper > USER_HEAP_END) && !jit) || lower >= upper ||
                 ((lower | upper) & (PAGE_SIZE - 1)) || !count ||
-                count > (upper - lower) / PAGE_SIZE || (flags & ~7u) || ((flags & 6) == 6) ||
-                (flags && !(flags & VM_READ))) {
-                r[0] = (uint32_t)USER_EINVAL;
+                count > (upper - lower) / PAGE_SIZE || (flags & ~7u) ||
+                ((flags & 6) == 6 && !jit) || (flags && !(flags & VM_READ))) {
+                r[0] = (user_reg)USER_EINVAL;
                 break;
             }
-            uint32_t address = vm_allocate_range(&p->space, count, lower, upper);
-            if (!address) {
-                r[0] = (uint32_t)USER_ENOMEM;
-                break;
-            }
-            for (unsigned i = 0; i < count; ++i)
-                vm_protect(&p->space, address + i * PAGE_SIZE, flags);
-            r[0] = address;
+            user_ptr address = allocate_range(p, count, lower, upper, flags);
+            r[0] = address ? address : (user_reg)USER_ENOMEM;
             break;
         }
         case SYS_MEMORY_INFO: {
@@ -493,49 +605,51 @@ static void syscall(struct process *p) {
             struct user_memory_info info = {PAGE_SIZE, p->space.mapped_pages, p->peak_pages,
                                             USER_PAGE_QUOTA, available};
             r[0] =
-                vm_copy_to_user(&p->space, r[0], &info, sizeof(info)) ? 0 : (uint32_t)USER_EFAULT;
+                vm_copy_to_user(&p->space, r[0], &info, sizeof(info)) ? 0 : (user_reg)USER_EFAULT;
             break;
         }
         case SYS_PRESENT:
-            r[0] = (uint32_t)page_host_present(p->pid - 1, &p->space, r[0], r[1]);
+            r[0] = (user_reg)page_host_present(p->pid - 1, &p->space, r[0], (uint32_t)r[1]);
             break;
         case SYS_PRESENT_DAMAGE: {
             struct user_present_damage damage;
             if (r[1] != sizeof(damage)) {
-                r[0] = (uint32_t)USER_EINVAL;
+                r[0] = (user_reg)USER_EINVAL;
                 break;
             }
             if (!vm_copy_from_user(&p->space, &damage, r[0], sizeof(damage))) {
-                r[0] = (uint32_t)USER_EFAULT;
+                r[0] = (user_reg)USER_EFAULT;
                 break;
             }
-            r[0] = (uint32_t)page_host_present_damage(p->pid - 1, &p->space, &damage);
+            r[0] = (user_reg)page_host_present_damage(p->pid - 1, &p->space, &damage);
             break;
         }
         case SYS_SURFACE_STATE: r[0] = page_host_surface_state(p->pid - 1); break;
         case SYS_PRESENT_FRAME: {
             struct user_present_frame frame;
             if (r[1] != sizeof(frame)) {
-                r[0] = (uint32_t)USER_EINVAL;
+                r[0] = (user_reg)USER_EINVAL;
                 break;
             }
             if (!vm_copy_from_user(&p->space, &frame, r[0], sizeof(frame))) {
-                r[0] = (uint32_t)USER_EFAULT;
+                r[0] = (user_reg)USER_EFAULT;
                 break;
             }
-            r[0] = (uint32_t)page_host_present_frame(p->pid - 1, &p->space, &frame);
+            r[0] = (user_reg)page_host_present_frame(p->pid - 1, &p->space, &frame);
             break;
         }
-        case SYS_INPUT_METHOD: r[0] = (uint32_t)page_host_input_method(p->pid - 1, r[0]); break;
-        case SYS_BACK_KEY: r[0] = (uint32_t)page_host_back_key(p->pid - 1, r[0]); break;
-        case SYS_HAPTIC_TAP: r[0] = (uint32_t)page_host_haptic_tap(p->pid - 1); break;
+        case SYS_INPUT_METHOD:
+            r[0] = (user_reg)page_host_input_method(p->pid - 1, (uint32_t)r[0]);
+            break;
+        case SYS_BACK_KEY: r[0] = (user_reg)page_host_back_key(p->pid - 1, (uint32_t)r[0]); break;
+        case SYS_HAPTIC_TAP: r[0] = (user_reg)page_host_haptic_tap(p->pid - 1); break;
         case SYS_UPDATE:
             /* The system's updater's alone; INFO and APPS need no I/O. */
-            if (!p->app || !p->app->system) r[0] = (uint32_t)USER_ENOSYS;
-            else if (r[0] == USER_UPDATE_INFO)
-                r[0] = (uint32_t)system_update_info(&p->space, r[1], r[2]);
-            else if (r[0] == USER_UPDATE_APPS)
-                r[0] = (uint32_t)system_update_apps(&p->space, r[1], r[2]);
+            if (!p->app || !p->app->system) r[0] = (user_reg)USER_ENOSYS;
+            else if ((uint32_t)r[0] == USER_UPDATE_INFO)
+                r[0] = (user_reg)system_update_info(&p->space, r[1], (uint32_t)r[2]);
+            else if ((uint32_t)r[0] == USER_UPDATE_APPS)
+                r[0] = (user_reg)system_update_apps(&p->space, r[1], (uint32_t)r[2]);
             else {
                 current_thread->state = T_SERVICE;
                 continue_slice = false;
@@ -544,11 +658,11 @@ static void syscall(struct process *p) {
         case SYS_BROWSER_COMMAND: {
             struct user_browser_command command;
             if (r[1] != sizeof(command)) {
-                r[0] = (uint32_t)USER_EINVAL;
+                r[0] = (user_reg)USER_EINVAL;
                 break;
             }
             if (!vm_accessible(&p->space, r[0], sizeof(command), VM_WRITE)) {
-                r[0] = (uint32_t)USER_EFAULT;
+                r[0] = (user_reg)USER_EFAULT;
                 break;
             }
             if (!page_host_browser_command(p->pid - 1, &command)) {
@@ -557,20 +671,20 @@ static void syscall(struct process *p) {
             }
             r[0] = vm_copy_to_user(&p->space, r[0], &command, sizeof(command))
                        ? 1
-                       : (uint32_t)USER_EFAULT;
+                       : (user_reg)USER_EFAULT;
             break;
         }
         case SYS_BROWSER_STATE: {
             struct user_browser_state state;
             if (r[1] != sizeof(state)) {
-                r[0] = (uint32_t)USER_EINVAL;
+                r[0] = (user_reg)USER_EINVAL;
                 break;
             }
             if (!vm_copy_from_user(&p->space, &state, r[0], sizeof(state))) {
-                r[0] = (uint32_t)USER_EFAULT;
+                r[0] = (user_reg)USER_EFAULT;
                 break;
             }
-            r[0] = (uint32_t)page_host_browser_state(p->pid - 1, &state);
+            r[0] = (user_reg)page_host_browser_state(p->pid - 1, &state);
             break;
         }
         case SYS_NET_INFO:
@@ -579,16 +693,17 @@ static void syscall(struct process *p) {
         case SYS_NET_SEND:
         case SYS_NET_RECV:
         case SYS_NET_CLOSE:
-            r[0] = (uint32_t)network_call(p->pid, &p->space, r[7], r[0], r[1], r[2]);
+            r[0] = (user_reg)network_call(p->pid, &p->space, (uint32_t)r[SYSCALL_NUMBER], r[0],
+                                          r[1], r[2]);
             break;
         case SYS_NEXT_EVENT: {
             struct user_input_event event;
             if (r[1] != sizeof(event)) {
-                r[0] = (uint32_t)USER_EINVAL;
+                r[0] = (user_reg)USER_EINVAL;
                 break;
             }
             if (!vm_accessible(&p->space, r[0], sizeof(event), VM_WRITE)) {
-                r[0] = (uint32_t)USER_EFAULT;
+                r[0] = (user_reg)USER_EFAULT;
                 break;
             }
             if (!page_host_next(p->pid - 1, &event)) {
@@ -596,10 +711,12 @@ static void syscall(struct process *p) {
                 break;
             }
             r[0] =
-                vm_copy_to_user(&p->space, r[0], &event, sizeof(event)) ? 1 : (uint32_t)USER_EFAULT;
+                vm_copy_to_user(&p->space, r[0], &event, sizeof(event)) ? 1 : (user_reg)USER_EFAULT;
             break;
         }
-        case SYS_FILE_SEEK: r[0] = (uint32_t)fs_seek(&p->files, r[0], r[1]); break;
+        case SYS_FILE_SEEK:
+            r[0] = (user_reg)fs_seek(&p->files, (uint32_t)r[0], (uint32_t)r[1]);
+            break;
         case SYS_GPU:
         case SYS_FILE_OPEN:
         case SYS_FILE_READ:
@@ -619,7 +736,7 @@ static void syscall(struct process *p) {
             current_thread->state = T_SERVICE;
             continue_slice = false;
             break;
-        default: r[0] = (uint32_t)USER_ENOSYS; break;
+        default: r[0] = (user_reg)USER_ENOSYS; break;
     }
 }
 
@@ -653,11 +770,11 @@ static void handle_trap(const struct arm_trap *trap, uint64_t elapsed) {
         /* Mapping changes and GC suspension require every peer to leave user
          * mode first. Stop dispatching this address space, then collect its
          * bounded timer slices before changing translations or taking stacks. */
-        if (current->running_mask && needs_quiescence(trap->context.r[7])) {
+        if (current->running_mask && needs_quiescence((uint32_t)trap->context.r[SYSCALL_NUMBER])) {
             current_thread->state = T_QUIESCE;
             return;
         }
-        continue_slice = trap->context.r[7] != SYS_YIELD;
+        continue_slice = trap->context.r[SYSCALL_NUMBER] != SYS_YIELD;
         syscall(current);
         if (current->space.mapped_pages > current->peak_pages)
             current->peak_pages = current->space.mapped_pages;
@@ -690,24 +807,28 @@ static void finish_quiescent(struct process *p) {
 static void service_work(void *argument) {
     struct process *p = argument;
     if (io_thread) {
-        uint32_t *r = io_thread->context.r;
-        if (r[7] == SYS_RANDOM) {
+        user_reg *r = io_thread->context.r;
+        if (r[SYSCALL_NUMBER] == SYS_RANDOM) {
             unsigned char bytes[256];
-            size_t n = entropy_read(bytes, r[1]);
+            size_t n = entropy_read(bytes, (uint32_t)r[1]);
             if (!n) {
                 random_ready = entropy_available();
                 page_host_entropy_status(random_ready, entropy_error());
             }
-            r[0] = n ? (vm_copy_to_user(&p->space, r[0], bytes, n) ? (uint32_t)n
-                                                                   : (uint32_t)USER_EFAULT)
-                     : (uint32_t)(random_ready ? USER_EAGAIN : USER_ENODEV);
+            r[0] = n ? (vm_copy_to_user(&p->space, r[0], bytes, n) ? (user_reg)n
+                                                                   : (user_reg)USER_EFAULT)
+                     : (user_reg)(random_ready ? USER_EAGAIN : USER_ENODEV);
             volatile unsigned char *wipe = bytes;
             for (unsigned i = 0; i < sizeof(bytes); ++i) wipe[i] = 0;
-        } else if (r[7] == SYS_GPU)
-            r[0] = (uint32_t)gpu_client_call(&p->gpu, &p->space, p->pid - 1, r[0], r[1], r[2]);
-        else if (r[7] == SYS_UPDATE)
-            r[0] = (uint32_t)system_update_call(p->pid, &p->space, r[0], r[1], r[2]);
-        else r[0] = (uint32_t)fs_call(&p->files, &p->space, r[7], r[0], r[1], r[2], r[3]);
+        } else if (r[SYSCALL_NUMBER] == SYS_GPU)
+            r[0] = (user_reg)gpu_client_call(&p->gpu, &p->space, p->pid - 1, (uint32_t)r[0], r[1],
+                                             (uint32_t)r[2]);
+        else if (r[SYSCALL_NUMBER] == SYS_UPDATE)
+            r[0] = (user_reg)system_update_call(p->pid, &p->space, (uint32_t)r[0], r[1],
+                                                (uint32_t)r[2]);
+        else
+            r[0] = (user_reg)fs_call(&p->files, &p->space, (uint32_t)r[SYSCALL_NUMBER], r[0], r[1],
+                                     r[2], r[3]);
         io_thread->state = T_READY;
         return;
     }
@@ -873,12 +994,6 @@ static void collect(unsigned cpu) {
         panic("CPU completion ownership corrupt");
     p->running_mask &= ~(1u << cpu);
     t->running_cpu = 0;
-    p->running_cpu = 0;
-    for (unsigned i = 0; i < ARM_CPU_MAX; ++i)
-        if (p->running_mask & (1u << i)) {
-            p->running_cpu = i + 1;
-            break;
-        }
     dispatched[cpu].process = 0;
     dispatched[cpu].thread = 0;
     /* Close cancels the in-flight syscall as well as its user continuation. */
@@ -917,11 +1032,11 @@ static void dispatch(unsigned cpu) {
                     candidate->state = T_READY;
                 if (candidate->state == T_WAIT) {
                     if (!vm_resolve(&p->space, candidate->wait_address, VM_READ)) {
-                        candidate->context.r[0] = (uint32_t)USER_EFAULT;
+                        candidate->context.r[0] = (user_reg)USER_EFAULT;
                         candidate->state = T_READY;
                     } else if (candidate->deadline != UINT64_MAX &&
                                time_us() >= candidate->deadline) {
-                        candidate->context.r[0] = (uint32_t)USER_ETIMEDOUT;
+                        candidate->context.r[0] = (user_reg)USER_ETIMEDOUT;
                         candidate->state = T_READY;
                     }
                 }
@@ -938,11 +1053,6 @@ static void dispatch(unsigned cpu) {
         t->resume = false;
         t->running_cpu = cpu + 1;
         p->running_mask |= 1u << cpu;
-        if (!p->running_cpu) p->running_cpu = cpu + 1;
-        unsigned parallel = 0;
-        for (unsigned i = 0; i < ARM_CPU_MAX; ++i)
-            if (p->running_mask & (1u << i)) ++parallel;
-        if (parallel > p->peak_parallel) p->peak_parallel = parallel;
         dispatched[cpu].process = p;
         dispatched[cpu].thread = t;
         now = time_us();

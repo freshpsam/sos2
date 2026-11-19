@@ -1,5 +1,6 @@
 #include "wcnss_control.h"
 #include "platform.h"
+#include "wire.h"
 
 enum {
     VERSION_REQUEST = 0x01000000,
@@ -10,14 +11,6 @@ enum {
     FRAGMENT = 3072,
     NV_LIMIT = 1024 * 1024
 };
-
-static uint32_t word(const unsigned char *p) {
-    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
-}
-
-static void put(unsigned char *p, uint32_t n) {
-    for (unsigned i = 0; i < 4; ++i) p[i] = (unsigned char)(n >> (8 * i));
-}
 
 static enum wcnss_state fail(struct wcnss_control *c, const char *why) {
     c->error = why;
@@ -70,9 +63,9 @@ enum wcnss_state wcnss_control_poll(struct wcnss_control *c, uint64_t now) {
         result = smd_receive(c->channel, c->packet, sizeof(c->packet), &size, now);
         if (result < 0) return fail(c, "WCNSS control receive failed");
         if (result == SMD_AGAIN) break;
-        if (size < 8 || word(c->packet + 4) != size)
+        if (size < 8 || le32(c->packet + 4) != size)
             return fail(c, "malformed WCNSS control reply");
-        uint32_t type = word(c->packet);
+        uint32_t type = le32(c->packet);
         if (type == BOOT_COMPLETE && size == 8) {
             c->cold_boot_done = true;
             if (c->state == WCNSS_BOOT_WAIT) {
@@ -82,7 +75,6 @@ enum wcnss_state wcnss_control_poll(struct wcnss_control *c, uint64_t now) {
             notification = true;
             continue;
         } else if (c->state == WCNSS_VERSION_WAIT && type == VERSION_RESPONSE && size == 12) {
-            memcpy(c->version, c->packet + 8, 4);
             c->state = WCNSS_NV_SEND;
             c->deadline = now + 30000000;
         } else if (c->state == WCNSS_NV_WAIT && type == NV_RESPONSE && size == 9) {
@@ -96,8 +88,8 @@ enum wcnss_state wcnss_control_poll(struct wcnss_control *c, uint64_t now) {
     if (c->state != WCNSS_READY && now >= c->deadline) return timed_out(c);
     if (notification) return c->state;
     if (c->state == WCNSS_VERSION_SEND) {
-        put(c->packet, VERSION_REQUEST);
-        put(c->packet + 4, 8);
+        put32(c->packet, VERSION_REQUEST);
+        put32(c->packet + 4, 8);
         result = smd_send(c->channel, c->packet, 8, now);
         if (result < 0) return fail(c, "WCNSS version query send failed");
         if (result == SMD_OK) {
@@ -109,13 +101,13 @@ enum wcnss_state wcnss_control_poll(struct wcnss_control *c, uint64_t now) {
     if (c->state == WCNSS_NV_SEND) {
         unsigned bytes = c->size - c->sent;
         if (bytes > FRAGMENT) bytes = FRAGMENT;
-        put(c->packet, NV_REQUEST);
-        put(c->packet + 4, bytes + 16);
+        put32(c->packet, NV_REQUEST);
+        put32(c->packet + 4, bytes + 16);
         c->packet[8] = (unsigned char)c->sequence;
         c->packet[9] = (unsigned char)(c->sequence >> 8);
         c->packet[10] = c->sent + bytes == c->size;
         c->packet[11] = 0;
-        put(c->packet + 12, bytes);
+        put32(c->packet + 12, bytes);
         memcpy(c->packet + 16, c->nv + c->sent, bytes);
         result = smd_send(c->channel, c->packet, bytes + 16, now);
         if (result < 0) return fail(c, "WCNSS board-data send failed");

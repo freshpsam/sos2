@@ -39,13 +39,14 @@ unavailable. Power toggles standby, which lasts about two weeks.
 ## Installing
 
 `make phone` also writes the installed system to `build/redmi2-install`, and
-`make publish` puts it on [GitHub Pages](https://freshpsam.github.io/sos2/):
+`make publish` puts it on [GitHub Pages](https://freshpsam.github.io/sos2/),
+with the [tablet's](gta7lite.md#updates-and-apps) when that is built too
+(`PUBLISH=redmi2` publishes the phone alone):
 
-- `flash-boot.img`: the kernel and DTB, whose command line names the
-  resources' SHA-256 (`sos2.system=`).
-- `flash-cache.img`: the cache partition's first slot, holding the compressed
-  resources.
-- `sos2-redmi2.update`: both, for the [updater](#updates).
+- `flash-boot.img`: the whole system, as the RAM image holds it (kernel, DTB
+  and the compressed resources as its ramdisk), with `sos2.storage=installed`
+  in its command line.
+- `sos2-redmi2.update`: the same image, for the [updater](#updates).
 - `install.json`: the release, the files' sizes and SHA-256s, and these
   commands.
 
@@ -53,23 +54,21 @@ Check the files' SHA-256 against `install.json`, start lk2nd fastboot and run:
 
 ```sh
 fastboot flash boot flash-boot.img     # lk2nd writes it after its own 512 KiB
-fastboot flash cache flash-cache.img
 fastboot reboot
 ```
 
 This replaces the system lk2nd starts from the boot partition (such as
-MIUI's kernel) and overwrites the cache partition, which Android treats as
-disposable; lk2nd and every other partition stay. MIUI comes back by flashing
-its own `boot.img`. At power-on the kernel reads its resources from the cache
-partition (**Reading browser** on the loading screen) and keeps web pages',
-apps' and the desktop's data on a [data volume](#persistent-storage) there.
-A phone that cannot start its installed system says what to flash.
+MIUI's kernel); lk2nd and every other partition stay. MIUI comes back by
+flashing its own `boot.img`. At power-on lk2nd loads the whole image, as
+`fastboot boot` does, and the kernel keeps web pages', apps' and the
+desktop's data in the cache partition, which Android treats as disposable.
 
-The 320 MiB cache partition holds two 64 MiB system slots
-(`include/system_store.h`), the [app store](#apps) and the 131 MiB data
-volume. SOS2 finds the `boot` and `cache` partitions by name in a GPT it
-validates, and writes only inside them. The eMMC handoff, these reads and
-writes, and the restart are not yet qualified on the handset.
+The 320 MiB cache partition holds 1 MiB left unused, the [app store](#apps)
+and the 259 MiB [data volume](#persistent-storage)
+(`include/system_store.h`), which SOS2 sets up at its first start, whatever
+the partition held. SOS2 finds the `boot` and `cache` partitions by name in a
+GPT it validates, and writes only inside them; when the eMMC fails, the phone
+runs as a RAM session.
 
 ## Updates
 
@@ -79,16 +78,17 @@ time and commit, `+` for uncommitted changes) and checks
 needs Wi-Fi and the network time.
 
 1. **CHECK FOR UPDATES** reads the published release and app list.
-2. **INSTALL SYSTEM** (**REINSTALL** for the running release) downloads about
-   45 MB. The kernel checks the file and writes the resources into the slot
-   the boot image does not use, reads them back, and then writes the boot
-   image, its first sector last.
+2. **INSTALL SYSTEM** (**REINSTALL** for the running release) downloads the
+   boot image, about 29 MB, into RAM. The kernel checks it, clears the boot
+   image's first sector, writes the rest and reads it back, and writes the
+   first sector last.
 3. **RESTART** restarts the phone into the new release.
 
-Until the boot image is written, a failed or interrupted update leaves the
-running release to start again. A power loss during that write (about a
-second) leaves lk2nd in fastboot, where flashing `flash-boot.img` finishes
-the job. Updates are not signed: their SHA-256s guard against damage, and
+A failed or interrupted download leaves the running release to start again.
+Once the write has begun, closing the updater does not stop it, but a power
+loss before it ends (likely about a minute of single-sector writes; not yet
+timed on the handset) leaves lk2nd in fastboot, where flashing
+`flash-boot.img` finishes the job. Updates are not signed: their SHA-256s guard against damage, and
 whoever can publish to the Pages site can install software on the phone.
 Pages is public, so `make publish` refuses a build with a Wi-Fi profile. A
 RAM session or QEMU shows updates but installs nothing.
@@ -118,9 +118,15 @@ position not in use, so an interrupted install keeps the previous version.
   handset must use its own files, never another phone's NV calibration.
 - `REDMI2_WIFI_PROFILE=file` adds a bootstrap Wi-Fi profile
   ([provisioning](redmi2-wifi.md#provisioning)).
-- `REDMI2_RTC_ANCHOR=UNIX_SECONDS:RTC_COUNTER` supplies an RTC calibration.
-- `REDMI2_ADRENO_FIRMWARE=build/redmi2-adreno` enables the
-  [Adreno path](gpu.md#redmi-2-adreno).
+- The [Adreno path](gpu.md#redmi-2-adreno) is on once `make fetch` has put
+  its firmware in `build/redmi2-adreno`; `REDMI2_ADRENO_FIRMWARE` names
+  another folder, or none (empty) for CPU composition.
+- `REDMI2_JSC=options` passes JavaScriptCore options to every page through
+  the `sos2.jsc=` boot argument, such as `useJIT=false` (interpreter only) or
+  `useDFGJIT=false` (up to the baseline JIT), to compare the tiers. The
+  installed image and update package carry the same options as the RAM image.
+  The kernel keeps 255 bytes of `sos2.*` arguments, which leaves the options
+  their whole 127 characters.
 - `STORAGE=persistent` builds `build/redmi2-browser/boot.img`, which keeps
   data on a [dedicated partition](#persistent-storage).
 
@@ -130,7 +136,7 @@ The persistent image (started with `fastboot boot`) keeps profiles on one
 dedicated GPT partition through the native eMMC driver. No SOS2 tool creates
 phone partitions. The kernel accepts only a single partition named
 `sos2-data` with type GUID `0f8d5c18-7f04-4af2-98d5-937c32e075a7`, 4 KiB
-aligned, 2 MiB to 1 GiB, in a fully consistent GPT, holding a littlefs volume
+aligned, 2 MiB to 1 GiB, in a valid primary GPT, holding a littlefs volume
 written by `build/host/mkfs`; otherwise storage is unavailable for the boot.
 An [installed](#installing) phone instead keeps its volume in the cache
 partition after the app store and never looks for `sos2-data`. The kernel

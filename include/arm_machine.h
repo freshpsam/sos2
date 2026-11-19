@@ -6,6 +6,14 @@ struct arm_timer_route {
     uintptr_t distributor, cpu;
     unsigned interrupt;
     bool qcom;
+#ifdef SOS2_BOARD_GTA7LITE
+    /* GICv3 in place of GICv2's CPU interface (cpu is 0): the CPU interface is
+     * in system registers, and each CPU's PPIs in its frame among the
+     * redistributors, which take `redistributor_size` bytes. */
+    bool gicv3;
+    uintptr_t redistributor;
+    uint32_t redistributor_size;
+#endif
 };
 
 struct arm_mapping {

@@ -51,7 +51,7 @@
  * reset first): 8.6 mA lowered, 6.0 mA off. Only if the panel is held in
  * reset when the rails are listed: a panel asleep but out of reset keeps
  * its settings only while powered (this phone's R61308 is held in reset at
- * every standby, redmi2_display.c). Each wake's active set brings L17 back
+ * every standby, display.c). Each wake's active set brings L17 back
  * before anything runs; waking restarts the panel from reset and the touch
  * controller with its reset pulse, and puts the motion sensor, which powers
  * up running, back to sleep (idle_devices.c).

@@ -174,7 +174,7 @@ public:
             fail("No fresh cached response available"_s);
             return false;
         }
-        if (auto *body = request.httpBody()) {
+        if (RefPtr body = request.httpBody()) {
             for (auto &element : body->elements())
                 if (!std::holds_alternative<Vector<uint8_t>>(element.data)) {
                     fail("File and blob uploads are unavailable"_s);

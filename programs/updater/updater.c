@@ -3,9 +3,9 @@
  * UPDATE_URL and the app index at APPS_URL over verified HTTPS, following
  * redirects, and shows the system release and each app next to what runs.
  * Installing hands a file to the kernel's update service (SYS_UPDATE,
- * kernel/protection/system_update.c), which checks it and, on a phone
- * started from its installed system, installs it: the system into the spare
- * cache slot and the boot partition, an app into the app store. Apps can be
+ * kernel/protection/system_update.c), which checks it and, on a device
+ * started from its installed system, installs it: the system into the boot
+ * partition, an app into the app store. Apps can be
  * removed too. RESTART starts an installed system update; an app's update
  * starts with its next launch. One thread does it all: the network is
  * nonblocking, and each step is short. */
@@ -28,9 +28,20 @@
 #include <sos2/services.h>
 #include "graphics.h"
 
-/* tools/publish_pages.py checks that these are where it publishes. */
+/* tools/publish_pages.py checks that these are where it publishes: each
+ * device's system and the apps for its architecture. The Galaxy Tab A7 Lite
+ * is the AArch64 device (QEMU's AArch64 machine checks it too). */
+#ifdef __aarch64__
+#define UPDATE_URL "https://freshpsam.github.io/sos2/gta7lite/sos2-gta7lite.update"
+#define APPS_URL   "https://freshpsam.github.io/sos2/apps-arm64/"
+#define BOARD      "gta7litewifi"
+#define DEVICE     "tablet"
+#else
 #define UPDATE_URL "https://freshpsam.github.io/sos2/redmi2/sos2-redmi2.update"
 #define APPS_URL   "https://freshpsam.github.io/sos2/apps/"
+#define BOARD      "redmi2-wt88047"
+#define DEVICE     "phone"
+#endif
 
 enum {
     WIDTH = WEB_WIDTH,
@@ -398,9 +409,15 @@ static const char *action_label(enum action action) {
     }
 }
 
+/* A device that installs nothing yet but restarts into its bootloader's
+ * download mode (the Galaxy Tab A7 Lite) has that in INSTALL SYSTEM's place. */
+static bool download_mode(void) {
+    return !installs() && (info.flags & USER_UPDATE_DOWNLOAD_MODE);
+}
+
 static bool enabled(int target) {
     if (busy()) return false;
-    if (target == INSTALL_SYSTEM) return system_checked && installs();
+    if (target == INSTALL_SYSTEM) return download_mode() || (system_checked && installs());
     if (target == PREVIOUS_APPS) return row_offset > 0;
     if (target == NEXT_APPS) return row_offset + ROWS < row_count;
     if (target >= ROW_BUTTON)
@@ -439,6 +456,7 @@ static const char *target_label(int target) {
     if (target == NEXT_APPS) return "NEXT";
     if (target == CHECK) return "CHECK FOR UPDATES";
     if (target == RESTART) return "RESTART";
+    if (download_mode()) return "DOWNLOAD MODE";
     return system_checked && !strcmp(available, info.release) ? "REINSTALL" : "INSTALL SYSTEM";
 }
 
@@ -481,14 +499,16 @@ static void render_status(void) {
                  status_warning ? WARNING : TEXT);
 }
 
-/* A download, then a system's read-back, as a fraction of the bar. */
+/* A download, then a system's boot-image write and read-back, as a fraction
+ * of the bar. */
 static void render_bar(void) {
     gfx_rect(&screen, MARGIN, BAR_Y, INNER, 10, PANEL);
     uint64_t done = 0, all = 0;
     if (job == INSTALLING) {
         done = net.body;
         all = total;
-    } else if (job == FINISHING && info.state == USER_UPDATE_CHECKING) {
+    } else if (job == FINISHING &&
+               (info.state == USER_UPDATE_WRITING || info.state == USER_UPDATE_CHECKING)) {
         done = info.done;
         all = info.total;
     } else if (job == FINISHING || info.state == USER_UPDATE_DONE) {
@@ -700,9 +720,13 @@ static void start(enum job next, const char *url, enum sink sink, uint32_t size)
     render();
 }
 
-/* The system update's header names it: its magic, board, release and size.
- * The kernel checks the rest when installing. */
+/* The system update's header (struct system_update_header in
+ * include/system_store.h) names it: its magic, board, release and size. The
+ * kernel checks the rest when installing. */
+enum { SYSTEM_FILE_SIZE = 120 /* the header's total_size */ };
+
 static bool read_system_header(void) {
+    static const char board[16] = BOARD;
     struct {
         char magic[8];
         uint32_t version, header_size;
@@ -711,10 +735,10 @@ static bool read_system_header(void) {
 
     memcpy(&fields, head, sizeof(fields));
     uint32_t file_size;
-    memcpy(&file_size, head + 160, 4);
-    if (memcmp(fields.magic, "SOS2UPDT", 8) || fields.version != 1 ||
+    memcpy(&file_size, head + SYSTEM_FILE_SIZE, 4);
+    if (memcmp(fields.magic, "SOS2UPDT", 8) || fields.version != 2 ||
         fields.header_size != USER_UPDATE_HEADER ||
-        memcmp(fields.board, "redmi2-wt88047\0", sizeof(fields.board)) ||
+        memcmp(fields.board, board, sizeof(board)) ||
         !memchr(fields.release, 0, sizeof(fields.release)) || !fields.release[0])
         return false;
     for (const char *c = fields.release; *c; ++c)
@@ -734,7 +758,7 @@ static bool write_piece(void) {
 /* The checks: the system's header, then the app index. */
 static void header_done(void) {
     if (!read_system_header()) {
-        stop(true, "Not an SOS2 update for this phone");
+        stop(true, "Not an SOS2 update for this device");
         return;
     }
     system_checked = true;
@@ -784,7 +808,7 @@ static bool deliver(const unsigned char *p, size_t n) {
         }
         /* The size the file's own header gives, should it differ from the
          * one checked. */
-        memcpy(&total, head + (memcmp(head, "SOS2APP1", 8) ? 160 : 64), sizeof(total));
+        memcpy(&total, head + (memcmp(head, "SOS2APP1", 8) ? SYSTEM_FILE_SIZE : 64), sizeof(total));
         begun = true;
     }
     while (n) {
@@ -1050,13 +1074,13 @@ static bool step_finish(void) {
     int result = sos2_update(USER_UPDATE_FINISH, 0, 0);
     refresh_info();
     if (result == USER_EAGAIN) {
-        if (info.state == USER_UPDATE_CHECKING) {
+        if (info.state == USER_UPDATE_WRITING || info.state == USER_UPDATE_CHECKING) {
             char done[16], all[16];
             megabytes(done, sizeof(done), info.done);
             megabytes(all, sizeof(all), info.total);
-            say(false, "Verifying %s of %s...", done, all);
-        } else if (info.state == USER_UPDATE_WRITING)
-            say(false, "Writing boot image; keep the phone on");
+            say(false, "%s %s of %s; keep the " DEVICE " on",
+                info.state == USER_UPDATE_WRITING ? "Writing" : "Verifying", done, all);
+        }
         render_progress(true);
         return true;
     }
@@ -1130,6 +1154,14 @@ static void act(int target) {
     if (target == CHECK) {
         installing[0] = 0;
         start(CHECKING_SYSTEM, UPDATE_URL, HEADER, 0);
+    } else if (target == INSTALL_SYSTEM && download_mode()) {
+        say(false, "Restarting into download mode...");
+        render();
+        if (sos2_update(USER_UPDATE_DOWNLOAD, 0, 0)) {
+            refresh_info();
+            say(true, "%s", info.message[0] ? info.message : "Download mode failed");
+            render();
+        }
     } else if (target == INSTALL_SYSTEM) {
         installing[0] = 0;
         start(INSTALLING, UPDATE_URL, STREAM, available_size);
@@ -1186,6 +1218,8 @@ int main(void) {
     if (info.state == USER_UPDATE_FAILED && info.message[0]) say(true, "%s", info.message);
     else if (info.flags & USER_UPDATE_RESTART_DUE)
         say(false, "Installed; restart to use it");
+    else if (download_mode())
+        say(false, "Updates cannot install here yet");
     else if (!installs())
         say(false, "Running from RAM: updates cannot install");
     else say(false, "Ready");

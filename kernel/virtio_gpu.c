@@ -258,7 +258,7 @@ static struct {
 static bool client_command;
 static uint32_t client_reply, caps_v1[77], caps_v2[1024];
 static unsigned caps_v2_bytes;
-/* The first failure, logged once; submissions also age the texture cache. */
+/* The first failure; submissions also age the texture cache. */
 static const char *error;
 static uint64_t submitted;
 
@@ -289,7 +289,8 @@ static bool reset(void) {
     return false;
 }
 
-bool virtio_gpu_stop(void) {
+/* A failed reset quarantines all static DMA storage until reboot. */
+static bool virtio_gpu_stop(void) {
     online = false;
     busy = false;
     phase = IDLE;

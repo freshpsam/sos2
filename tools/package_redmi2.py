@@ -3,16 +3,17 @@
 
 The source-backed contract and device prerequisites are in docs/redmi2.md.
 Only a verified Redmi 2 ELF/raw pair and a minimal wt88047 DTB are accepted.
-With --install-dir, the same compressed resources also become the installed
-system: flash-boot.img for lk2nd's boot partition, flash-cache.img for the
-cache partition's first slot, and sos2-redmi2.update, which the system's
-updater, /bin/sos2-updater, downloads (docs/redmi2.md#installing). The phone's
+With --install-dir, the same image, its data kept on the eMMC, also becomes
+the installed system: flash-boot.img for lk2nd's boot partition, and
+sos2-redmi2.update, which the system's updater, /bin/sos2-updater, downloads
+(docs/redmi2.md#installing). The phone's
 images build in no apps; with --apps-dir, the bundle's apps become packages,
 <id>.sos2app, with index.txt, which the updater installs one by one
 (docs/redmi2.md#apps).
 """
 
 import argparse
+import array
 import hashlib
 import json
 import os
@@ -37,32 +38,46 @@ RAMDISK_ADDRESS = 0x82000000
 # restarts.
 RAMDISK_LIMIT = 0x85A00000
 PAGE_SIZE = 2048
-# SORZ v2 resources: one raw LZMA stream with an end marker, which the kernel
-# decodes with third_party/lzma (kernel/protection/boot_bundle.c). lc=3, lp=0,
-# pb=2 are LZMA's defaults; the kernel accepts lc+lp <= 3. The header carries
-# the properties byte; the kernel sizes the dictionary to the whole output.
+# SORZ v3 resources: a 128-byte header and one raw LZMA stream with an end
+# marker, which the kernel decodes with third_party/lzma
+# (kernel/protection/boot_bundle.c). The header carries the LZMA properties
+# byte; the kernel accepts lc+lp <= 3 and sizes the dictionary to the whole
+# output. lp=1 suits the engine's 2- and 4-byte instructions: LZMA's default
+# lc=3, lp=0 makes the resources about 0.5% larger.
+# The engine's code goes through branch filters first, which make each call's
+# target absolute, so that calls to one function repeat: xz's ARM64 filter
+# for an AArch64 engine, about 7% smaller compressed, and for an ARM32
+# engine, mostly Thumb-2 with ARM libraries, an ARM and a Thumb-2 filter over
+# each instruction set's ranges, about 9%. The header names up to
+# SORZ_RANGES filters with their ranges of the expanded data, which the
+# kernel converts back.
 LZMA_FILTERS = [{'id': lzma.FILTER_LZMA1, 'preset': 9 | lzma.PRESET_EXTREME,
-                 'dict_size': 64 * 1024 * 1024, 'lc': 3, 'lp': 0, 'pb': 2}]
+                 'dict_size': 64 * 1024 * 1024, 'lc': 2, 'lp': 1, 'pb': 2}]
 LZMA_PROPERTIES = (LZMA_FILTERS[0]['pb'] * 5 + LZMA_FILTERS[0]['lp']) * 9 + LZMA_FILTERS[0]['lc']
 SORZ_MAGIC = 0x5a524f53
+SORZ_VERSION = 3
+SORZ_HEADER = 128
+SORZ_RANGES = 8
+SORZ_FILTER_NONE = 0
+SORZ_FILTER_ARM64 = 1
+SORZ_FILTER_ARM = 2
+SORZ_FILTER_THUMB = 3
 MAX_DTB_SIZE = 1024 * 1024
-CMDLINE = b"lk2nd.pass-simplefb=xrgb8888,autorefresh"
-DISPLAY_CMDLINES = {
-    "xrgb8888": CMDLINE,
-    "native": b"lk2nd.pass-simplefb=autorefresh",
-}
+# What lk2nd leaves of the 32 MiB boot partition after its own 512 KiB: a
+# boot image with everything, the engine included, must fit there too.
+BOOT_PARTITION_SPACE = 32 * 1024 * 1024 - 512 * 1024
+# lk2nd passes its framebuffer as it is, in the panel's native format.
+CMDLINE = b"lk2nd.pass-simplefb=autorefresh"
 # The installed system (include/system_store.h, kernel/protection/system_update.c):
 # lk2nd keeps its first 512 KiB of the 32 MiB boot partition and boots the
-# image after it; the cache partition holds two slots for the compressed
-# resources, the first 1 MiB in, each a 4 KiB header and the SORZ data. The
-# boot image names its slot's SHA-256 with sos2.system=.
-BOOT_IMAGE_LIMIT = 4 * 1024 * 1024
-SLOT_A_OFFSET = 1024 * 1024
-SLOT_HEADER = 4096
+# image after it, which holds everything, as the RAM image does; the cache
+# partition holds the app store and the data volume, which SOS2 formats. An
+# update is that boot image after a 4 KiB header.
 UPDATE_HEADER = 4096
+UPDATE_VERSION = 2
 BOARD = b"redmi2-wt88047"
 RELEASE_MAX = 47
-INSTALL_FILES = ("flash-boot.img", "flash-cache.img", "sos2-redmi2.update")
+INSTALL_FILES = ("flash-boot.img", "sos2-redmi2.update")
 # App packages (struct app_package in include/app_store.h): a 512-byte header,
 # the 48x48 ARGB icon and the program, at most one app store half less its
 # 4 KiB header.
@@ -70,8 +85,10 @@ APP_PACKAGE_HEADER = 512
 APP_ICON_BYTES = 48 * 48 * 4
 APP_PACKAGE_MAX = 6144 * 512 - 4096
 APP_INDEX = b"SOS2 apps 1"
-ABI = int(re.search(r"#define USER_ABI_VERSION (\d+)",
-                    (Path(__file__).resolve().parents[1] / "include/user_abi.h").read_text()).group(1))
+USER_ABI = (Path(__file__).resolve().parents[1] / "include/user_abi.h").read_text()
+ABI = int(re.search(r"#define USER_ABI_VERSION (\d+)", USER_ABI).group(1))
+# AArch64's carries EM_AARCH64 (183) above its version, so the two never match.
+ABI_ARM64 = 183 << 16 | int(re.search(r"#define USER_ABI_VERSION \(\(183u << 16\) \| (\d+)\)", USER_ABI).group(1))
 
 
 class PackagingError(ValueError):
@@ -140,9 +157,9 @@ def validate_arm32_kernel(kernel, elf):
     return align(memory_end - ARM32_KERNEL_ADDRESS, PAGE_SIZE)
 
 
-def parse_dtb(data):
+def parse_dtb(data, *, max_size=MAX_DTB_SIZE):
     """Parse bounded FDT v17 data, rejecting ambiguous nodes/properties/trailers."""
-    if len(data) < 40 or len(data) > MAX_DTB_SIZE:
+    if len(data) < 40 or len(data) > max_size:
         raise PackagingError("DTB size is outside the accepted range")
     magic, total, off_struct, off_strings, off_reserve, version, last, _, strings_len, struct_len = (
         struct.unpack_from(">10I", data)
@@ -250,28 +267,166 @@ def validate_dtb(data):
             raise PackagingError("framebuffer address must be supplied by lk2nd at runtime")
 
 
+def arm64_branches(data,position,encode):
+    """xz's ARM64 branch filter (liblzma/simple/arm64.c) over whole words:
+    BL's and ADRP's relative targets become absolute from each word's
+    position in the expanded data when encoding, and relative again when
+    decoding."""
+    words=array.array('I');words.frombytes(data[:len(data)//4*4])
+    if sys.byteorder!='little':words.byteswap()
+    sign=1 if encode else -1
+    for i,word in enumerate(words):
+        if word>>26==0x25:
+            words[i]=0x94000000|((word+sign*((position+4*i)>>2))&0x03ffffff)
+        elif word&0x9f000000==0x90000000:
+            source=(word>>29)&3|(word>>3)&0x001ffffc
+            if (source+0x00020000)&0x001c0000:continue
+            target=(source+sign*((position+4*i)>>12))&0xffffffff
+            words[i]=word&0x9000001f|(target&3)<<29|(target&0x0003fffc)<<3|(-(target&0x00020000))&0x00e00000
+    if sys.byteorder!='little':words.byteswap()
+    return words.tobytes()+data[len(data)//4*4:]
+
+
+def arm_branches(data,position,encode):
+    """ARM's B and BL with the always condition, and BLX, over whole words, as
+    arm64_branches does AArch64's: B's and BL's targets count words, BLX's, a
+    Thumb function's, halfwords, with its H bit the lowest."""
+    out=bytearray(data);sign=1 if encode else -1
+    for match in re.finditer(rb'[\xea\xeb\xfa\xfb]',data[3:len(data)//4*4:4]):
+        i=match.start()*4;word,=struct.unpack_from('<I',out,i);top=word>>24;pc=position+i+8
+        if top<0xfa:word=top<<24|(word+sign*(pc>>2))&0xffffff
+        else:
+            target=((word&0xffffff)<<1|top&1)+sign*(pc>>1)
+            word=(0xfa|target&1)<<24|target>>1&0xffffff
+        struct.pack_into('<I',out,i,word)
+    return bytes(out)
+
+
+# A walk over Thumb-2 instructions up to the next BL, BLX or B.W: a halfword
+# from 0xe800 up starts a 32-bit instruction, one from 0xf000 to 0xf7ff a
+# branch if its second halfword says so (BLX with its H bit clear).
+_EVEN=b'['+b''.join(re.escape(bytes([byte])) for byte in range(0,256,2))+b']'
+_ODD=b'['+b''.join(re.escape(bytes([byte])) for byte in range(1,256,2))+b']'
+THUMB_BRANCH=re.compile(
+    rb'(?:.[\x00-\xe7]|.[\xe8-\xef\xf8-\xff]..|.[\xf0-\xf7](?:.[\x00-\x8f\xa0-\xaf]|'+_ODD+rb'[\xc0-\xcf\xe0-\xef]))*+'
+    rb'.[\xf0-\xf7](?:.[\x90-\x9f\xb0-\xbf\xd0-\xdf\xf0-\xff]|'+_EVEN+rb'[\xc0-\xcf\xe0-\xef])',re.DOTALL)
+
+
+def thumb_branches(data,position,encode):
+    """Thumb-2's BL, BLX and B.W, as arm_branches does ARM's: their 24-bit
+    fields hold the target in halfwords, with S, J1 and J2 as its top bits.
+    BLX's target counts from the word-aligned PC, as the instruction does. The
+    walk sees the same instructions both ways: filtering keeps the bits it
+    reads."""
+    out=bytearray(data);i=0
+    while match:=THUMB_BRANCH.match(data,i):
+        i=match.end();first,second=struct.unpack_from('<2H',data,i-4)
+        pc=position+i if second&0xd000!=0xc000 else position+i&~3
+        if encode:
+            s=first>>10&1
+            offset=s<<23|(~(second>>13^s)&1)<<22|(~(second>>11^s)&1)<<21|(first&0x3ff)<<11|second&0x7ff
+            target=offset+(pc>>1)&0xffffff
+            first=first&0xf800|target>>13
+            second=second&0xd000|(target>>12&1)<<13|(target>>11&1)<<11|target&0x7ff
+        else:
+            target=(first&0x7ff)<<13|(second>>13&1)<<12|second&0xfff
+            offset=target-(pc>>1)&0xffffff;s=offset>>23
+            first=first&0xf800|s<<10|offset>>11&0x3ff
+            second=second&0xd000|(~(offset>>22^s)&1)<<13|(~(offset>>21^s)&1)<<11|offset&0x7ff
+        struct.pack_into('<2H',out,i-4,first,second)
+    return bytes(out)
+
+
+BRANCH_FILTERS={SORZ_FILTER_ARM64:arm64_branches,SORZ_FILTER_ARM:arm_branches,SORZ_FILTER_THUMB:thumb_branches}
+
+
+def arm32_ranges(program,offset):
+    """An ARM32 engine's code by instruction set, as filter ranges of the
+    expanded data, where the program starts at offset: its executable segment
+    in 4 KiB blocks, ARM where at least 40% of the words carry ARM's always
+    condition, Thumb-2 elsewhere, the shortest stretches given to their
+    neighbours until SORZ_RANGES remain. Every choice decodes; a poor one only
+    compresses worse."""
+    phoff,=struct.unpack_from('<I',program,28);size,count=struct.unpack_from('<2H',program,42)
+    if size!=32 or phoff+32*count>len(program):return []
+    code=[(start,start+length) for kind,start,_,_,length,_,flags,_ in
+          (struct.unpack_from('<8I',program,phoff+32*i) for i in range(count))
+          if kind==1 and flags&1 and length and start+length<=len(program)]
+    if len(code)!=1 or code[0][0]%4:return []
+    start,end=code[0][0],code[0][1]//4*4
+    condition=program[start+3:end:4].translate(bytes(0xe0<=byte<=0xef for byte in range(256)))
+    runs=[]
+    for block in range(start,end,4096):
+        words=condition[(block-start)//4:(block-start)//4+1024]
+        kind=SORZ_FILTER_ARM if 10*sum(words)>=4*len(words) else SORZ_FILTER_THUMB
+        if runs and runs[-1][0]==kind:runs[-1][2]=min(end,block+4096)
+        else:runs.append([kind,block,min(end,block+4096)])
+    while len(runs)>SORZ_RANGES:
+        i=min(range(len(runs)),key=lambda i:runs[i][2]-runs[i][1])
+        if i==0:runs[1][1]=runs[0][1];del runs[0]
+        elif i==len(runs)-1:runs[i-1][2]=runs[i][2];del runs[i]
+        else:runs[i-1][2]=runs[i+1][2];del runs[i:i+2]
+    return [(kind,offset+first,last-first) for kind,first,last in runs]
+
+
+def branch_filters(data):
+    """The branch filters for a SORB, as (filter, start, length): its engine's
+    code, by instruction set."""
+    for i in range(struct.unpack_from('<I',data,12)[0]):
+        name,offset,size=struct.unpack_from('<128sII',data,16+i*136)
+        program=data[offset:offset+size]
+        if name.split(b'\0',1)[0]!=b'/bin/sos2-web' or size<52:continue
+        machine,=struct.unpack_from('<H',program,18)
+        if program[:7]==b'\x7fELF\x02\x01\x01' and machine==183:return [(SORZ_FILTER_ARM64,offset,size//4*4)]
+        if program[:7]==b'\x7fELF\x01\x01\x01' and machine==40:return arm32_ranges(program,offset)
+    return []
+
+
+def filters_valid(filters,expanded):
+    """Branch filters as the kernel accepts them: known ones over aligned,
+    ordered, separate ranges of the expanded data, then unused ones, zero."""
+    end=0;unused=False
+    for kind,start,length in filters:
+        if not kind:
+            if start or length:return False
+            unused=True;continue
+        align=2 if kind==SORZ_FILTER_THUMB else 4
+        if (unused or kind not in BRANCH_FILTERS or not length or start%align or length%align or
+                start<end or start+length>expanded):return False
+        end=start+length
+    return True
+
+
+def apply_filters(data,filters,encode):
+    """data with each branch filter applied to its range."""
+    out=bytearray(data)
+    for kind,start,length in filters:
+        if kind:out[start:start+length]=BRANCH_FILTERS[kind](bytes(out[start:start+length]),start,encode)
+    return bytes(out)
+
+
 def unpack_resources(packed):
-    """The expanded SORB of a SORZ v2 ramdisk, decoded as the kernel does: with
-    the header's properties byte and sizes, checked against its CRC-32s."""
-    if len(packed)<=32:raise PackagingError('truncated SORZ ramdisk')
+    """The expanded SORB of a SORZ v3 ramdisk, decoded as the kernel does: with
+    the header's properties byte, sizes and branch filter, checked against its
+    CRC-32s."""
+    if len(packed)<=SORZ_HEADER:raise PackagingError('truncated SORZ ramdisk')
     magic,version,header,size,expanded,crc,expanded_crc,properties=struct.unpack_from('<8I',packed)
+    ranges=struct.unpack_from(f'<{3*SORZ_RANGES}I',packed,32)
+    filters=[ranges[i:i+3] for i in range(0,len(ranges),3)]
     lc,lp,pb=properties%9,properties//9%5,properties//45
-    if ((magic,version,header,size)!=(SORZ_MAGIC,2,32,len(packed)-32) or not 16<=expanded<=256*1024*1024 or
-            pb>4 or lc+lp>3 or zlib.crc32(packed[32:])!=crc):
-        raise PackagingError('invalid SORZ v2 ramdisk header')
+    if ((magic,version,header,size)!=(SORZ_MAGIC,SORZ_VERSION,SORZ_HEADER,len(packed)-SORZ_HEADER) or
+            not 16<=expanded<=256*1024*1024 or pb>4 or lc+lp>3 or not filters_valid(filters,expanded) or
+            zlib.crc32(packed[SORZ_HEADER:])!=crc):
+        raise PackagingError('invalid SORZ v3 ramdisk header')
     try:
-        data=lzma.decompress(packed[32:],format=lzma.FORMAT_RAW,
+        data=lzma.decompress(packed[SORZ_HEADER:],format=lzma.FORMAT_RAW,
                              filters=[{'id':lzma.FILTER_LZMA1,'dict_size':expanded,'lc':lc,'lp':lp,'pb':pb}])
     except lzma.LZMAError as error:
         raise PackagingError('SORZ ramdisk does not decode: '+str(error)) from error
+    if len(data)==expanded:data=apply_filters(data,filters,False)
     if len(data)!=expanded or zlib.crc32(data)!=expanded_crc:
         raise PackagingError('SORZ ramdisk does not decode to its recorded size and CRC-32')
     return data
-
-
-def pack_resources(data,rtc_anchor=None,extra_files=None,ram_only=False,release=None):
-    """Bounded SORB -> SORZ transport with optional private board resources."""
-    return compress_resources(resource_bundle(data,rtc_anchor,extra_files,ram_only,release))
 
 
 def validate_release(release):
@@ -310,14 +465,24 @@ def app_ids(files):
     return sorted(ids)
 
 
-def app_package(app_id, name, icon, program, abi=ABI):
-    """An app's .sos2app: header, icon and program (include/app_store.h)."""
+# Programs by architecture: ELF class, ARM's (40) or AArch64's (183) machine.
+ELF_ARM32 = (1, 40)
+ELF_ARM64 = (2, 183)
+
+
+def app_package(app_id, name, icon, program, abi=None, elf=ELF_ARM32):
+    """An app's .sos2app: header, icon and program (include/app_store.h),
+    whose program is for elf's architecture, built for its ABI by default."""
+    if abi is None:
+        abi = ABI_ARM64 if elf == ELF_ARM64 else ABI
     if not re.fullmatch(r"[a-z0-9-]{1,15}", app_id):
         raise PackagingError(f"app id {app_id!r} is not 1-15 lowercase letters, digits and hyphens")
     if not 1 <= len(name) <= 12 or not all(32 <= c < 127 for c in name):
         raise PackagingError(f"app {app_id}: the name must be 1-12 printable ASCII characters")
-    if len(icon) != APP_ICON_BYTES or len(program) < 52 or program[:7] != b"\x7fELF\x01\x01\x01":
-        raise PackagingError(f"app {app_id}: needs a 48x48 icon and an ARM32 ELF program")
+    if (len(icon) != APP_ICON_BYTES or len(program) < 64 or program[:4] != b"\x7fELF" or
+            program[4:7] != bytes((elf[0], 1, 1)) or struct.unpack_from("<H", program, 18)[0] != elf[1]):
+        raise PackagingError(f"app {app_id}: needs a 48x48 icon and an "
+                             f"{'AArch64' if elf == ELF_ARM64 else 'ARM32'} ELF program")
     payload = icon + program
     fields = struct.pack("<8sII16s16sIIIII32s", b"SOS2APP1", 1, abi, app_id.encode("ascii"), name,
                          APP_PACKAGE_HEADER, len(icon), APP_PACKAGE_HEADER + len(icon), len(program),
@@ -328,11 +493,11 @@ def app_package(app_id, name, icon, program, abi=ABI):
     return package
 
 
-def app_packages(files):
+def app_packages(files, elf=ELF_ARM32):
     """The bundle's apps, as packages by id."""
     return {app_id: app_package(app_id, files[f"/apps/{app_id}/name".encode()],
                                 files[f"/apps/{app_id}/icon".encode()],
-                                files[f"/apps/{app_id}/program".encode()])
+                                files[f"/apps/{app_id}/program".encode()], elf=elf)
             for app_id in app_ids(files)}
 
 
@@ -342,12 +507,13 @@ def app_index(packages):
     lines = [APP_INDEX]
     for app_id, package in sorted(packages.items()):
         name = package[32:48].split(b"\0", 1)[0]
-        lines.append(b"%s %d %d %s %s" % (app_id.encode("ascii"), ABI, len(package),
+        abi = struct.unpack_from("<I", package, 12)[0]
+        lines.append(b"%s %d %d %s %s" % (app_id.encode("ascii"), abi, len(package),
                                           hashlib.sha256(package).hexdigest().encode("ascii"), name))
     return b"\n".join(lines) + b"\n"
 
 
-def resource_bundle(data,rtc_anchor=None,extra_files=None,ram_only=False,release=None,strip_apps=False):
+def resource_bundle(data,extra_files=None,ram_only=False,release=None,strip_apps=False):
     """The SORB the phone expands: a checked native bundle plus optional private
     board resources and the release name, /system/release. strip_apps leaves
     out every app, for the phone, which then needs the system's updater."""
@@ -374,12 +540,6 @@ def resource_bundle(data,rtc_anchor=None,extra_files=None,ram_only=False,release
     if entry_size!=32 or not entries or phoff+entries*entry_size>len(engine) or any(
             struct.unpack_from('<I',engine,phoff+i*entry_size)[0] in (2,3) for i in range(entries)):
         raise PackagingError('browser must be static native ARM32, without a dynamic loader')
-    if rtc_anchor is not None:
-        epoch,counter=rtc_anchor
-        # Match the kernel's accepted range: 2000-01-01 <= t < 2100-01-01.
-        if not 946684800<=epoch<4102444800 or not 0<=counter<=0xffffffff:
-            raise PackagingError('RTC anchor requires Unix seconds (2000 <= t < 2100) and the observed 32-bit RTC counter')
-        files[b'/system/rtc-anchor']=struct.pack('<4IQ',0x41435452,1,counter,0,epoch)
     if extra_files:
         for name,content in extra_files.items():
             radio=name==b'/system/wifi-profile' or re.fullmatch(rb'/firmware/wcnss/(?:wcnss\.(?:mdt|b[0-9]{2})|WCNSS_qcom_wlan_nv\.bin)',name)
@@ -396,26 +556,44 @@ def resource_bundle(data,rtc_anchor=None,extra_files=None,ram_only=False,release
         try:
             for name,content in gpu_files.items():validate_gpu(name.decode().rsplit('/',1)[1],content)
         except ValueError as error:raise PackagingError(str(error)) from error
-    if rtc_anchor is not None or extra_files or ram_only or release is not None or stripped:
-        if len(files)>128:raise PackagingError('no room for board resources in the resource table')
-        table=bytearray();payload=bytearray();offset=align(16+136*len(files),4096)
-        for name,content in files.items():
-            table+=struct.pack('<128sII',name,offset+len(payload),len(content))
-            payload+=content;payload+=bytes(align(len(payload),4096)-len(payload))
-        data=(struct.pack('<4I',0x42524f53,1,offset+len(payload),len(files))+table).ljust(offset,b'\0')+payload
+    if extra_files or ram_only or release is not None or stripped:
+        data=sorb(files)
     if len(data)>256*1024*1024:
         raise PackagingError('expanded native resources exceed the kernel limit')
     return data
 
 
-def compress_resources(data):
-    """The SORZ v2 ramdisk for an expanded SORB, checked by decoding it again."""
-    compressed=lzma.compress(data,format=lzma.FORMAT_RAW,filters=LZMA_FILTERS)
-    header=struct.pack('<8I',SORZ_MAGIC,2,32,len(compressed),len(data),
-                       zlib.crc32(compressed),zlib.crc32(data),LZMA_PROPERTIES)
+def sorb(files):
+    """A SORB of these files, each page-aligned after the table, as the kernel
+    reads it (kernel/protection/runtime_files.c)."""
+    if len(files)>128:raise PackagingError('no room for board resources in the resource table')
+    table=bytearray();payload=bytearray();offset=align(16+136*len(files),4096)
+    for name,content in files.items():
+        table+=struct.pack('<128sII',name,offset+len(payload),len(content))
+        payload+=content;payload+=bytes(align(len(payload),4096)-len(payload))
+    return (struct.pack('<4I',0x42524f53,1,offset+len(payload),len(files))+table).ljust(offset,b'\0')+payload
+
+
+def sorz(data):
+    """The SORZ v3 ramdisk for an expanded SORB, checked by decoding it again;
+    the engine's code goes through the branch filters."""
+    filters=branch_filters(data)
+    if not filters_valid(filters,len(data)) or len(filters)>SORZ_RANGES:
+        raise PackagingError('invalid branch filter ranges for the engine')
+    compressed=lzma.compress(apply_filters(data,filters,True),format=lzma.FORMAT_RAW,filters=LZMA_FILTERS)
+    ranges=[value for branch_filter in filters for value in branch_filter]
+    header=struct.pack(f'<8I{3*SORZ_RANGES}I',SORZ_MAGIC,SORZ_VERSION,SORZ_HEADER,len(compressed),len(data),
+                       zlib.crc32(compressed),zlib.crc32(data),LZMA_PROPERTIES,
+                       *ranges,*[0]*(3*SORZ_RANGES-len(ranges)))
     packed=header+compressed
     if unpack_resources(packed)!=data:
         raise PackagingError('compressed resources do not decode to the bundle')
+    return packed
+
+
+def compress_resources(data):
+    """sorz(data), within lk2nd's ramdisk window."""
+    packed=sorz(data)
     if align(len(packed),PAGE_SIZE)>RAMDISK_LIMIT-RAMDISK_ADDRESS:
         raise PackagingError(f'compressed resources need {align(len(packed),PAGE_SIZE)} bytes; lk2nd can load '
                              f'{RAMDISK_LIMIT-RAMDISK_ADDRESS} bytes of ramdisk at 0x{RAMDISK_ADDRESS:08x}')
@@ -461,10 +639,22 @@ def android_ramdisk(image):
     return image[start:start + ramdisk_size]
 
 
-def make_boot_image(kernel, elf, dtb, display_format="xrgb8888", arch="arm32", resources=None,rtc_anchor=None,extra_files=None,ram_only=False,release=None,strip_apps=False):
-    if display_format not in DISPLAY_CMDLINES:
-        raise PackagingError("display format must be xrgb8888 or native")
-    cmdline = DISPLAY_CMDLINES[display_format]
+def with_jsc_options(cmdline, options):
+    if options is None:
+        return cmdline
+    if not options or len(options) > 127 or not all('!' <= c <= '~' for c in options):
+        raise PackagingError('JavaScriptCore options are 1-127 printable ASCII characters without spaces')
+    prefix = cmdline + b' sos2.jsc='
+    # The kernel keeps 255 bytes of sos2.* arguments from /chosen/bootargs,
+    # and installed updaters check that the image's whole line fits in them.
+    available = 255 - len(prefix)
+    if len(options) > available:
+        raise PackagingError(f'JavaScriptCore options exceed the {available} bytes left in the boot command line')
+    return prefix + options.encode('ascii')
+
+
+def make_boot_image(kernel, elf, dtb, resources=None,extra_files=None,ram_only=False,release=None,strip_apps=False,jsc=None):
+    cmdline = CMDLINE
     if resources is not None:
         # MSM8916 forces ramdisks to 0x82000000; the full browser crosses
         # MIPI_FB_ADDR (0x83200000). Ask lk2nd to move scanout before handing
@@ -474,26 +664,27 @@ def make_boot_image(kernel, elf, dtb, display_format="xrgb8888", arch="arm32", r
         # lk2nd overwrites that address. SOS2 still validates the actual DTB.
         cmdline += b",relocate"
     if ram_only:
-        if arch!='arm32' or resources is None:
+        if resources is None:
             raise PackagingError('RAM-only mode requires the protected ARM32 browser bundle')
         cmdline+=b' sos2.storage=ram'
-    if arch != 'arm32':
-        raise PackagingError('only the ARM32 browser kernel is supported')
+    cmdline = with_jsc_options(cmdline, jsc)
     payload, image_size = boot_payload(kernel, elf, dtb)
-    if rtc_anchor is not None and resources is None:raise PackagingError('RTC calibration requires a resource bundle')
     if extra_files and resources is None:raise PackagingError('Wi-Fi provisioning requires native browser resources')
     if release is not None and resources is None:raise PackagingError('a release name requires a resource bundle')
-    expanded=resource_bundle(resources,rtc_anchor,extra_files,ram_only,release,strip_apps) if resources is not None else None
+    expanded=resource_bundle(resources,extra_files,ram_only,release,strip_apps) if resources is not None else None
     ramdisk=compress_resources(expanded) if expanded is not None else b''
     kernel_address = ARM32_KERNEL_ADDRESS
     image_format = "Android boot v0; uncompressed ARM32 zImage-shaped image followed by one DTB"
     entry_requirement = "32-bit ARM-state entry with device tree in r2"
     image = android_image(payload, cmdline, ramdisk)
+    if len(image) > BOOT_PARTITION_SPACE:
+        raise PackagingError(f'boot.img needs {len(image)} bytes; the boot partition holds '
+                             f'{BOOT_PARTITION_SPACE} after lk2nd')
     manifest = {
         "status": "built",
         "target": "Redmi 2 wt88047 / lk2nd-msm8916",
         "lk2nd_source_revision": LK2ND_REVISION,
-        "architecture": arch,
+        "architecture": "arm32",
         "format": image_format,
         "kernel_address": f"0x{kernel_address:08x}",
         "dtb_address": f"0x{TAGS_ADDRESS:08x}",
@@ -513,7 +704,7 @@ def make_boot_image(kernel, elf, dtb, display_format="xrgb8888", arch="arm32", r
                          "stock recovery materials verified before any device writes"],
     }
     if resources is not None:
-        manifest['resources']={'format':'SORZ v2 / raw LZMA / CRC32',
+        manifest['resources']={'format':'SORZ v3 / raw LZMA / CRC32',
             'compressed_bytes':len(ramdisk),'expanded_bytes':len(expanded),
             'ramdisk_address':f'0x{RAMDISK_ADDRESS:08x}',
             'ramdisk_end':f'0x{RAMDISK_ADDRESS+len(ramdisk):08x}',
@@ -530,7 +721,6 @@ def make_boot_image(kernel, elf, dtb, display_format="xrgb8888", arch="arm32", r
                                                                     {'sha256':hashlib.sha256(content).hexdigest()})
                          for name,content in extra_files.items() if name.startswith(prefix) or (kind=='wifi_resources' and name==b'/system/wifi-profile')}
                 if entries:manifest['resources'][kind]=entries
-        if rtc_anchor is not None:manifest['resources']['rtc_anchor']={'unix_seconds':rtc_anchor[0],'rtc_counter':rtc_anchor[1]}
         manifest['requirements']+=['protected kernel with SORZ decoding',
             'lk2nd continuous-splash framebuffer relocation support',
             'reported RAM and live framebuffer must not overlap the ramdisk or expanded resources']
@@ -541,36 +731,22 @@ def make_boot_image(kernel, elf, dtb, display_format="xrgb8888", arch="arm32", r
     return image, manifest
 
 
-def slot_header(system):
-    """A cache-partition slot's first 4 KiB: magic, version, data offset and
-    size, a reserved word, the data's SHA-256 and a CRC-32 of those 56 bytes
-    (struct system_slot in include/system_store.h)."""
-    fields = struct.pack("<8sIIII32s", b"SOS2SLOT", 1, SLOT_HEADER, len(system), 0,
-                         hashlib.sha256(system).digest())
-    return (fields + struct.pack("<I", zlib.crc32(fields))).ljust(SLOT_HEADER, b"\0")
-
-
-def update_header(release, boot, system):
+def update_header(release, boot, board=BOARD):
     """sos2-redmi2.update's first 4 KiB (struct system_update_header in
-    include/system_store.h): the release and board, where the boot image and
-    the compressed resources follow with their sizes and SHA-256s, the file's
-    size and a CRC-32 of the 164 bytes before it."""
-    boot_offset = UPDATE_HEADER
-    system_offset = boot_offset + align(len(boot), 4096)
-    fields = struct.pack("<8sII16s48sII32sII32sI", b"SOS2UPDT", 1, UPDATE_HEADER, BOARD,
-                         validate_release(release), boot_offset, len(boot),
-                         hashlib.sha256(boot).digest(), system_offset, len(system),
-                         hashlib.sha256(system).digest(), system_offset + len(system))
+    include/system_store.h): the release and board, where the boot image
+    follows with its size and SHA-256, the file's size and a CRC-32 of the 124
+    bytes before it."""
+    fields = struct.pack("<8sII16s48sII32sI", b"SOS2UPDT", UPDATE_VERSION, UPDATE_HEADER, board,
+                         validate_release(release), UPDATE_HEADER, len(boot),
+                         hashlib.sha256(boot).digest(), UPDATE_HEADER + len(boot))
     return (fields + struct.pack("<I", zlib.crc32(fields))).ljust(UPDATE_HEADER, b"\0")
 
 
-def make_install_files(kernel, elf, dtb, ramdisk, release, display_format="native"):
+def make_install_files(kernel, elf, dtb, ramdisk, release, jsc=None):
     """The installed system from a RAM image's compressed resources: lk2nd's
-    boot partition gets a boot image without a ramdisk, which names the
-    resources' SHA-256 with sos2.system=, and the cache partition's first slot
-    the resources. The update package carries both for the updater."""
-    if display_format not in DISPLAY_CMDLINES:
-        raise PackagingError("display format must be xrgb8888 or native")
+    boot partition gets the same boot image with sos2.storage=installed, which
+    keeps data in the cache partition. The update package carries it for the
+    updater."""
     expanded = unpack_resources(ramdisk)
     files = {}
     for i in range(struct.unpack_from("<I", expanded, 12)[0]):
@@ -584,27 +760,23 @@ def make_install_files(kernel, elf, dtb, ramdisk, release, display_format="nativ
     if files.get(b"/system/release") != validate_release(release):
         raise PackagingError("the resources must name the same release")
     payload, _ = boot_payload(kernel, elf, dtb)
-    system_hash = hashlib.sha256(ramdisk).hexdigest()
-    # relocate as for the RAM image: the kernel reads the slot to 0x82000000.
-    cmdline = (DISPLAY_CMDLINES[display_format]
-               + b",relocate sos2.storage=installed sos2.system=" + system_hash.encode("ascii"))
-    boot = android_image(payload, cmdline, b"")
-    if len(boot) > BOOT_IMAGE_LIMIT:
-        raise PackagingError(f"the installed boot image exceeds {BOOT_IMAGE_LIMIT} bytes")
-    slot = slot_header(ramdisk) + ramdisk
-    cache = bytes(SLOT_A_OFFSET) + slot.ljust(align(len(slot), 4096), b"\0")
-    update = update_header(release, boot, ramdisk) + boot.ljust(align(len(boot), 4096), b"\0") + ramdisk
-    outputs = dict(zip(INSTALL_FILES, (boot, cache, update)))
+    # relocate as for the RAM image: lk2nd loads the ramdisk to 0x82000000.
+    cmdline = CMDLINE + b",relocate sos2.storage=installed"
+    cmdline = with_jsc_options(cmdline, jsc)
+    boot = android_image(payload, cmdline, ramdisk)
+    if len(boot) > BOOT_PARTITION_SPACE:
+        raise PackagingError(f"flash-boot.img needs {len(boot)} bytes; the boot partition holds "
+                             f"{BOOT_PARTITION_SPACE} after lk2nd")
+    update = update_header(release, boot) + boot
+    outputs = dict(zip(INSTALL_FILES, (boot, update)))
     manifest = {
         "release": release,
         "board": BOARD.decode("ascii"),
         "boot_cmdline": cmdline.decode("ascii"),
-        "system_sha256": system_hash,
         "wifi_profile": b"/system/wifi-profile" in files,
         "files": {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                   for name, data in outputs.items()},
-        "flash": ["fastboot flash boot flash-boot.img", "fastboot flash cache flash-cache.img",
-                  "fastboot reboot"],
+        "flash": ["fastboot flash boot flash-boot.img", "fastboot reboot"],
     }
     return outputs, manifest
 
@@ -660,18 +832,14 @@ def main(argv=None):
     parser.add_argument("--kernel", required=True, type=Path, help="Redmi 2 ARM32 kernel image")
     parser.add_argument("--elf", required=True, type=Path, help="matching Redmi 2 ELF (rejects QEMU images)")
     parser.add_argument("--dtb", required=True, type=Path, help="compiled boards/redmi2/boot.dts")
-    parser.add_argument("--display-format", choices=tuple(DISPLAY_CMDLINES), default="xrgb8888",
-                        help="request XRGB8888 conversion (default) or preserve lk2nd's native framebuffer format")
-    parser.add_argument("--arch", choices=("arm32",), default="arm32",
-                        help="kernel architecture (ARM32)")
     parser.add_argument("--output", required=True, type=Path, help="output boot image; also writes .json manifest")
     parser.add_argument('--resources',type=Path,help='native WebKit SORB bundle; delivered as a compressed ramdisk')
     parser.add_argument('--ram-only',action='store_true',help='temporary browser session; never initialize or access a disk')
     parser.add_argument('--wifi-firmware-dir',type=Path,help='local matching wcnss.mdt, split segments and board NV')
     parser.add_argument('--wifi-profile',type=Path,help='explicit Wi-Fi profile created by tools/redmi2_wifi.py')
     parser.add_argument('--adreno-firmware-dir',type=Path,help='pinned A306 firmware pair and redistribution notices')
-    parser.add_argument('--rtc-anchor',help='explicit calibration UNIX_SECONDS:RTC_COUNTER, sampled together on this phone')
     parser.add_argument('--release',help='the build\'s name for the updater, 1-47 printable ASCII characters')
+    parser.add_argument('--jsc',help='JavaScriptCore options for pages, comma-separated (the sos2.jsc= boot argument)')
     parser.add_argument('--install-dir',type=Path,help='also write the installed system and update package here (RAM-only images)')
     parser.add_argument('--apps-dir',type=Path,help='write the apps the image leaves out here as packages, with index.txt')
     args = parser.parse_args(argv)
@@ -692,12 +860,6 @@ def main(argv=None):
             from adreno_firmware import resources as adreno_resources
             try:extra_files={**(extra_files or {}),**adreno_resources(args.adreno_firmware_dir)}
             except (ValueError,OSError) as error:raise PackagingError(str(error)) from error
-        rtc_anchor=None
-        if args.rtc_anchor:
-            try:
-                rtc_anchor=tuple(int(x) for x in args.rtc_anchor.split(':'))
-                if len(rtc_anchor)!=2:raise ValueError()
-            except ValueError:raise PackagingError('RTC anchor must be UNIX_SECONDS:RTC_COUNTER')
         outputs_paths = (args.output, manifest_path, *install)
         if args.wifi_firmware_dir and any(out.resolve().is_relative_to(args.wifi_firmware_dir.resolve()) for out in outputs_paths):
             raise PackagingError('output must not overwrite the firmware backup')
@@ -712,14 +874,13 @@ def main(argv=None):
         if args.apps_dir and resources is None:raise PackagingError('app packages require a resource bundle')
         # The phone's images build in no apps: the updater is part of the system.
         image, manifest = make_boot_image(kernel, elf, dtb,
-                                          display_format=args.display_format, arch=args.arch,
-                                          resources=resources,rtc_anchor=rtc_anchor,extra_files=extra_files,ram_only=args.ram_only,
-                                          release=args.release,strip_apps=resources is not None)
+                                          resources=resources,extra_files=extra_files,ram_only=args.ram_only,
+                                          release=args.release,strip_apps=resources is not None,jsc=args.jsc)
         outputs = [(args.output, image),
                    (manifest_path, (json.dumps(manifest, indent=2) + "\n").encode("utf-8"))]
         if args.install_dir:
             files, install_manifest = make_install_files(kernel, elf, dtb, android_ramdisk(image),
-                                                         args.release, args.display_format)
+                                                         args.release, args.jsc)
             args.install_dir.mkdir(parents=True, exist_ok=True)
             outputs += [(args.install_dir/name, data) for name, data in files.items()]
             outputs.append((args.install_dir/'install.json',
@@ -739,7 +900,7 @@ def main(argv=None):
     except (OSError, PackagingError) as exc:
         print(f"Cannot package Redmi 2 image: {exc}", file=sys.stderr)
         return 1
-    print(f"Created experimental image: {args.output} ({len(image)} bytes)")
+    print(f"Created boot image: {args.output} ({len(image)} bytes)")
     print(f"Manifest: {manifest_path}; no device was accessed.")
     if args.install_dir:
         print(f"Installed system and update: {args.install_dir} ({', '.join(INSTALL_FILES)})")

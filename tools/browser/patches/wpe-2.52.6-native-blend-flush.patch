@@ -1,0 +1,17 @@
+--- a/Source/WebCore/rendering/RenderLayer.cpp
++++ b/Source/WebCore/rendering/RenderLayer.cpp
+@@ -1599,8 +1599,13 @@ void RenderLayer::updateBlendMode()
+     }
+ 
+     BlendMode newBlendMode = renderer().style().blendMode();
+-    if (newBlendMode != static_cast<BlendMode>(m_blendMode))
++    if (newBlendMode != static_cast<BlendMode>(m_blendMode)) {
+         m_blendMode = static_cast<unsigned>(newBlendMode);
++#if OS(SOS2)
++        // TextureMapper needs a rendering update to switch to or from page painting.
++        page().scheduleRenderingUpdate(RenderingUpdateStep::LayerFlush);
++#endif
++    }
+ }
+ 
+ void RenderLayer::willRemoveChildWithBlendMode()

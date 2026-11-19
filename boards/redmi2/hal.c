@@ -72,14 +72,6 @@ static int informational(struct wcn_hal *h, unsigned type, unsigned size) {
             break;
         case WCN36XX_HAL_OTA_TX_COMPL_IND:
             if (size < 12) error = "short TX indication";
-            else if (h->tx_report_pending && !h->tx_report_disabled) {
-                h->tx_report_pending = false;
-                /* This is a Boolean OTA result, unlike HAL command status: 1
-                 * means acknowledged. Vendor replies can append a dialog token;
-                 * the legacy ABI has none, so only one report may be outstanding. */
-                if (h->tx_report_generation == h->tx_generation)
-                    h->tx_feedback = le32(h->rx + 8) == 1 ? WCN_TX_ACKED : WCN_TX_NO_ACK;
-            }
             break;
         case WCN36XX_HAL_PRINT_REG_INFO_IND:
             /* Header, count, scenario, reason, followed by count address/value pairs. */
@@ -267,14 +259,6 @@ bool wcn_hal_poll(struct wcn_hal *h, uint64_t now) {
             break;
         }
     }
-    if (h->tx_report_pending && now >= h->tx_report_deadline) {
-        h->tx_report_pending = false;
-        h->tx_report_disabled = true;
-        if (h->tx_report_generation == h->tx_generation) h->tx_feedback = WCN_TX_NO_STATUS;
-        /* Do not reuse a tokenless report slot after timeout: a late report
-         * could otherwise be mistaken for the next packet's acknowledgement.
-         * Data/DHCP retries remain enabled; only further probing is disabled. */
-    }
     /* Indications never renew the deadline, but a queued matching reply wins
      * over timeout even after a delayed worker poll. */
     if (h->pending && now >= h->deadline) return fail(h, "wireless HAL timed out");
@@ -298,7 +282,6 @@ bool wcn_hal_poll(struct wcn_hal *h, uint64_t now) {
             if (v->major != 1 || v->minor < 3 || v->minor > 5 ||
                 !response.start_rsp_params.stations || !response.start_rsp_params.bssids)
                 return fail(h, "unsupported WCN3620 HAL firmware version");
-            memcpy(h->version, v, 4);
             ++h->phase;
         } else if (h->phase == 2) {
             const struct wcn36xx_hal_add_sta_self_rsp_msg *r = (const void *)h->rx;
@@ -451,11 +434,7 @@ int wcn_hal_configure(struct wcn_hal *h, enum wifi_action action, const struct w
             h->sta = 255;
             h->self_dpu = h->self_signature = 0;
         }
-        if (action == WIFI_DELETE_BSS) {
-            h->bss = h->bss_sta = 255;
-            ++h->tx_generation;
-            h->tx_feedback = WCN_TX_UNTESTED;
-        }
+        if (action == WIFI_DELETE_BSS) h->bss = h->bss_sta = 255;
         if (action == WIFI_INSTALL_KEY) wipe_tx(h);
         return 1;
     }
@@ -602,18 +581,6 @@ static struct wcn_tx_info wcn_hal_tx_info(const struct wcn_hal *h, bool data) {
                                 .data = data};
 }
 
-static bool dhcp_request(const unsigned char *p, unsigned n) {
-    /* SOS2 sends non-QoS ToDS frames. Inspect the complete LLC/IP/UDP bounds,
-     * and request feedback only for DHCP, not every browser packet or EAPOL. */
-    if (n < 60 || (le16(p) & 0x03fc) != 0x0108 || memcmp(p + 24, "\xaa\xaa\3\0\0\0\x08\0", 8) ||
-        (p[32] >> 4) != 4)
-        return false;
-    unsigned header = (p[32] & 15) * 4;
-    if (header < 20 || header > n - 40 || p[41] != 17 || (p[38] & 0x3f) || p[39]) return false;
-    const unsigned char *udp = p + 32 + header;
-    return !udp[0] && udp[1] == 68 && !udp[2] && udp[3] == 67;
-}
-
 bool wcn_hal_send(struct wcn_hal *h, struct wcn_dxe *d, const void *frame, unsigned n, bool data,
                   uint64_t now) {
     if (!h || !h->ready || h->failed || !frame || n < 24 || now > UINT64_MAX - 1000000)
@@ -624,23 +591,5 @@ bool wcn_hal_send(struct wcn_hal *h, struct wcn_dxe *d, const void *frame, unsig
     struct wcn_tx_info info = wcn_hal_tx_info(h, data || encrypt);
     info.data = data;
     info.encrypt = encrypt;
-    info.report = data && !h->tx_report_pending && !h->tx_report_disabled && dhcp_request(p, n);
-    if (!wcn_dxe_send(d, frame, n, &info, now)) return false;
-    if (info.report) {
-        h->tx_report_pending = true;
-        h->tx_report_deadline = now + 1000000;
-        h->tx_report_generation = h->tx_generation;
-        h->tx_feedback = WCN_TX_PENDING;
-    }
-    return true;
-}
-
-const char *wcn_hal_tx_status(const struct wcn_hal *h) {
-    switch (h->tx_feedback) {
-        case WCN_TX_PENDING: return "pending";
-        case WCN_TX_ACKED: return "ACK";
-        case WCN_TX_NO_ACK: return "no ACK";
-        case WCN_TX_NO_STATUS: return "no report";
-        default: return h->tx_report_disabled ? "unavailable" : 0;
-    }
+    return wcn_dxe_send(d, frame, n, &info, now);
 }

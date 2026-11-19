@@ -1,0 +1,41 @@
+CVE-2026-65337, WebKit bug 317142
+Upstream: https://github.com/WebKit/WebKit/commit/e66f7ba8818f1c211a2f86cbfe4cf6d232842e56
+
+--- a/Source/JavaScriptCore/bytecode/RepatchInlines.h
++++ b/Source/JavaScriptCore/bytecode/RepatchInlines.h
+@@ -233,7 +233,8 @@ ALWAYS_INLINE void* virtualForWithFunction(VM& vm, JSCell* owner, CallFrame* cal
+     JSValue calleeAsValue = calleeFrame->guaranteedJSValueCallee();
+     calleeAsFunctionCell = getJSFunction(calleeAsValue);
+     if (!calleeAsFunctionCell) [[unlikely]] {
+-        if (jsDynamicCast<InternalFunction*>(calleeAsValue)) {
++        if (auto* internalFunction = jsDynamicCast<InternalFunction*>(calleeAsValue)) {
++            calleeAsFunctionCell = internalFunction;
+             CodePtr<JSEntryPtrTag> codePtr = vm.getCTIInternalFunctionTrampolineFor(kind);
+             ASSERT(!!codePtr);
+             return codePtr.taggedPtr();
+--- a/Source/JavaScriptCore/jit/JITOperations.cpp
++++ b/Source/JavaScriptCore/jit/JITOperations.cpp
+@@ -2486,7 +2486,9 @@ JSC_DEFINE_JIT_OPERATION(operationPolymorphicCall, UCPURegister, (CallFrame* cal
+     void* callTarget = virtualForWithFunction(vm, owner, calleeFrame, callLinkInfo, calleeAsFunctionCell);
+     if (scope.exception()) [[unlikely]]
+         OPERATION_RETURN(scope, std::bit_cast<UCPURegister>(vm.getCTIStub(CommonJITThunkID::ThrowExceptionFromCall).template retagged<JSEntryPtrTag>().code().taggedPtr()));
+-    linkPolymorphicCall(vm, owner, calleeFrame, *callLinkInfo, CallVariant(calleeAsFunctionCell));
++    // A null cell means virtualForWithFunction did a host call that ran JS and may have freed *callLinkInfo; don't link.
++    if (calleeAsFunctionCell) [[likely]]
++        linkPolymorphicCall(vm, owner, calleeFrame, *callLinkInfo, CallVariant(calleeAsFunctionCell));
+     // Keep owner alive explicitly. Now this function can be called from tail-call. This means that CallFrame for that owner already goes away, so we should keep it alive if we would like to use it.
+     ensureStillAliveHere(owner);
+     if (scope.exception()) [[unlikely]]
+--- a/Source/JavaScriptCore/llint/LLIntSlowPaths.cpp
++++ b/Source/JavaScriptCore/llint/LLIntSlowPaths.cpp
+@@ -654,7 +654,9 @@ extern "C" UGPRPair SYSV_ABI llint_polymorphic_call(CallFrame* calleeFrame, Call
+     void* callTarget = virtualForWithFunction(vm, owner, calleeFrame, callLinkInfo, calleeAsFunctionCell);
+     if (scope.exception()) [[unlikely]]
+         return encodeResult(callTarget, std::bit_cast<void*>(&vm));
+-    linkPolymorphicCall(vm, owner, calleeFrame, *callLinkInfo, CallVariant(calleeAsFunctionCell));
++    // A null cell means virtualForWithFunction did a host call that ran JS and may have freed *callLinkInfo; don't link.
++    if (calleeAsFunctionCell) [[likely]]
++        linkPolymorphicCall(vm, owner, calleeFrame, *callLinkInfo, CallVariant(calleeAsFunctionCell));
+     ensureStillAliveHere(owner);
+     if (scope.exception()) [[unlikely]]
+         return encodeResult(callTarget, std::bit_cast<void*>(&vm));

@@ -14,11 +14,21 @@ static struct memory_region obstacle(const struct platform_devices *d, unsigned 
 
 bool boot_memory_available(const struct platform_devices *d, uint64_t start, uint64_t size,
                            uintptr_t dtb, uintptr_t ks, uintptr_t ke, bool avoid_initrd) {
+#ifdef __aarch64__
+    /* Up to 4 GiB inclusive: the Galaxy Tab A7 Lite's RAM ends there. */
+    const uint64_t limit = 1ull << 32;
+    if (!size || start & 4095 || start >= limit || size > limit - start || ke <= ks ||
+        !fdt_range_in_ram(d, start, size))
+        return false;
+    uint64_t end = (start + size + 4095) & ~4095ull;
+    if (end > limit || !fdt_range_in_ram(d, start, end - start)) return false;
+#else
     if (!size || start & 4095 || start > UINT32_MAX || size > UINT32_MAX - start || ke <= ks ||
         !fdt_range_in_ram(d, start, size))
         return false;
     uint64_t end = (start + size + 4095) & ~4095ull;
     if (end > UINT32_MAX || !fdt_range_in_ram(d, start, end - start)) return false;
+#endif
     for (unsigned i = 0; i < d->reserved_region_count + 3 + (unsigned)avoid_initrd; ++i) {
         struct memory_region r = obstacle(d, i, dtb, ks, ke);
         if (r.size > UINT64_MAX - r.start || (r.size && start < r.start + r.size && r.start < end))
@@ -82,6 +92,77 @@ bool redmi2_browser_arena(const struct platform_devices *d, uintptr_t dtb, uintp
                           uintptr_t ke, uintptr_t *out, size_t *size) {
     return arena(d, dtb, ks, ke, 256ull << 20, 384ull << 20, out, size);
 }
+
+#ifdef __aarch64__
+/* A free stretch of RAM below 4 GiB, clear of the firmware's reservations, the
+ * kernel, the DTB, the framebuffer, the initrd and `extra`: the largest, or
+ * with `fit` the smallest that holds that many bytes. */
+static bool free_stretch(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
+                         uintptr_t ke, struct memory_region extra, uint64_t fit, uint64_t *out,
+                         uint64_t *size) {
+    uint64_t best = 0, best_size = 0;
+    unsigned obstacles = (unsigned)d->reserved_region_count + 5;
+    for (unsigned n = 0; n < d->ram_region_count; ++n) {
+        struct memory_region ram = d->ram_regions[n];
+        if (ram.size > UINT64_MAX - ram.start) return false;
+        uint64_t end = ram.start + ram.size;
+        if (end > 1ull << 32) end = 1ull << 32;
+        uint64_t at = (ram.start + 4095) & ~4095ull;
+        while (at < end) {
+            uint64_t gap_end = end, next = 0;
+            for (unsigned i = 0; i < obstacles; ++i) {
+                struct memory_region r = i + 1 == obstacles ? extra : obstacle(d, i, dtb, ks, ke);
+                if (r.size > UINT64_MAX - r.start) return false;
+                if (!r.size || r.start + r.size <= at || r.start >= end) continue;
+                if (r.start <= at) {
+                    next = r.start + r.size >= end ? end : (r.start + r.size + 4095) & ~4095ull;
+                    break;
+                }
+                if (r.start < gap_end) gap_end = r.start;
+            }
+            if (next) {
+                at = next;
+                continue;
+            }
+            uint64_t length = (gap_end & ~4095ull) - at;
+            if (fit ? length >= fit && (!best_size || length < best_size) : length > best_size) {
+                best = at;
+                best_size = length;
+            }
+            if (gap_end == end) break;
+            at = gap_end & ~4095ull;
+            if (at < gap_end) at += 4096;
+        }
+    }
+    if (!best_size) return false;
+    *out = best;
+    *size = best_size;
+    return true;
+}
+
+bool boot_memory_pool(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks, uintptr_t ke,
+                      uintptr_t resources, size_t resource_size, uint64_t maximum, uintptr_t *out,
+                      size_t *size) {
+    uint64_t start, length;
+    if (!free_stretch(d, dtb, ks, ke, (struct memory_region){resources, resource_size}, 0, &start,
+                      &length))
+        return false;
+    *out = (uintptr_t)start;
+    *size = (size_t)(length < maximum ? length : maximum);
+    return true;
+}
+
+bool boot_memory_resources(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
+                           uintptr_t ke, size_t size, uintptr_t *out) {
+    uint64_t start, length, pages = ((uint64_t)size + 4095) & ~4095ull;
+    if (!size ||
+        !free_stretch(d, dtb, ks, ke, (struct memory_region){0, 0}, pages, &start, &length) ||
+        !boot_memory_available(d, start, pages, dtb, ks, ke, true))
+        return false;
+    *out = (uintptr_t)start;
+    return true;
+}
+#endif
 
 bool redmi2_resource_arena(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
                            uintptr_t ke, size_t size, uintptr_t *out) {

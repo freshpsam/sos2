@@ -1,0 +1,109 @@
+--- a/Source/JavaScriptCore/assembler/ARMv7Assembler.h
++++ b/Source/JavaScriptCore/assembler/ARMv7Assembler.h
+@@ -37,6 +37,9 @@
+ #include <wtf/Assertions.h>
+ #include <wtf/Vector.h>
+ #include <stdint.h>
++#if OS(SOS2)
++#include <sos2/services.h>
++#endif
+ 
+ namespace JSC {
+ 
+@@ -1507,7 +1510,7 @@ public:
+         m_formatter.twoWordOp5i6Imm4Reg4EncodedImm(OP_MOV_imm_T3, imm.m_value.imm4, rd, imm);
+     }
+     
+-#if OS(LINUX)
++#if OS(LINUX) || OS(SOS2)
+     static void revertJumpTo_movT3movtcmpT2(void* instructionStart, RegisterID left, RegisterID right, uintptr_t imm)
+     {
+         uint16_t* address = static_cast<uint16_t*>(instructionStart);
+@@ -2808,7 +2811,7 @@ public:
+         ASSERT(!(std::bit_cast<uintptr_t>(instructionStart) & 1));
+         ASSERT(!(std::bit_cast<uintptr_t>(to) & 1));
+ 
+-#if OS(LINUX)
++#if OS(LINUX) || OS(SOS2)
+         if (canBeJumpT4(reinterpret_cast<uint16_t*>(instructionStart), to)) {
+             uint16_t* ptr = reinterpret_cast<uint16_t*>(instructionStart) + 2;
+             linkJumpT4(ptr, ptr, to, BranchWithLink::No);
+@@ -2833,7 +2836,7 @@ public:
+ 
+     static constexpr ptrdiff_t maxJumpReplacementSize()
+     {
+-#if OS(LINUX)
++#if OS(LINUX) || OS(SOS2)
+         return 10;
+ #else
+         return 4;
+@@ -2887,11 +2890,8 @@ public:
+ 
+         linuxPageFlush(current, end);
+ #elif OS(SOS2)
+-        // SOS2 has no JIT, so no code is generated, and user code cannot
+-        // maintain caches: the kernel cleans code that it makes executable.
+-        UNUSED_PARAM(code);
+-        UNUSED_PARAM(size);
+-        RELEASE_ASSERT_NOT_REACHED();
++        // AArch32 user code cannot maintain caches: SYS_ICACHE_SYNC does.
++        sos2_icache_sync(code, size);
+ #else
+ #error "The cacheFlush support is missing on this platform."
+ #endif
+--- a/Source/JavaScriptCore/assembler/MacroAssemblerARMv7.h
++++ b/Source/JavaScriptCore/assembler/MacroAssemblerARMv7.h
+@@ -4084,7 +4084,7 @@ public:
+     template<PtrTag tag>
+     static void revertJumpReplacementToBranchPtrWithPatch(CodeLocationLabel<tag> instructionStart, RegisterID rd, void* initialValue)
+     {
+-#if OS(LINUX)
++#if OS(LINUX) || OS(SOS2)
+         ARMv7Assembler::revertJumpTo_movT3movtcmpT2(instructionStart.dataLocation(), rd, dataTempRegister, reinterpret_cast<uintptr_t>(initialValue));
+ #else
+         UNUSED_PARAM(rd);
+--- a/Source/JavaScriptCore/runtime/Options.cpp
++++ b/Source/JavaScriptCore/runtime/Options.cpp
+@@ -596,7 +596,7 @@ static void overrideDefaults()
+     Options::worklistFTLLoadWeight() = 20;
+ #endif
+ 
+-#if OS(LINUX) && CPU(ARM)
++#if (OS(LINUX) || OS(SOS2)) && CPU(ARM)
+     Options::maximumFunctionForCallInlineCandidateBytecodeCostForDFG() = 77;
+     Options::maximumOptimizationCandidateBytecodeCost() = 42403;
+     Options::maximumFunctionForClosureCallInlineCandidateBytecodeCostForDFG() = 68;
+--- a/Source/WTF/wtf/PlatformEnable.h
++++ b/Source/WTF/wtf/PlatformEnable.h
+@@ -725,8 +725,8 @@
+ #endif
+ 
+ #if USE(JSVALUE32_64)
+-#if CPU(ARM_THUMB2) && CPU(ARM_HARDFP) && OS(LINUX)
+-/* On ARMv7 Linux the JIT is enabled unless explicitly disabled. */
++#if CPU(ARM_THUMB2) && CPU(ARM_HARDFP) && (OS(LINUX) || OS(SOS2))
++/* On ARMv7 Linux and SOS2 the JIT is enabled unless explicitly disabled. */
+ #if !defined(ENABLE_JIT)
+ #define ENABLE_JIT 1
+ #endif
+@@ -794,7 +794,7 @@
+ #endif
+ 
+ /* Enable the DFG JIT on ARMv7.  Only tested on iOS, Linux, and FreeBSD. */
+-#if (CPU(ARM_THUMB2) || CPU(ARM64)) && (OS(DARWIN) || OS(LINUX) || OS(FREEBSD))
++#if (CPU(ARM_THUMB2) || CPU(ARM64)) && (OS(DARWIN) || OS(LINUX) || OS(FREEBSD) || OS(SOS2))
+ #define ENABLE_DFG_JIT 1
+ #endif
+ 
+--- a/Source/cmake/OptionsJSCOnly.cmake
++++ b/Source/cmake/OptionsJSCOnly.cmake
+@@ -59,7 +59,8 @@ else ()
+     set(ENABLE_API_TESTS ON)
+ endif ()
+ 
+-if (ENABLE_JIT AND (WTF_CPU_ARM OR WTF_CPU_MIPS))
++# SOS2 builds no disassembler; the tarball has no Capstone.
++if (ENABLE_JIT AND (WTF_CPU_ARM OR WTF_CPU_MIPS) AND NOT SOS2_NATIVE_TARGET)
+     SET_AND_EXPOSE_TO_BUILD(USE_CAPSTONE TRUE)
+ endif ()
+ 

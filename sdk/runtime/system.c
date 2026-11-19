@@ -81,10 +81,17 @@ void sos2_wake(uint32_t *word, unsigned count) { call(SYS_WAKE_WORD, sos2_ptr(wo
  * mode (CNTKCTL.PL0VCTEN), converted as the kernel's time_us() converts it;
  * other clocks need the kernel. */
 static uint64_t monotonic_us(void) {
+#ifdef __aarch64__
+    uint64_t count, frequency;
+    __asm__ volatile("isb\n mrs %0, cntvct_el0" : "=r"(count));
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
+    return user_timer_us(count, (uint32_t)frequency);
+#else
     uint32_t low, high, frequency;
     __asm__ volatile("isb\n mrrc p15, 1, %0, %1, c14" : "=r"(low), "=r"(high));
     __asm__ volatile("mrc p15, 0, %0, c14, c0, 0" : "=r"(frequency));
     return user_timer_us(((uint64_t)high << 32) | low, frequency);
+#endif
 }
 
 int sos2_clock_read(int kind, uint64_t *out) {
@@ -126,9 +133,39 @@ int sos2_present_frame(const uint32_t *pixels, const struct user_pixel_scroll *s
 
 int sos2_surface_state(void) { return sos2_result(call(SYS_SURFACE_STATE, 0, 0)); }
 
-int sos2_gpu(unsigned op, uint32_t argument, uint32_t size) {
+int sos2_gpu(unsigned op, uintptr_t argument, uint32_t size) {
     return call3(SYS_GPU, op, argument, size);
 }
+
+#ifdef __aarch64__
+/* EL0 cache maintenance (SCTLR_EL1.UCI and UCT). Clean and invalidate to the
+ * point of coherency rather than cleaning to unification: early Cortex-A53
+ * revisions need the stronger operation (errata 819472, 826319, 827319,
+ * 824069), and both reach the instruction side. Broadcast to every CPU. */
+void sos2_icache_sync(const void *code, size_t size) {
+    uint64_t ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    uintptr_t data = (uintptr_t)4 << ((ctr >> 16) & 15), instruction = (uintptr_t)4 << (ctr & 15);
+    uintptr_t start = (uintptr_t)code, end = start + size;
+    for (uintptr_t at = start & ~(data - 1); at < end; at += data)
+        __asm__ volatile("dc civac, %0" : : "r"(at) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (uintptr_t at = start & ~(instruction - 1); at < end; at += instruction)
+        __asm__ volatile("ic ivau, %0" : : "r"(at) : "memory");
+    __asm__ volatile("dsb ish\n isb" ::: "memory");
+}
+#else
+/* AArch32 user mode cannot maintain caches: the kernel does it on this CPU
+ * (SYS_ICACHE_SYNC), at most 256 KiB at a time. */
+void sos2_icache_sync(const void *code, size_t size) {
+    uintptr_t at = (uintptr_t)code, end = at + size;
+    while (at < end) {
+        size_t n = end - at > 0x40000 ? 0x40000 : end - at;
+        if (call(SYS_ICACHE_SYNC, at, n)) abort();
+        at += n;
+    }
+}
+#endif
 
 int sos2_next_event(struct user_input_event *event) {
     return sos2_result(call(SYS_NEXT_EVENT, sos2_ptr(event), sizeof(*event)));
@@ -182,10 +219,15 @@ void *_sbrk(ptrdiff_t change) {
         errno = ENOMEM;
         return (void *)-1;
     }
-    uintptr_t next = end + (uintptr_t)change, rounded = (next + 4095) & ~4095u;
-    if (rounded > mapped &&
-        sos2_result(call3(SYS_VM_MAP, mapped, (rounded - mapped) / 4096, 3)) < 0)
-        return (void *)-1;
+    uintptr_t next = end + (uintptr_t)change, rounded = (next + 4095) & ~(uintptr_t)4095;
+    if (rounded > mapped) {
+        /* Success returns the address, so check the full-width status. */
+        sos2_status r = call3(SYS_VM_MAP, mapped, (rounded - mapped) / 4096, 3);
+        if (r < 0) {
+            errno = sos2_errno((int)r);
+            return (void *)-1;
+        }
+    }
     end = next;
     mapped = rounded;
     return (void *)old;
@@ -1064,6 +1106,9 @@ long sysconf(int name) {
 
 int sched_yield(void) { return sos2_result(call(SYS_YIELD, 0, 0)); }
 
+/* The longest mapping: the heap's span (include/user_abi.h). */
+#define MAPPING_MAX (USER_HEAP_END - USER_HEAP_BASE)
+
 void *mmap(void *address, size_t length, int prot, int flags, int fd, off_t offset) {
     if (!(flags & MAP_ANONYMOUS)) {
         int index = device_get(fd);
@@ -1082,20 +1127,29 @@ void *mmap(void *address, size_t length, int prot, int flags, int fd, off_t offs
         errno = ENOTSUP;
         return MAP_FAILED;
     }
-    if (!length || length > 0x0f000000u || (prot & ~7) || ((prot & 6) == 6) ||
+    int file = !(flags & MAP_ANONYMOUS);
+    /* Writable executable memory lives in the JIT window, which the kernel
+     * grants only to the engine. */
+    int jit = (prot & 6) == 6 && !file;
+    if (!length || length > MAPPING_MAX || (prot & ~7) || ((prot & 6) == 6 && !jit) ||
         (prot && !(prot & PROT_READ)) || offset < 0 || (offset & 4095)) {
         errno = EINVAL;
         return MAP_FAILED;
     }
     unsigned pages = (length + 4095) / 4096;
-    int file = !(flags & MAP_ANONYMOUS), permissions = file ? PROT_READ | PROT_WRITE : prot;
+    int permissions = file ? PROT_READ | PROT_WRITE : prot;
     /* address is a hint, not authorization to replace existing allocations. */
-    uint32_t hint = sos2_ptr(address);
-    int r = USER_EINVAL;
-    if (hint >= USER_HEAP_BASE && hint < SOS2_BRK_BASE && pages <= (SOS2_BRK_BASE - hint) / 4096)
+    sos2_word hint = sos2_ptr(address);
+    sos2_status r = USER_EINVAL;
+    if (jit) r = call4(SYS_VM_ALLOC_RANGE, USER_JIT_BASE, USER_JIT_END, pages, permissions);
+    if (!jit && hint >= USER_HEAP_BASE && hint < SOS2_BRK_BASE &&
+        pages <= (SOS2_BRK_BASE - hint) / 4096)
         r = call3(SYS_VM_MAP, hint, pages, permissions);
-    if (r < 0) r = sos2_map(pages, permissions);
-    if (sos2_result(r) < 0) return MAP_FAILED;
+    if (r < 0 && !jit) r = sos2_map(pages, permissions);
+    if (r < 0) {
+        errno = sos2_errno((int)r);
+        return MAP_FAILED;
+    }
     void *mapped = (void *)(uintptr_t)r;
     if (file) {
         sos2_lock(&files_lock);
@@ -1135,7 +1189,7 @@ void *mmap(void *address, size_t length, int prot, int flags, int fd, off_t offs
 }
 
 static int memory_op(unsigned op, void *address, size_t length, int prot) {
-    if (!length || length > 0x0f000000u || (sos2_ptr(address) & 4095)) {
+    if (!length || length > MAPPING_MAX || (sos2_ptr(address) & 4095)) {
         errno = EINVAL;
         return -1;
     }
@@ -1247,6 +1301,8 @@ int dladdr(const void *address, Dl_info *info) {
 }
 
 int mprotect(void *address, size_t length, int prot) {
+    /* As Linux: an empty range at an aligned address changes nothing. */
+    if (!length && !(sos2_ptr(address) & 4095)) return 0;
     return memory_op(SYS_VM_PROTECT, address, length, prot);
 }
 
@@ -1268,7 +1324,7 @@ int msync(void *address, size_t length, int flags) {
 }
 
 int mincore(void *address, size_t length, unsigned char *resident) {
-    if (!length || length > 0x0f000000u || (sos2_ptr(address) & 4095)) {
+    if (!length || length > MAPPING_MAX || (sos2_ptr(address) & 4095)) {
         errno = EINVAL;
         return -1;
     }

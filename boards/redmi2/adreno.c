@@ -7,6 +7,7 @@
  * See adreno-notices.txt and docs/gpu.md for provenance and limits. */
 #include "adreno.h"
 #include "platform.h"
+#include "sha256.h"
 #include "adreno_shaders.h"
 
 #define GCC        0x01800000u
@@ -42,21 +43,11 @@ static bool wait_bits(struct adreno_device *g, uintptr_t a, uint32_t mask, uint3
     return false;
 }
 
-static uint32_t crc(const void *bytes, unsigned n) {
-    const unsigned char *p = bytes;
-    uint32_t c = UINT32_MAX;
-    while (n--) {
-        c ^= *p++;
-        for (unsigned i = 0; i < 8; ++i) c = (c >> 1) ^ (0xedb88320u & -(c & 1));
-    }
-    return ~c;
-}
-
 bool adreno_firmware_valid(const void *pm4, unsigned n, const void *pfp, unsigned m) {
     /* This is an integrity/compatibility check, not a signature verifier.
      * Firmware comes only from the trusted boot bundle, never a web process. */
-    return pm4 && pfp && n == 9220 && m == 1156 && crc(pm4, n) == 0xe68e4d55 &&
-           crc(pfp, m) == 0x0181387e;
+    return pm4 && pfp && n == 9220 && m == 1156 && crc32_ieee(pm4, n) == 0xe68e4d55 &&
+           crc32_ieee(pfp, m) == 0x0181387e;
 }
 
 /* The GPU's clocks in the vendor's slumber order (bimc_gpu, bimc_gfx, gmem,
@@ -68,9 +59,8 @@ static const unsigned branches[] = {0x31040, 0x31024, 0x59024, 0x59028, 0x59020}
  * every clock running: KGSL never touches the GPU's registers otherwise);
  * then its clocks off and its power domain collapsed, as at slumber, so it
  * costs nothing in standby. A domain that will not collapse stays on. */
-void adreno_disable(struct adreno_device *g, enum adreno_error error) {
+void adreno_disable(struct adreno_device *g) {
     if (!g) return;
-    if (g->error == ADRENO_OK) g->error = error;
     g->running = false;
     g->pending = false;
     g->collapsed = false;
@@ -93,8 +83,8 @@ void adreno_disable(struct adreno_device *g, enum adreno_error error) {
     }
 }
 
-static bool fail(struct adreno_device *g, enum adreno_error e) {
-    adreno_disable(g, e);
+static bool fail(struct adreno_device *g) {
+    adreno_disable(g);
     return false;
 }
 
@@ -126,11 +116,11 @@ static bool engine(struct adreno_device *g);
 static bool clocks(struct adreno_device *g) {
     /* Do not retune a shared PLL or change voltage. GPLL0 is the existing
      * 800 MHz source; dedicated GPU roots run at a conservative 200 MHz. */
-    if (!(read32(g, GCC + 0x2101c) & (1u << 17))) return fail(g, ADRENO_CLOCK);
+    if (!(read32(g, GCC + 0x2101c) & (1u << 17))) return fail(g);
     bits(g, GCC + 0x45000, 1, 1);
     bits(g, GCC + 0x4500c, (1u << 12) | (1u << 2), (1u << 12) | (1u << 2));
     if (!wait_bits(g, GCC + 0x12038, 1u << 31, 0) || !wait_bits(g, GCC + 0x12020, 1u << 31, 0))
-        return fail(g, ADRENO_CLOCK);
+        return fail(g);
     /* OXILI GDSC: software control, with the waits Linux's gdsc.c and the
      * vendor's set (EN_REST 2, EN_FEW 8, CLK_DIS 2): EN_FEW paces the
      * power switches against inrush on the core rail. No clock starts
@@ -138,7 +128,7 @@ static bool clocks(struct adreno_device *g) {
     bits(g, GCC + 0x5901c, 0x00fff007, 0x00282000);
     /* From here a failure turns the domain and its clocks off again. */
     g->powered = true;
-    if (!wait_bits(g, GCC + 0x5901c, 1u << 31, 1u << 31)) return fail(g, ADRENO_POWER);
+    if (!wait_bits(g, GCC + 0x5901c, 1u << 31, 1u << 31)) return fail(g);
     uint64_t settle = now(g);
     for (unsigned i = 0; i < 1000 && now(g) - settle < 2; ++i) { }
     write32(g, GCC + 0x59004, 0x307);
@@ -146,10 +136,10 @@ static bool clocks(struct adreno_device *g) {
     write32(g, GCC + 0x3102c, 0x107);
     bits(g, GCC + 0x31028, 1, 1);
     if (!wait_bits(g, GCC + 0x59000, 1, 0) || !wait_bits(g, GCC + 0x31028, 1, 0))
-        return fail(g, ADRENO_CLOCK);
+        return fail(g);
     if (!clock_branch(g, 0x59028) || !clock_branch(g, 0x31024) || !clock_branch(g, 0x31040) ||
         !clock_branch(g, 0x59024) || !clock_branch(g, 0x59020))
-        return fail(g, ADRENO_CLOCK);
+        return fail(g);
     g->clocked = true;
     /* Never leave an inherited command queue running while replacing tables. */
     reg(g, 0x01f6, 1u << 28);
@@ -186,7 +176,7 @@ static bool iommu(struct adreno_device *g) {
         !map(g, ADRENO_SHADER, 4096, false) || !map(g, ADRENO_PRIVATE, ADRENO_PRIVATE_SIZE, true) ||
         !map(g, ADRENO_SOURCE, ADRENO_SOURCE_SIZE, true) ||
         !map(g, ADRENO_OUTPUT, out_size, true) || !map(g, ADRENO_UPLOAD, ADRENO_UPLOAD_SIZE, false))
-        return fail(g, ADRENO_MMU);
+        return fail(g);
     sync(g);
     return banks(g);
 }
@@ -196,7 +186,7 @@ static bool iommu(struct adreno_device *g) {
 static bool banks(struct adreno_device *g) {
     uint64_t *root = (uint64_t *)g->memory;
     for (unsigned cb = 1; cb <= 2; ++cb) {
-        if (!g->io.restore(g->io.context, cb)) return fail(g, ADRENO_SCM);
+        if (!g->io.restore(g->io.context, cb)) return fail(g);
         uintptr_t a = SMMU + cb * 4096;
         write32(g, a, 0);
         write32(g, a + 0x58, 0xc00001fe);
@@ -212,14 +202,14 @@ static bool banks(struct adreno_device *g) {
         write32(g, a + 0x34, cb);
         write32(g, a + 0x610, cb);
         write32(g, a + 0x7f0, 0);
-        if (!wait_bits(g, a + 0x7f4, 1, 0)) return fail(g, ADRENO_MMU);
+        if (!wait_bits(g, a + 0x7f4, 1, 0)) return fail(g);
         write32(g, a, 0x10a7); /* ASIDPNE, CFCFG, CFRE, AFE, TRE, M; polled */
         sync(g);
         /* ASIDPNE reads as zero on this SMMU (seen on the phone: 0xa7 back);
          * Linux's qcom_iommu sets it the same way and never reads it back.
          * Translation, faults and the tables must have taken. */
         uint32_t control = read32(g, a), table = read32(g, a + 0x20);
-        if ((control & 0xa7) != 0xa7 || table != (uintptr_t)root) return fail(g, ADRENO_MMU);
+        if ((control & 0xa7) != 0xa7 || table != (uintptr_t)root) return fail(g);
     }
     return true;
 }
@@ -269,7 +259,7 @@ int adreno_poll(struct adreno_device *g) {
     if (!g->pending) return 1;
     if ((read32(g, GPU + 4 * 0x0064) & GPU_ERRORS) || (read32(g, SMMU + 0x1058) & 0xc00001fe) ||
         (read32(g, SMMU + 0x2058) & 0xc00001fe)) {
-        fail(g, ADRENO_FAULT);
+        fail(g);
         return -1;
     }
     sync(g);
@@ -281,7 +271,7 @@ int adreno_poll(struct adreno_device *g) {
         return 1;
     }
     if (now(g) >= g->deadline || ++g->polls >= 1000000) {
-        fail(g, ADRENO_TIMEOUT);
+        fail(g);
         return -1;
     }
     return 0;
@@ -300,7 +290,6 @@ bool adreno_init(struct adreno_device *g, const struct adreno_io *io, void *aren
                  unsigned stride) {
     if (!g || g->attempted) return false;
     g->attempted = true;
-    g->error = ADRENO_ARGUMENT;
     unsigned bytes = format == PIXEL_RGB565 ? 2 : format == PIXEL_RGB888 ? 3 : 4;
     if (!io || !io->read || !io->write || !io->now || !io->barrier || !io->restore || !arena ||
         ((uintptr_t)arena & 4095) || (uintptr_t)arena > UINT32_MAX - ADRENO_ARENA_SIZE ||
@@ -311,11 +300,7 @@ bool adreno_init(struct adreno_device *g, const struct adreno_io *io, void *aren
     g->format = format;
     g->stride = stride;
     g->bytes = bytes;
-    if (!adreno_firmware_valid(pm4, n, pfp, m)) {
-        g->error = ADRENO_FIRMWARE;
-        return false;
-    }
-    g->error = ADRENO_OK;
+    if (!adreno_firmware_valid(pm4, n, pfp, m)) return false;
     g->pm4 = pm4;
     g->pm4_size = n;
     g->pfp = pfp;
@@ -348,7 +333,7 @@ static bool engine(struct adreno_device *g) {
     reg(g, 0x0018, 0);
     sync(g);
     uint32_t version = read32(g, GPU);
-    if (version == UINT32_MAX) return fail(g, ADRENO_ENGINE);
+    if (version == UINT32_MAX) return fail(g);
     /* A306 settings, with interrupt status polled by the boot CPU. */
     static const uint32_t setup[][2] = {
         {0x3049, 3},       {0x3034, 10},      {0x3035, 10},         {0x0088, UINT32_MAX},
@@ -424,10 +409,7 @@ bool adreno_power_off(struct adreno_device *g) {
             g->powered = true;
             g->clocked = true;
             g->running = true;
-        } else {
-            g->quarantined = true;
-            if (g->error == ADRENO_OK) g->error = ADRENO_POWER;
-        }
+        } else g->quarantined = true;
         return false;
     }
     g->collapsed = true;
@@ -562,7 +544,9 @@ static void scale(struct adreno_device *g, struct adreno_rect r) {
     g->height = r.height;
 }
 
-bool adreno_submit(struct adreno_device *g, unsigned x, unsigned y, unsigned width,
+/* Caller supplies an immutable complete source snapshot before submission.
+ * Damage is in destination pixels, with 16x8 workgroup alignment. */
+static bool adreno_submit(struct adreno_device *g, unsigned x, unsigned y, unsigned width,
                    unsigned height) {
     struct adreno_rect r = {x, y, width, height};
     if (!ready(g) || !rect_valid(r, 720, 1280, true)) return false;
@@ -632,7 +616,7 @@ bool adreno_frame(struct adreno_device *g, const struct adreno_copy *c,
     }
     scale(g, output);
     if (((g->ring_write - start) & (ADRENO_RING_WORDS - 1)) + 8 > 4096)
-        return fail(g, ADRENO_ENGINE);
+        return fail(g);
     fence(g);
     return true;
 }
@@ -660,10 +644,10 @@ bool adreno_selftest(struct adreno_device *g) {
             if (g->format == PIXEL_ARGB8888) color |= 0xff000000;
             for (unsigned b = 0; b < g->bytes; ++b)
                 if (out[x * g->bytes + b] != (unsigned char)(color >> (8 * b)))
-                    return fail(g, ADRENO_READBACK);
+                    return fail(g);
         }
         for (unsigned x = 720 * g->bytes; x < g->stride; ++x)
-            if (out[x] != 0xa5) return fail(g, ADRENO_READBACK);
+            if (out[x] != 0xa5) return fail(g);
     }
     /* Exercise a second dispatch with nonzero origins and unchanged borders.
      * This also proves that stale completion words are not accepted. */
@@ -679,7 +663,7 @@ bool adreno_selftest(struct adreno_device *g) {
             for (unsigned b = 0; b < g->bytes; ++b)
                 if (g->memory[ADRENO_OUTPUT + y * g->stride + x * g->bytes + b] !=
                     (unsigned char)(color >> (8 * b)))
-                    return fail(g, ADRENO_READBACK);
+                    return fail(g);
         }
     /* Prove copy -> overlapping copy -> patch -> scale dependencies on actual
      * hardware before enabling retention. Nonzero, unaligned origins exercise
@@ -700,7 +684,7 @@ bool adreno_selftest(struct adreno_device *g) {
                 if (x >= c.dx && x < c.dx + c.width && y >= c.dy && y < c.dy + c.height)
                     expected = pattern(x - c.dx + c.sx, y - c.dy + c.sy);
                 if (x >= 16 && x < 32 && y >= 32 && y < 40) expected = pattern(x, y) ^ 0xabcdef;
-                if (source[y * 480 + x] != expected) return fail(g, ADRENO_READBACK);
+                if (source[y * 480 + x] != expected) return fail(g);
             }
         for (unsigned y = 0; y < out.height; ++y)
             for (unsigned x = 0; x < out.width; ++x) {
@@ -711,7 +695,7 @@ bool adreno_selftest(struct adreno_device *g) {
                 for (unsigned b = 0; b < g->bytes; ++b)
                     if (g->memory[ADRENO_OUTPUT + y * g->stride + x * g->bytes + b] !=
                         (unsigned char)(color >> (8 * b)))
-                        return fail(g, ADRENO_READBACK);
+                        return fail(g);
             }
     }
     return true;

@@ -1,0 +1,150 @@
+--- a/Source/JavaScriptCore/assembler/ARM64Assembler.h
++++ b/Source/JavaScriptCore/assembler/ARM64Assembler.h
+@@ -38,6 +38,10 @@
+ #include <limits.h>
+ #include <wtf/Assertions.h>
+ #include <wtf/Vector.h>
++
++#if OS(SOS2)
++#include <sos2/services.h>
++#endif
+ #include <stdint.h>
+ 
+ #if OS(FUCHSIA)
+@@ -3911,6 +3915,8 @@ public:
+             linuxPageFlush(current, current + page);
+ 
+         linuxPageFlush(current, end);
++#elif OS(SOS2)
++        sos2_icache_sync(code, size);
+ #else
+ #error "The cacheFlush support is missing on this platform."
+ #endif
+--- a/Source/JavaScriptCore/heap/StructureAlignedMemoryAllocator.cpp
++++ b/Source/JavaScriptCore/heap/StructureAlignedMemoryAllocator.cpp
+@@ -36,7 +36,7 @@
+ #if CPU(ADDRESS64)
+ #include <wtf/NeverDestroyed.h>
+ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
+-#if !USE(SYSTEM_MALLOC)
++#if !USE(SYSTEM_MALLOC) && !OS(SOS2)
+ #include <bmalloc/bmalloc.h>
+ #include <bmalloc/bmalloc_heap.h>
+ #include <bmalloc/bmalloc_heap_config.h>
+@@ -85,7 +85,7 @@ void* StructureAlignedMemoryAllocator::tryReallocateMemory(void*, size_t)
+ }
+ 
+ #if CPU(ADDRESS64)
+-#if !USE(SYSTEM_MALLOC)
++#if !USE(SYSTEM_MALLOC) && !OS(SOS2)
+ 
+ static const bmalloc_type structureHeapType { BMALLOC_TYPE_INITIALIZER(MarkedBlock::blockSize, MarkedBlock::blockSize, "Structure Heap") };
+ static pas_primitive_heap_ref structureHeap { BMALLOC_AUXILIARY_HEAP_REF_INITIALIZER(&structureHeapType, pas_bmalloc_heap_ref_kind_compact) };
+@@ -107,7 +107,14 @@ public:
+             // across 4GB granules. Otherwise, the top 32 bits of the address may not be constant for all
+             // addresses in the range. The top 32 bits being constant is an invariant that we rely on in
+             // order to encode StructureIDs.
++#if OS(SOS2)
++            // SOS2's user space is one 4GB granule (asserted below), so block
++            // alignment is enough. Aligning to the heap's size maps it twice
++            // over (no MAP_ALIGNED), and SOS2 commits all of it.
++            g_jscConfig.startOfStructureHeap = reinterpret_cast<uintptr_t>(OSAllocator::tryReserveUncommittedAligned(mappedHeapSize, MarkedBlock::blockSize, OSAllocator::StructureAllocatorPages));
++#else
+             g_jscConfig.startOfStructureHeap = reinterpret_cast<uintptr_t>(OSAllocator::tryReserveUncommittedAligned(mappedHeapSize, mappedHeapSize, OSAllocator::StructureAllocatorPages));
++#endif
+             if (g_jscConfig.startOfStructureHeap)
+                 break;
+             mappedHeapSize /= 2;
+@@ -116,11 +123,15 @@ public:
+         RELEASE_ASSERT(hasOneBitSet(mappedHeapSize), mappedHeapSize);
+         uintptr_t alignmentMask = mappedHeapSize - 1;
+         RELEASE_ASSERT(g_jscConfig.startOfStructureHeap & ~alignmentMask, g_jscConfig.startOfStructureHeap, mappedHeapSize, alignmentMask);
++#if OS(SOS2)
++        RELEASE_ASSERT(!((g_jscConfig.startOfStructureHeap ^ (g_jscConfig.startOfStructureHeap + mappedHeapSize - 1)) >> 32));
++#endif
+         g_jscConfig.sizeOfStructureHeap = mappedHeapSize;
+         g_jscConfig.structureIDBase = g_jscConfig.startOfStructureHeap & ~StructureID::structureIDMask;
+ 
+         // Don't use the first page because zero is used as the empty StructureID and the first allocation will conflict.
+-#if !USE(SYSTEM_MALLOC)
++        // SOS2 has no libpas: its blocks come from this reservation's bitmap.
++#if !USE(SYSTEM_MALLOC) && !OS(SOS2)
+         m_useSystemHeap = !bmalloc::api::isEnabled();
+         if (!m_useSystemHeap) [[likely]] {
+ #if OS(WINDOWS) || PLATFORM(PLAYSTATION)
+@@ -137,7 +148,7 @@ public:
+ 
+     void* tryMallocStructureBlock()
+     {
+-#if !USE(SYSTEM_MALLOC)
++#if !USE(SYSTEM_MALLOC) && !OS(SOS2)
+ #if OS(WINDOWS) || PLATFORM(PLAYSTATION)
+         if (!m_useSystemHeap) [[likely]] {
+             void* result = bmalloc_try_allocate_auxiliary_with_alignment_inline(&structureHeap, MarkedBlock::blockSize, MarkedBlock::blockSize, pas_maybe_compact_allocation_mode);
+@@ -174,7 +185,7 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
+ 
+     void freeStructureBlock(void* blockPtr)
+     {
+-#if !USE(SYSTEM_MALLOC)
++#if !USE(SYSTEM_MALLOC) && !OS(SOS2)
+         if (!m_useSystemHeap) [[likely]] {
+             bmalloc_deallocate_inline(blockPtr);
+             return;
+@@ -216,7 +227,7 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
+ 
+ private:
+     Lock m_lock;
+-#if !USE(SYSTEM_MALLOC)
++#if !USE(SYSTEM_MALLOC) && !OS(SOS2)
+     bool m_useSystemHeap { true };
+ #endif
+     BitVector m_usedBlocks;
+--- a/Source/JavaScriptCore/offlineasm/arm64.rb
++++ b/Source/JavaScriptCore/offlineasm/arm64.rb
+@@ -1443,6 +1443,12 @@ class Instruction
+             $asm.puts "ldr #{operands[1].arm64Operand(:quad)}, [#{operands[1].arm64Operand(:quad)}, :got_lo12:#{operands[0].asmLabel}]"
+             $asm.putStr("#endif")
+ 
++            # SOS2 runs static executables at their link addresses.
++            $asm.putStr("#elif OS(SOS2)")
++
++            $asm.puts "adrp #{operands[1].arm64Operand(:quad)}, #{operands[0].asmLabel}"
++            $asm.puts "add #{operands[1].arm64Operand(:quad)}, #{operands[1].arm64Operand(:quad)}, :lo12:#{operands[0].asmLabel}"
++
+             # Throw a compiler error everywhere else.
+             $asm.putStr("#else")
+             $asm.putStr("#error Missing globaladdr implementation")
+--- a/Source/JavaScriptCore/runtime/ScriptExecutable.cpp
++++ b/Source/JavaScriptCore/runtime/ScriptExecutable.cpp
+@@ -26,6 +26,7 @@
+ #include "config.h"
+ 
+ #include "CodeBlock.h"
++#include "CompilationResult.h"
+ #include "Debugger.h"
+ #include "EvalCodeBlock.h"
+ #include "FunctionCodeBlock.h"
+--- a/Source/bmalloc/mimalloc/mimalloc/include/mimalloc/prim.h
++++ b/Source/bmalloc/mimalloc/mimalloc/include/mimalloc/prim.h
+@@ -256,6 +256,7 @@ extern mi_decl_hidden bool _mi_process_is_initialized;                // has mi_
+ #if !defined(__APPLE__)  /* on apple (M1) the wrong register is read (tpidr_el0 instead of tpidrro_el0) so fall back to TLS slot assembly (<https://github.com/microsoft/mimalloc/issues/343#issuecomment-763272369>)*/ \
+     && !defined(__CYGWIN__) \
+     && !defined(MI_LIBC_MUSL) \
++    && !defined(__sos2__)  /* SOS2's GCC has no __builtin_thread_pointer: mimalloc uses a thread_local (emulated TLS) */ \
+     && (!defined(__clang_major__) || __clang_major__ >= 14)  /* older clang versions emit bad code; fall back to using the TLS slot (<https://lore.kernel.org/linux-arm-kernel/202110280952.352F66D8@keescook/T/>) */
+   #if    (defined(__GNUC__) && (__GNUC__ >= 7)  && defined(__aarch64__)) /* aarch64 for older gcc versions (issue #851) */ \
+       || (defined(__GNUC__) && (__GNUC__ >= 11) && defined(__x86_64__)) \
+--- a/Source/JavaScriptCore/jit/JITCall.cpp
++++ b/Source/JavaScriptCore/jit/JITCall.cpp
+@@ -467,7 +467,10 @@ void JIT::emit_op_iterator_next(const JSInstruction* instruction)
+     emitPutVirtualRegister(bytecode.m_done, returnValueGPR);
+     emitPutVirtualRegister(bytecode.m_value, returnValueGPR2);
+     doneCases.append(branchIfEmpty(JSValueRegs { returnValueGPR2 }));
+-    emitValueProfilingSite(bytecode, JSValueRegs { returnValueGPR2 });
++    // Profile the value where the DFG reads it, as LLInt's slow path does. At the
++    // first checkpoint it lands in the next() result's profile, and a loop first
++    // run in this tier leaves the DFG without a type for it: no OSR entry.
++    emitValueProfilingSite(bytecode, BytecodeIndex(m_bytecodeIndex.offset(), OpIteratorNext::getValue), JSValueRegs { returnValueGPR2 });
+ #else
+     auto* tryFastFunction = ([&] () {
+         switch (instruction->width()) {

@@ -1,5 +1,6 @@
 #ifndef SOS2_SERVICES_H
 #define SOS2_SERVICES_H
+#include <stddef.h>
 #include <user_abi.h>
 #include <user_input.h>
 #include <user_browser.h>
@@ -16,7 +17,13 @@ int sos2_present_frame(const uint32_t *, const struct user_pixel_scroll *,
 int sos2_surface_state(void);
 /* SYS_GPU (include/user_abi.h): argument is a struct address, or a handle for
  * USER_GPU_DESTROY. Returns a non-negative result or a negative errno. */
-int sos2_gpu(unsigned op, uint32_t argument, uint32_t size);
+int sos2_gpu(unsigned op, uintptr_t argument, uint32_t size);
+/* Makes code written at [code, code + size) visible to instruction fetch on
+ * every CPU, as a JIT needs after writing code. */
+void sos2_icache_sync(const void *code, size_t size);
+/* A web page's JavaScriptCore options: the sos2.jsc= boot argument's value,
+ * comma-separated, or NULL without one. */
+const char *sos2_engine_options(void);
 /* The errno value for a negative SOS2 result, such as sos2_gpu's. */
 int sos2_errno(int result);
 /* Futex-style wait: sleep while *word equals expected, for at most us

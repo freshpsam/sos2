@@ -4,6 +4,9 @@
 #ifdef SOS2_BOARD_REDMI2
 #include "redmi2_rtc.h"
 #endif
+#ifdef SOS2_BOARD_GTA7LITE
+#include "gta7lite.h"
+#endif
 
 static struct arm_machine machine;
 
@@ -67,7 +70,53 @@ bool arm_machine_init(const struct platform_devices *d) {
     };
     for (unsigned i = 0; i < sizeof(phone) / sizeof(phone[0]); ++i)
         if (!device(phone[i].start, phone[i].size)) return false;
+#elif defined(SOS2_BOARD_GTA7LITE)
+    /* MT6765's GICv3 (Samsung's mt6765.dts): the distributor and the
+     * redistributors' 2 MiB window, one 128 KiB frame per CPU; the virtual
+     * timer's PPI 11 (INTID 27). TOPRGU, whose watchdog LK leaves running. */
+    if (!d->gicv3) return false;
+    machine.timer = (struct arm_timer_route){.distributor = 0x0c000000,
+                                             .interrupt = 27,
+                                             .gicv3 = true,
+                                             .redistributor = 0x0c100000,
+                                             .redistributor_size = 0x200000};
+    if (!device(0x10007000, 0x1000)) return false;
+    /* The touch screen (boards/gta7lite/touch.c): topckgen's and infracfg's
+     * SPI clock controls, the GPIO pins, the external interrupt controller
+     * that latches the touch interrupt, and SPI1. */
+    if (!device(0x10000000, 0x2000) || !device(0x10005000, 0x1000) || !device(0x1000b000, 0x1000) ||
+        !device(0x11010000, 0x1000))
+        return false;
+    /* The PMIC wrapper (boards/gta7lite/pmic.c) and the eMMC's MSDC0
+     * (boards/gta7lite/emmc.c). */
+    if (!device(0x1000d000, 0x1000) || !device(0x11230000, 0x10000)) return false;
+    /* The USB controller and its PHY (boards/gta7lite/usb.c). */
+    if (!device(0x11200000, 0x1000) || !device(0x11cc0000, 0x1000)) return false;
+    /* Wi-Fi (boards/gta7lite/connsys.c and wifi_radio.c): the radio chip's pin
+     * driving, SPM's power domains, BTIF, the connectivity subsystem with
+     * Wi-Fi's registers, then its memory and Wi-Fi's DMA pool, which
+     * gta7lite_handoff kept out of every allocation. */
+    if (!device(0x10002000, 0x1000) || !device(0x10006000, 0x1000) || !device(0x1100c000, 0x1000) ||
+        !device(0x18000000, 0x100000))
+        return false;
+    if (gta7lite_connsys_reserved() && (!device(GTA7LITE_CONNSYS_EMI, GTA7LITE_CONNSYS_EMI_SIZE) ||
+                                        !device(GTA7LITE_WIFI_POOL, GTA7LITE_WIFI_POOL_SIZE)))
+        return false;
+    /* Standby (boards/gta7lite/mt6370.c and display.c): I2C5, where the
+     * MT6370 charger and backlight driver answer; OVL0, OVL0_2L and DSI0. */
+    if (!device(0x11016000, 0x1000) || !device(0x1400b000, 0x2000) || !device(0x14014000, 0x1000))
+        return false;
+    /* MediaTek's boot-params buffer in SRAM, for restarting into download
+     * mode (boards/gta7lite/board.c). */
+    if (d->has_ram_console) {
+        uint32_t start = d->ram_console_start & ~0xfffu;
+        uint32_t end = (d->ram_console_start + d->ram_console_size + 0xfffu) & ~0xfffu;
+        if (!device(start, end - start)) return false;
+    }
+    return device(machine.timer.distributor, 0x10000) &&
+           device(machine.timer.redistributor, machine.timer.redistributor_size);
 #else
+    /* QEMU virt's GICv2 and the virtual timer's PPI 11 (INTID 27). */
     machine.timer = (struct arm_timer_route){0x08000000, 0x08010000, 27, false};
     machine.rtc = 0x09010000;
     if (!device(d->fwcfg, 0x1000) || !device(machine.rtc, 0x1000)) return false;
@@ -91,6 +140,9 @@ bool arm_rtc_read(uint32_t *seconds) {
     if (!seconds) return false;
 #ifdef SOS2_BOARD_REDMI2
     return redmi2_rtc_read(seconds);
+#elif defined(SOS2_BOARD_GTA7LITE)
+    /* The MT6357's calendar, which Android keeps in UTC: Unix seconds. */
+    return gta7lite_rtc_read(seconds);
 #else
     if (!machine.rtc) return false;
     *seconds = mmio_read32(machine.rtc);

@@ -6,3 +6,5 @@ add_compile_options($<$<COMPILE_LANGUAGE:C>:-std=gnu17>)
 # the minimum arena to 1 MiB; reserve arenas at that size, mapped committed
 # instead of committing them slice by slice with mprotect.
 add_compile_definitions(MI_ARENA_SLICE_SHIFT=13 MI_DEFAULT_ARENA_RESERVE=1024 MI_DEFAULT_ARENA_EAGER_COMMIT=1)
+# On arm64 mimalloc builds for ARMv8.1-A by default; the Cortex-A53 is ARMv8.0.
+set(MI_NO_OPT_ARCH ON CACHE BOOL "Keep the target CPU's architecture" FORCE)

@@ -4,6 +4,8 @@
 #include "page_host.h"
 #include "desktop_wifi.h"
 #include "platform.h"
+#include "wire.h"
+#include "sha256.h"
 
 enum { SETTINGS_SIZE = 188 };
 
@@ -19,29 +21,12 @@ static uint64_t attempt_deadline;
  * network, so a connection attempt's minute stops meanwhile. */
 static uint64_t standby_since;
 
-static unsigned get32(const unsigned char *p) {
-    return p[0] | (unsigned)p[1] << 8 | (unsigned)p[2] << 16 | (unsigned)p[3] << 24;
-}
-
-static void put32(unsigned char *p, unsigned n) {
-    for (unsigned i = 0; i < 4; ++i) p[i] = (unsigned char)(n >> (8 * i));
-}
-
-static uint32_t checksum(const unsigned char *p, unsigned n) {
-    uint32_t c = ~0u;
-    while (n--) {
-        c ^= *p++;
-        for (unsigned i = 0; i < 8; ++i) c = (c >> 1) ^ (0xedb88320u & -(c & 1));
-    }
-    return ~c;
-}
-
 static bool decode(const unsigned char *data, unsigned n) {
-    if (n != SETTINGS_SIZE || memcmp(data, "SOWS", 4) || get32(data + 4) != 1 ||
-        get32(data + 8) > 1 || get32(data + 12) || data[22] || data[23] ||
-        !wifi_mac_valid(data + 16) || get32(data + 184) != checksum(data, 184))
+    if (n != SETTINGS_SIZE || memcmp(data, "SOWS", 4) || le32(data + 4) != 1 ||
+        le32(data + 8) > 1 || le32(data + 12) || data[22] || data[23] ||
+        !wifi_mac_valid(data + 16) || le32(data + 184) != crc32_ieee(data, 184))
         return false;
-    bool present = get32(data + 8) != 0;
+    bool present = le32(data + 8) != 0;
     if (present) {
         if (!wifi_profile_read(&saved_profile, data + 24, 160) ||
             memcmp(saved_profile.mac, data + 16, 6))
@@ -61,7 +46,7 @@ static bool store_profile(const struct wifi_profile *profile) {
     put32(data + 8, profile != 0);
     memcpy(data + 16, identity, 6);
     bool valid = !profile || wifi_profile_write(profile, data + 24);
-    put32(data + 184, checksum(data, 184));
+    put32(data + 184, crc32_ieee(data, 184));
     int result = valid ? fs_settings_write(FS_SETTING_WIFI, data, sizeof(data)) : USER_EINVAL;
     wifi_secret_clear(data, sizeof(data));
     return result == 0;
@@ -215,7 +200,9 @@ done:
 void wifi_setup_service(void *unused) {
     (void)unused;
     if (!view.available) return;
-    struct wifi_setup_view before = view;
+    /* The view up to its network list decides the redraw (include/wifi_setup.h). */
+    struct wifi_setup_view before;
+    memcpy(&before, &view, offsetof(struct wifi_setup_view, radio.networks));
     working = true;
     if (initializing) load();
     unsigned action = command;
@@ -284,9 +271,9 @@ void wifi_setup_service(void *unused) {
     view.storage = fs_persistent_ready();
     view.busy = false;
     working = false;
-    /* Only connection state and visible settings trigger a screen redraw,
-     * not hardware-stage details. */
-    before.radio.detail = view.radio.detail;
+    /* Only connection state and visible settings trigger a screen redraw: a
+     * stage's message only once it failed. */
     if (view.radio.state != WIFI_RADIO_FAILED) before.radio.message = view.radio.message;
-    if (memcmp(&before, &view, sizeof(view))) page_host_redraw();
+    if (memcmp(&before, &view, offsetof(struct wifi_setup_view, radio.networks)))
+        page_host_redraw();
 }

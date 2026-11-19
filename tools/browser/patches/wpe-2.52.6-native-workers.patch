@@ -1,0 +1,13 @@
+--- a/Source/WebCore/dom/Document.cpp
++++ b/Source/WebCore/dom/Document.cpp
+@@ -5062,6 +5062,10 @@ void Document::setTrustedTypesEnforcement(JSC::TrustedTypesEnforcement enforceme
+ 
+ IDBClient::IDBConnectionProxy* Document::idbConnectionProxy()
+ {
++    // Creating a worker must not contact an unavailable IndexedDB provider
++    // when the API is disabled in the document and inherited worker settings.
++    if (!settings().indexedDBAPIEnabled())
++        return nullptr;
+     if (!m_idbConnectionProxy) {
+         RefPtr currentPage = page();
+         if (!currentPage)

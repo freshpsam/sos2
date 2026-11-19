@@ -1,4 +1,5 @@
 #include "fdt.h"
+#include "wire.h"
 
 /* Root-bus devices, RAM, reserved memory and a firmware-owned simplefb only.
  * No general bus address translation is attempted. The chosen/reserved-memory
@@ -10,6 +11,17 @@ static uint32_t be32(const unsigned char *p) {
 }
 
 static uint64_t be64(const unsigned char *p) { return ((uint64_t)be32(p) << 32) | be32(p + 4); }
+
+#ifdef SOS2_BOARD_GTA7LITE
+static void copy_string(char *out, size_t capacity, const unsigned char *p) {
+    size_t i = 0;
+    while (i + 1 < capacity && p[i]) {
+        out[i] = (char)p[i];
+        ++i;
+    }
+    out[i] = 0;
+}
+#endif
 
 static bool equals(const char *a, const char *b) {
     while (*a && *a == *b) {
@@ -42,6 +54,14 @@ static bool string_list(const unsigned char *p, size_t n) {
     return true;
 }
 
+/* The value's text up to its first NUL, or all of it, equals s: how Linux
+ * reads a status (strcmp in of_device_is_available). */
+static bool text_is(const unsigned char *p, size_t n, const char *s) {
+    size_t i = 0;
+    while (i < n && p[i] && s[i] && p[i] == (unsigned char)s[i]) ++i;
+    return !s[i] && (i == n || !p[i]);
+}
+
 static bool compatible(const unsigned char *p, size_t n, const char *s) {
     while (n) {
         size_t length = 0;
@@ -55,13 +75,27 @@ static bool compatible(const unsigned char *p, size_t n, const char *s) {
     return false;
 }
 
-static void copy_string(char *out, size_t capacity, const unsigned char *p) {
-    size_t i = 0;
-    while (i + 1 < capacity && p[i]) {
-        out[i] = (char)p[i];
-        ++i;
+/* SOS2's own arguments, the sos2.* tokens of /chosen/bootargs, in order,
+ * wherever the loader put the image's command line: lk2nd starts its
+ * bootargs with it, the tablet's LK ends a long one with it. The kernel reads
+ * nothing else there. Only whole tokens are kept; one that does not fit ends
+ * the list, which can drop an argument but never change one. */
+static void own_arguments(char *out, size_t capacity, const unsigned char *p) {
+    size_t used = 0;
+    out[0] = 0;
+    for (size_t i = 0; p[i];) {
+        while (p[i] == ' ' || p[i] == '\t') ++i;
+        size_t start = i;
+        while (p[i] && p[i] != ' ' && p[i] != '\t') ++i;
+        size_t n = i - start;
+        if (n < 5 || p[start] != 's' || p[start + 1] != 'o' || p[start + 2] != 's' ||
+            p[start + 3] != '2' || p[start + 4] != '.')
+            continue;
+        if (used + (used ? 1 : 0) + n >= capacity) break;
+        if (used) out[used++] = ' ';
+        for (size_t k = 0; k < n; ++k) out[used++] = (char)p[start + k];
+        out[used] = 0;
     }
-    out[i] = 0;
 }
 
 static uint64_t cells(const unsigned char *p, unsigned count) {
@@ -95,6 +129,9 @@ struct node {
     bool chosen, reserved_container, ranges_seen, ranges_empty, children_started;
     bool width_seen, height_seen, stride_seen, bad_fb, memory_region_seen;
     bool cpus, cpu, cpu_psci, psci, psci_standard;
+#ifdef SOS2_BOARD_GTA7LITE
+    bool gicv3;
+#endif
     enum cpu_boot_method method;
     uint32_t cpu_on;
 };
@@ -189,7 +226,8 @@ bool fdt_discover(const void *blob, struct platform_devices *d) {
             return false;
         uint64_t address = be64(b + reserve), size = be64(b + reserve + 8);
         reserve += 16;
-        if (!address && !size) break;
+        /* Like Linux, a zero size ends the map (libfdt writes all zeros). */
+        if (!size) break;
         if (!add_region(d->reserved_regions, &d->reserved_region_count, MAX_RESERVED_REGIONS,
                         address, size))
             return false;
@@ -260,17 +298,13 @@ bool fdt_discover(const void *blob, struct platform_devices *d) {
                 n->psci_standard =
                     compatible(p, len, "arm,psci-0.2") || compatible(p, len, "arm,psci-1.0");
                 n->psci = n->psci_standard || compatible(p, len, "arm,psci");
-                if (depth == 0) {
-                    copy_string(d->root_compatible, sizeof(d->root_compatible), p);
-                    d->redmi2_wt88047 = compatible(p, len, "wingtech,wt88047");
-                    d->redmi2 = d->redmi2_wt88047 || compatible(p, len, "wingtech,wt86047");
-                }
-            } else if (equals(name, "model") && depth == 0) {
-                if (!single_string(p, len)) return false;
-                copy_string(d->model, sizeof(d->model), p);
+#ifdef SOS2_BOARD_GTA7LITE
+                n->gicv3 = compatible(p, len, "arm,gic-v3");
+#endif
+                if (depth == 0) d->redmi2_wt88047 = compatible(p, len, "wingtech,wt88047");
             } else if (equals(name, "bootargs") && depth == 1 && n->chosen) {
                 if (!single_string(p, len)) return false;
-                copy_string(d->bootargs, sizeof(d->bootargs), p);
+                own_arguments(d->bootargs, sizeof(d->bootargs), p);
             } else if (depth == 1 && n->chosen &&
                        (equals(name, "linux,initrd-start") || equals(name, "linux,initrd-end"))) {
                 if (len != 4 && len != 8) return false;
@@ -284,6 +318,30 @@ bool fdt_discover(const void *blob, struct platform_devices *d) {
                     d->initrd_end = address;
                     d->has_initrd_end = true;
                 }
+#ifdef SOS2_BOARD_GTA7LITE
+            } else if (depth == 1 && n->chosen && equals(name, "atag,videolfb")) {
+                /* LK's raw little-endian struct tag_videolfb: u64 fb_base,
+                 * u32 islcmfound, fps and vram, then the LCM driver's name.
+                 * Anything shorter or unterminated is not one. */
+                uint32_t name_end = 20;
+                while (name_end < len && p[name_end]) ++name_end;
+                if (name_end < len) {
+                    d->videolfb_base = le32(p) | (uint64_t)le32(p + 4) << 32;
+                    d->videolfb_vram = le32(p + 16);
+                    copy_string(d->lcm_name, sizeof(d->lcm_name), p + 20);
+                    d->has_videolfb = true;
+                }
+            } else if (depth == 1 && n->chosen && equals(name, "ram_console")) {
+                /* LK's raw little-endian struct mem_desc_t: start, size, type
+                 * (1: SRAM) and the memory info's offset. Only a small SRAM
+                 * buffer below DRAM is taken. */
+                if (len == 16 && le32(p + 8) == 1 && le32(p) && le32(p + 4) >= 64 &&
+                    le32(p + 4) <= 0x10000 && le32(p) < 0x40000000u - le32(p + 4)) {
+                    d->ram_console_start = le32(p);
+                    d->ram_console_size = le32(p + 4);
+                    d->has_ram_console = true;
+                }
+#endif
             } else if (equals(name, "device_type")) {
                 n->memory = len == 7 && compatible(p, len, "memory");
                 n->cpu = len == 4 && compatible(p, len, "cpu");
@@ -299,9 +357,10 @@ bool fdt_discover(const void *blob, struct platform_devices *d) {
                 if (len != 4) return false;
                 n->cpu_on = be32(p);
             } else if (equals(name, "status")) {
-                if (!single_string(p, len)) return false;
-                n->disabled = n->disabled || !((len == 5 && compatible(p, len, "okay")) ||
-                                               (len == 3 && compatible(p, len, "ok")));
+                /* MediaTek's LK writes "okay" without its NUL into nodes it enables
+                 * (reserve-memory-sspm_share and scp@10500000 on the Galaxy Tab A7
+                 * Lite); Linux reads status as a C string. */
+                n->disabled = n->disabled || !(text_is(p, len, "okay") || text_is(p, len, "ok"));
             } else if (equals(name, "width")) {
                 n->width_seen = true;
                 if (len != 4) n->bad_fb = true;
@@ -342,6 +401,9 @@ bool fdt_discover(const void *blob, struct platform_devices *d) {
         } else if (token == 2) {
             if (depth < 0) return false;
             struct node *n = &stack[depth];
+#ifdef SOS2_BOARD_GTA7LITE
+            if (!n->disabled && n->gicv3) d->gicv3 = true;
+#endif
             if (!n->disabled && depth == 2 && stack[1].cpus && n->cpu) {
                 if (!n->reg || n->parent_ac < 1 || n->parent_ac > 2 || n->parent_sc ||
                     n->reg_length != n->parent_ac * 4)
@@ -377,10 +439,11 @@ bool fdt_discover(const void *blob, struct platform_devices *d) {
                     uint64_t size = cells(n->reg + offset + 4 * n->parent_ac, n->parent_sc);
                     if (size > UINT64_MAX - address) return false;
                     if (!size) {
-                        /* Like Linux, ignore empty memory tuples: CAF-LK-derived loaders
-                         * such as lk2nd may append SMEM banks after the zero-size
-                         * /memory placeholder instead of replacing it. */
-                        if (!reserved && n->memory) continue;
+                        /* Like Linux, skip empty RAM and reservation tuples: CAF-LK-derived
+                         * loaders such as lk2nd may append SMEM banks after the zero-size
+                         * /memory placeholder instead of replacing it, and an empty
+                         * reservation reserves nothing. */
+                        if (reserved || n->memory) continue;
                         return false;
                     }
                     if (reserved) {
@@ -399,10 +462,6 @@ bool fdt_discover(const void *blob, struct platform_devices *d) {
                         if (!add_region(d->ram_regions, &d->ram_region_count, MAX_RAM_REGIONS,
                                         address, size))
                             return false;
-                        if (d->ram_region_count == 1) {
-                            d->ram_start = address;
-                            d->ram_size = size;
-                        }
                     } else if (!offset) {
                         if (address > UINTPTR_MAX) return false;
                         if (n->fwcfg) d->fwcfg = (uintptr_t)address;

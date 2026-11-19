@@ -358,7 +358,7 @@ public:
         } else if (native->type() == PlatformEvent::Type::Char && editor.canEdit() && !control &&
                    !event.altKey()) {
             if (event.key() == "Enter"_s) command = shift ? "InsertLineBreak"_s : "InsertNewline"_s;
-            else if (!native->text().isEmpty() && native->text().codeUnitAt(0) >= 32 &&
+            else if (!native->text().isEmpty() && native->text().characterAt(0) >= 32 &&
                      editor.insertText(native->text(), &event))
                 event.setDefaultHandled();
         }
@@ -412,7 +412,7 @@ public:
                              pressed || type == Type::MouseReleased ? MouseButton::Left
                                                                     : MouseButton::None,
                              type, clicks, modifiers, MonotonicTime::now(), 0,
-                             SyntheticClickType::NoTap, MouseEventInputSource::UserDriven) {
+                             SyntheticClickType::NoTap) {
         m_buttons = pressed ? 1 : 0;
     }
 };

@@ -12,8 +12,8 @@
 
 enum { IDLE, RESOLVING, WAITING };
 
-static char server[254];
-static uint16_t server_port;
+static const char server[] = "time.cloudflare.com";
+enum { SERVER_PORT = 123 };
 static struct udp_pcb *socket;
 static ip_addr_t remote;
 static unsigned phase, generation, retry_seconds;
@@ -58,7 +58,6 @@ static void retry(void) {
         retry_seconds *= 2;
         if (retry_seconds > 900) retry_seconds = 900;
     }
-    system_clock_network_status(CLOCK_NETWORK_RETRY);
 }
 
 static void received(void *unused, struct udp_pcb *pcb, struct pbuf *packet,
@@ -67,7 +66,7 @@ static void received(void *unused, struct udp_pcb *pcb, struct pbuf *packet,
     unsigned char data[48];
     uint64_t now = time_us();
     bool matches = phase == WAITING && pcb == socket && packet->tot_len == sizeof(data) &&
-                   port == server_port && ip_addr_cmp(address, &remote) && now < deadline &&
+                   port == SERVER_PORT && ip_addr_cmp(address, &remote) && now < deadline &&
                    pbuf_copy_partial(packet, data, sizeof(data), 0) == sizeof(data);
     pbuf_free(packet);
     if (!matches || (data[0] & 7) != 4 || ((data[0] >> 3) & 7) < 3 || ((data[0] >> 3) & 7) > 4 ||
@@ -80,7 +79,6 @@ static void received(void *unused, struct udp_pcb *pcb, struct pbuf *packet,
         if (poll < 60) poll = 60;
         retry();
         earliest_request = time_us() + (uint64_t)poll * SECOND;
-        if (denied) system_clock_network_status(CLOCK_NETWORK_REFUSED);
         return;
     }
     uint64_t receive_us, transmit_us;
@@ -97,7 +95,6 @@ static void received(void *unused, struct udp_pcb *pcb, struct pbuf *packet,
     cancel();
     retry_seconds = 15;
     next_attempt = now + 3600 * SECOND;
-    system_clock_network_status(CLOCK_NETWORK_SYNCED);
 }
 
 static void resolved(const char *name, const ip_addr_t *address, void *context) {
@@ -134,46 +131,12 @@ static void resolved(const char *name, const ip_addr_t *address, void *context) 
     deadline = sent_at + 5 * SECOND;
     earliest_request = sent_at + 15 * SECOND;
     phase = WAITING;
-    err_t error = udp_sendto(socket, packet, &remote, server_port);
+    err_t error = udp_sendto(socket, packet, &remote, SERVER_PORT);
     pbuf_free(packet);
     if (error != ERR_OK) retry();
 }
 
-void network_time_init(const char *args) {
-    strcpy(server, "time.cloudflare.com");
-    server_port = 123;
-    /* An operator may choose a local time service without exposing settings
-     * to web pages. An optional port also permits isolated emulator fixtures. */
-    while (args && *args) {
-        while (*args == ' ') ++args;
-        const char *start = args;
-        while (*args && *args != ' ') ++args;
-        size_t n = (size_t)(args - start);
-        static const char prefix[] = "sos2.ntp=";
-        const size_t skip = sizeof(prefix) - 1;
-        if (n > skip && n < sizeof(server) && !memcmp(start, prefix, skip)) {
-            char value[254];
-            memcpy(value, start + skip, n - skip);
-            value[n - skip] = 0;
-            char *colon = strchr(value, ':');
-            unsigned port = 123;
-            if (colon) {
-                *colon++ = 0;
-                port = 0;
-                for (; *colon && port <= 65535; ++colon) {
-                    if (*colon < '0' || *colon > '9') {
-                        port = 0;
-                        break;
-                    }
-                    port = port * 10 + (*colon - '0');
-                }
-            }
-            if (value[0] && port && port <= 65535) {
-                strcpy(server, value);
-                server_port = (uint16_t)port;
-            }
-        }
-    }
+void network_time_init(void) {
     socket = 0;
     phase = IDLE;
     generation = 0;
@@ -189,23 +152,18 @@ void network_time_poll(bool online) {
         cancel();
         next_attempt = now;
         retry_seconds = 15;
-        system_clock_network_status(online ? CLOCK_NETWORK_SYNCING : CLOCK_NETWORK_OFFLINE);
     }
-    bool ready = system_clock_view()->ready;
+    bool ready = system_clock_ready();
     if (was_ready && !ready) next_attempt = now;
     was_ready = ready;
     if (!connected) return;
-    if (denied) {
-        system_clock_network_status(CLOCK_NETWORK_REFUSED);
-        return;
-    }
+    if (denied) return;
     if (phase != IDLE && now >= deadline) retry();
     if (phase != IDLE || dns_busy || now < next_attempt || now < earliest_request) return;
     phase = RESOLVING;
     dns_busy = true;
     ++generation;
     deadline = now + 10 * SECOND;
-    system_clock_network_status(CLOCK_NETWORK_SYNCING);
     ip_addr_t address;
     err_t error = dns_gethostbyname(server, &address, resolved, (void *)(uintptr_t)generation);
     if (error == ERR_OK) resolved(server, &address, (void *)(uintptr_t)generation);

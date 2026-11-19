@@ -13,8 +13,6 @@ void virtio_gpu_damage(unsigned x, unsigned y, unsigned width, unsigned height);
 void virtio_gpu_poll(void);
 /* Bounded drain for a terminal error screen; ordinary frames stay asynchronous. */
 bool virtio_gpu_sync(void);
-/* A failed reset quarantines all static DMA storage until reboot. */
-bool virtio_gpu_stop(void);
 /* Optional virgl compositor. Four texture cache entries, never a page limit.
  * Owners are kernel page slots, not user-supplied device/resource handles.
  * A view shows the top height rows of owner's cache (display_page_view). */

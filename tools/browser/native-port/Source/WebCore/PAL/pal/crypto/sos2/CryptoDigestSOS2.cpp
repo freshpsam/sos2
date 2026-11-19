@@ -3,7 +3,7 @@
 #define MBEDTLS_CONFIG_FILE "sos2/mbedtls_config.h"
 #include <mbedtls/md.h>
 
-namespace PAL::Crypto {
+namespace PAL {
 struct CryptoDigestContext {
     WTF_DEPRECATED_MAKE_STRUCT_FAST_ALLOCATED(CryptoDigestContext);
     mbedtls_md_context_t value;

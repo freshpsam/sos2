@@ -41,8 +41,6 @@ public:
 
     bool headersReady() const { return finalHeaders && failure.empty(); }
 
-    size_t bodyBytes() const { return receivedBody; }
-
     std::vector<uint8_t> takeBody() { return std::exchange(response.body, {}); }
 
     const std::string &error() const { return failure; }

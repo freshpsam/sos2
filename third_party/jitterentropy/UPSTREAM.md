@@ -13,5 +13,6 @@ Linux services are linked. All core sources compile with `-O0 -fwrapv`.
 
 Startup and continuous health tests, including the FIPS-mode checks, remain
 enabled; this is not a claim of FIPS certification. SOS2 bounds execution and
-fails closed on clock/health/allocation errors. Real MSM8916 timing quality
-and latency still require validation on the handset.
+fails closed on clock/health/allocation errors. Real timing quality and
+latency still require validation on the devices: the Redmi 2 (MSM8916) and
+the Galaxy Tab A7 Lite (MT6765).

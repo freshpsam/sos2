@@ -67,7 +67,7 @@ static int fail_sos2(int result) {
 }
 
 /* Every SYS_GPU request after setup goes through here, so a failure is seen. */
-static int request(unsigned op, uint32_t argument, uint32_t size) {
+static int request(unsigned op, uintptr_t argument, uint32_t size) {
     int result = sos2_gpu(op, argument, size);
     if (result < 0) __atomic_store_n(&failed, 1, __ATOMIC_RELEASE);
     return result;
@@ -77,7 +77,7 @@ int sos2_drm_failed(void) { return __atomic_load_n(&failed, __ATOMIC_ACQUIRE); }
 
 static uint32_t pages(uint32_t size) { return (size + PAGE - 1) & ~(PAGE - 1); }
 
-static uint32_t address(const void *p) { return (uint32_t)(uintptr_t)p; }
+static uintptr_t address(const void *p) { return (uintptr_t)p; }
 
 /* Caller holds lock. */
 static struct object *find(struct file *file, uint32_t handle) {
@@ -266,7 +266,7 @@ static int wait_idle(struct buffer *b, uint32_t handle, void *argument) {
 static int execbuffer(struct drm_virtgpu_execbuffer *e) {
     if (e->flags || e->num_in_syncobjs || e->num_out_syncobjs) return fail(EINVAL);
     if (!e->size) return 0;
-    struct user_gpu_submit s = {(uint32_t)e->command, e->size};
+    struct user_gpu_submit s = {(user_ptr)e->command, e->size};
     int result = request(USER_GPU_SUBMIT, address(&s), sizeof(s));
     return result < 0 ? fail_sos2(result) : 0;
 }

@@ -9,11 +9,12 @@ import os
 import shutil
 import subprocess
 import sys
+import arch
 from build_native_runtime import ROOT, SYSROOT, CPU, link_flags, link_libraries, sdk, sdk_includes
 from host_tools import find_tool
 from native_sources import apply_patch, digest, download, run_logged, source_tree
 
-BASE = ROOT/'build/native-mesa'
+BASE = ROOT/('build/native-mesa'+arch.SUFFIX)
 RECORDS = {record['name']: record for record in
            json.loads((ROOT/'tools/browser/native-mesa.lock.json').read_text())['sources']}
 MESA = BASE/'src'/('mesa-'+RECORDS['mesa']['version'])
@@ -38,8 +39,8 @@ def compile_flags(cxx=False):
     """Flags for Mesa and the shim. arm-none-eabi defaults to short enums,
     which Mesa's enum bitfields do not fit; the GL and EGL interfaces pass no
     enum types, so programs may mix either size."""
-    return [*CPU, '-fno-short-enums', '-DEGL_NO_PLATFORM_SPECIFIC_TYPES', '-ffunction-sections', '-fdata-sections',
-            *sdk_includes(cxx)]
+    return [*CPU, *(['-fno-short-enums'] if arch.SHORT_ENUMS else []), '-DEGL_NO_PLATFORM_SPECIFIC_TYPES',
+            '-ffunction-sections', '-fdata-sections', *sdk_includes(cxx)]
 
 
 def libraries():
@@ -54,7 +55,7 @@ def include_directories():
 
 
 def archive(record):
-    return BASE/'downloads'/record['url'].rsplit('/', 1)[1]
+    return ROOT/'build/native-mesa/downloads'/record['url'].rsplit('/', 1)[1]
 
 
 def fetch():
@@ -80,12 +81,12 @@ def write_if_changed(path, text):
 
 def toolchain():
     """Compiler wrappers, the shim's pkg-config file and the meson cross file."""
-    # arm-none-eabi GCC rejects -pthread, which meson adds for threads; SOS2
+    # Bare-metal GCC rejects -pthread, which meson adds for threads; SOS2
     # programs always have threads.
     for name in ('gcc', 'g++'):
-        wrapper = BASE/'bin'/('arm-none-eabi-'+name)
+        wrapper = BASE/'bin'/(arch.TRIPLE+'-'+name)
         write_if_changed(wrapper, '#!/bin/sh\nfor argument do shift; [ "$argument" = -pthread ] || '
-                         'set -- "$@" "$argument"; done\nexec arm-none-eabi-'+name+' "$@"\n')
+                         'set -- "$@" "$argument"; done\nexec '+arch.tool(name)+' "$@"\n')
         wrapper.chmod(0o755)
     version = RECORDS['libdrm']['version']
     write_if_changed(BASE/'pkgconfig/libdrm.pc',
@@ -95,26 +96,28 @@ def toolchain():
     def array(values):
         return '['+', '.join("'"+str(v).replace('\\', '\\\\').replace("'", "\\'")+"'" for v in values)+']'
     # Mesa's 32-bit enums (above) would draw a warning per object mixed with SDK code.
-    linking = link_flags('--no-enum-size-warning')
+    linking = link_flags(*(['--no-enum-size-warning'] if arch.SHORT_ENUMS else []))
     cross = BASE/'cross-sos2.ini'
     write_if_changed(cross, '\n'.join([
-        '[binaries]', 'c = '+array([BASE/'bin/arm-none-eabi-gcc'])[1:-1], 'cpp = '+array([BASE/'bin/arm-none-eabi-g++'])[1:-1],
-        "ar = 'arm-none-eabi-ar'", "strip = 'arm-none-eabi-strip'", "pkg-config = 'pkg-config'", '',
+        '[binaries]', 'c = '+array([BASE/'bin'/(arch.TRIPLE+'-gcc')])[1:-1],
+        'cpp = '+array([BASE/'bin'/(arch.TRIPLE+'-g++')])[1:-1],
+        'ar = '+array([arch.tool('ar')])[1:-1], 'strip = '+array([arch.tool('strip')])[1:-1], "pkg-config = 'pkg-config'", '',
         '[properties]', 'needs_exe_wrapper = true', 'pkg_config_libdir = '+array([BASE/'pkgconfig'])[1:-1],
         'sys_root = '+array([SYSROOT])[1:-1], '',
         '[built-in options]', 'c_args = '+array(compile_flags()), 'cpp_args = '+array(compile_flags(True)),
         'c_link_args = '+array(linking+link_libraries()), 'cpp_link_args = '+array(linking+link_libraries(True)), '',
-        '[host_machine]', "system = 'sos2'", "cpu_family = 'arm'", "cpu = 'cortex-a15'", "endian = 'little'", '']))
+        '[host_machine]', "system = 'sos2'", "cpu_family = '"+arch.MESON_CPU[0]+"'", "cpu = '"+arch.MESON_CPU[1]+"'",
+        "endian = 'little'", '']))
     return cross
 
 
 def shim():
     SHIM.mkdir(parents=True, exist_ok=True)
-    run(['arm-none-eabi-gcc', *compile_flags(), '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+    run([arch.tool('gcc'), *compile_flags(), '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
          '-I'+str(LIBDRM), '-I'+str(LIBDRM/'include/drm'), '-I'+str(MESA/'src/virtio/virtio-gpu'),
          '-c', ROOT/'sdk/drm/drm.c', '-o', SHIM/'drm.o'], 'drm-shim')
     (SHIM/'libdrm.a').unlink(missing_ok=True)
-    run(['arm-none-eabi-ar', 'rcs', SHIM/'libdrm.a', SHIM/'drm.o'], 'drm-shim-archive')
+    run([arch.tool('ar'), 'rcs', SHIM/'libdrm.a', SHIM/'drm.o'], 'drm-shim-archive')
 
 
 def environment():
@@ -168,19 +171,11 @@ def build(jobs):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('fetch', 'prepare', 'build'))
-    parser.add_argument('-j', '--jobs', type=int, default=8)
-    args = parser.parse_args()
-    if args.jobs < 1:
-        parser.error('jobs must be positive')
+    parser = argparse.ArgumentParser(description=__doc__ + ' make engine builds it; this fetches its sources.')
+    parser.add_argument('command', choices=('fetch',))
+    parser.parse_args()
     try:
-        if args.command == 'fetch':
-            fetch()
-        elif args.command == 'prepare':
-            prepare()
-        else:
-            build(args.jobs)
+        fetch()
     except (OSError, RuntimeError) as error:
         parser.exit(1, str(error)+'\n')
 

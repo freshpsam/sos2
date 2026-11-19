@@ -5,7 +5,7 @@
 // CPU topology and cold boot use the verified MSM8916 ACC/SCM interface.
 // lk2nd fills memory from SMEM and inserts the active display's framebuffer.
 // Contract: msm8916-mainline/lk2nd 3e86db90765468c55e1be507cb897efd20876b71
-// See docs/redmi2.md for sources, assumptions, and untested device prerequisites.
+// See docs/redmi2.md for sources and assumptions.
 / {
     model = "Xiaomi Redmi 2 (wt88047), sos2 boot handoff";
     compatible = "wingtech,wt88047", "qcom,msm8916";

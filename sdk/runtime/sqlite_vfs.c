@@ -189,15 +189,9 @@ static int reserved_file(sqlite3_file *base, int *result) {
 }
 
 static int control_file(sqlite3_file *base, int op, void *argument) {
-    struct native_file *file = (void *)base;
-    if (op == SQLITE_FCNTL_LOCKSTATE) {
-        *((int *)argument) = file->level;
-        return SQLITE_OK;
-    }
-    if (op == SQLITE_FCNTL_VFSNAME) {
-        *((char **)argument) = sqlite3_mprintf("sos2");
-        return *((char **)argument) ? SQLITE_OK : SQLITE_NOMEM;
-    }
+    (void)base;
+    (void)op;
+    (void)argument;
     return SQLITE_NOTFOUND;
 }
 

@@ -10,8 +10,6 @@ struct battery_view {
 };
 
 void battery_init(void);
-/* Whether this board has a battery gauge (the phone; QEMU has none). */
-bool battery_supported(void);
 const struct battery_view *battery_view(void);
 /* The screen going off and on: no polls while it is off. */
 void battery_standby(bool active);

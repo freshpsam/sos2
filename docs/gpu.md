@@ -50,12 +50,15 @@ page back to the CPU for good. `gpuRasterization` in
 
 ## GPU compositing
 
-When a page paints on the GPU, WebKit's Skia compositor
-(`programs/browser/web_gpu_compositor.h`) composites its layers: it runs
-transform, opacity and filter animations itself and draws masks, filters,
-blend modes and 3D transforms, which the CPU compositor flattens. SOS2 runs
-it on the page thread, right after WebCore's layer flush
-(`tools/browser/patches/wpe-2.54.2-native-gpu-compositing.patch`).
+When a page paints on the GPU, WebKit's TextureMapper
+(`programs/browser/web_gpu_compositor.h`) composites its layers with GL into
+the page's GPU surface: it runs transform, opacity and filter animations
+itself and draws masks, filters and 3D transforms, which the CPU compositor
+flattens. When a page uses a non-normal CSS `mix-blend-mode`, WebCore paints
+directly into the GPU surface and animates on the page thread. Layer compositing
+resumes when those blend modes are removed. SOS2 commits and draws the layer
+tree on the page thread after WebCore's layer flush
+(`tools/browser/patches/wpe-2.52.6-native-gpu-compositing.patch`).
 `gpuCompositing` in `programs/browser/web_main.cpp` turns it off.
 
 ## Redmi 2 Adreno

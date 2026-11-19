@@ -13,9 +13,11 @@ struct disk_partition {
 };
 
 typedef bool (*disk_read_sector)(void *context, uint64_t sector, void *data);
-/* Read-only, serialized discovery. Rejects damaged/ambiguous GPTs; never repairs
- * them. Supports 1 to 128 entries of 128 bytes (Qualcomm's tools declare 32)
- * on 512-byte sectors. */
+/* Read-only, serialized discovery from the primary GPT, as Linux reads it.
+ * Rejects a damaged or ambiguous one; never repairs it or falls back to the
+ * backup. Supports headers of 92 to 512 bytes and 1 to 128 entries of 128
+ * bytes (Qualcomm's tools declare 32, the Galaxy Tab A7 Lite's 56) on
+ * 512-byte sectors. */
 bool disk_partition_find(disk_read_sector read, void *context, uint64_t sectors,
                          struct disk_partition *out);
 /* The one partition whose UTF-16 GPT name is exactly name, whatever its type,

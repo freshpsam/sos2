@@ -86,7 +86,6 @@ struct wifi_station {
     unsigned char query_id[2];
     uint16_t last_sequence[17];
     bool sequence_seen[17];
-    unsigned rx_data_seen, rx_data_admitted;
     bool survey;
     /* Standby holds reconnection scans; leaving marks a network left for
      * standby, rejoined once it ends without counting a failure. */

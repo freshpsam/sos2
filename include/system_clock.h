@@ -11,26 +11,12 @@ struct system_clock_ops {
     enum arm_rtc_kind kind;
 };
 
-enum clock_network_state {
-    CLOCK_NETWORK_OFFLINE,
-    CLOCK_NETWORK_SYNCING,
-    CLOCK_NETWORK_RETRY,
-    CLOCK_NETWORK_SYNCED,
-    CLOCK_NETWORK_REFUSED
-};
-
-struct system_clock_view {
-    bool ready, busy, storage, rtc_available, saved;
-    enum clock_network_state network;
-    const char *message;
-};
-
 void system_clock_init(const struct system_clock_ops *);
-const struct system_clock_view *system_clock_view(void);
+/* Whether the wall time is known. */
+bool system_clock_ready(void);
 bool system_clock_read(uint64_t *microseconds);
 /* UTC at receipt, in microseconds; saving RTC calibration is best effort. */
 bool system_clock_synchronize(uint64_t microseconds);
-void system_clock_network_status(enum clock_network_state);
 bool system_clock_pending(void);
 void system_clock_service(void *);
 #endif

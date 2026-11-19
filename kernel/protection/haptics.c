@@ -56,7 +56,10 @@ void haptics_init(void) {
 #ifdef SOS2_BOARD_REDMI2
     ready = redmi2_vibrator_init(TAP_MV);
 #else
-    ready = false; /* QEMU virt has no vibrator. */
+    /* QEMU virt has no vibrator, nor has the Galaxy Tab A7 Lite: its stock
+     * vendor partition has no vibrator HAL, and pulses of the PMIC's VIBR
+     * supply, which MediaTek's reference device tree names, are not felt. */
+    ready = false;
 #endif
 }
 

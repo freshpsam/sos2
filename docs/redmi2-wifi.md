@@ -14,9 +14,10 @@ signed MDT's layout; the secure monitor verifies its signatures at boot.
 
 ## Networks and profiles
 
-**WI-FI → Scan Networks** lists up to 16 networks; pick one, enter its
-password and tap **Connect**. The keyboard is ASCII, and without a saved
-profile the radio stays idle until you scan.
+**WI-FI → Scan Networks** lists up to 128 networks across pages; pick one,
+enter its password and tap **Connect**. If more networks are discovered,
+the list says **Some networks could not be listed**. The keyboard is ASCII,
+and without a saved profile the radio stays idle until you scan.
 
 - Supported: open, WPA2-Personal (CCMP) and WPA3-SAE, with no silent
   downgrade, on 2.4 GHz channels 1–11.

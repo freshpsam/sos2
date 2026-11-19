@@ -18,7 +18,7 @@ void page_host_back(void);
 void page_host_home(void);
 void page_host_wheel(const struct pointer_event *point, int32_t dx, int32_t dy);
 void page_host_render(void);
-int32_t page_host_present(unsigned slot, const struct vm_space *space, uint32_t address,
+int32_t page_host_present(unsigned slot, const struct vm_space *space, user_ptr address,
                           uint32_t bytes);
 int32_t page_host_present_damage(unsigned slot, const struct vm_space *,
                                  const struct user_present_damage *);
@@ -50,10 +50,14 @@ void page_host_redraw(void);
 void page_host_redraw_region(unsigned x, unsigned y, unsigned width, unsigned height,
                              void (*paint)(struct framebuffer *, unsigned, unsigned));
 void page_host_network_status(const char *);
-void page_host_device_status(bool clock_ready, bool random_ready, bool storage_ready,
-                             bool session_only);
-void page_host_clock_status(bool ready);
+void page_host_device_status(bool random_ready, bool storage_ready, bool session_only);
+/* The wall time was set or lost: the header's clock follows. */
+void page_host_clock_status(void);
 void page_host_entropy_status(bool ready, const char *error);
+/* A touch screen or USB link that failed to start (the tablet's) says why
+ * in the status lines; NULL when it works. */
+void page_host_touch_status(const char *error);
+void page_host_usb_status(const char *error);
 bool page_host_browser_command(unsigned slot, struct user_browser_command *);
 int32_t page_host_browser_state(unsigned slot, const struct user_browser_state *);
 #endif

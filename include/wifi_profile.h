@@ -6,7 +6,8 @@
 
 enum wifi_security { WIFI_OPEN, WIFI_WPA2_PSK, WIFI_WPA3_SAE };
 
-enum { WIFI_PROFILE_BYTES = 160, WIFI_NETWORK_MAX = 16 };
+/* Leave room for later-scanned channels in crowded deployments. */
+enum { WIFI_PROFILE_BYTES = 160, WIFI_NETWORK_MAX = 128 };
 
 struct wifi_profile {
     unsigned char mac[6], ssid[32], pmk[32], password[64];

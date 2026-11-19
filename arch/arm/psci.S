@@ -1,9 +1,12 @@
     .syntax unified
     .arm
     .text
-    .global arm_psci_cpu_on
-    .type arm_psci_cpu_on, %function
-arm_psci_cpu_on:
+/* int32_t arm_psci_call(unsigned method, uint32_t function, uintptr_t a,
+ * uintptr_t b): a PSCI call with a, b and 0 as its arguments (CPU_ON's
+ * context ID), through HVC when method is CPU_BOOT_HVC (2), else SMC. */
+    .global arm_psci_call
+    .type arm_psci_call, %function
+arm_psci_call:
     push    {r4-r8, lr}
     mov     r4, r0
     mov     r0, r1
@@ -16,5 +19,5 @@ arm_psci_cpu_on:
     b       2f
 1:  smc     #0
 2:  pop     {r4-r8, pc}
-    .size arm_psci_cpu_on, .-arm_psci_cpu_on
+    .size arm_psci_call, .-arm_psci_call
     .section .note.GNU-stack, "", %progbits

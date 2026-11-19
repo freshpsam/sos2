@@ -16,15 +16,3 @@ def find_tool(env_var, executable, package):
         return str(local_root / "usr/bin" / executable), local_root
     return None, None
 
-
-def prepend_library_path(directory):
-    """Prefer a local copy's libraries in this process and its children.
-
-    An empty LD_LIBRARY_PATH entry means the current directory to ld.so, so none is
-    added, and repeated calls do not stack copies of the same directory.
-    """
-    directory = str(directory)
-    current = os.environ.get("LD_LIBRARY_PATH", "")
-    entries = current.split(":") if current else []
-    if directory not in entries:
-        os.environ["LD_LIBRARY_PATH"] = ":".join([directory, *entries])

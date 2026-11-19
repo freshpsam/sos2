@@ -32,8 +32,7 @@ void AXObjectCache::attachWrapper(AccessibilityObject &) { }
 void AXObjectCache::nodeTextChangePlatformNotification(AccessibilityObject *, AXTextChange,
                                                        unsigned, const String &) { }
 
-void AXObjectCache::platformHandleFocusedUIElementChanged(AccessibilityObject *,
-                                                          AccessibilityObject *) { }
+void AXObjectCache::platformHandleFocusedUIElementChanged(Element *, Element *) { }
 
 void AXObjectCache::platformPerformDeferredCacheUpdate() { }
 

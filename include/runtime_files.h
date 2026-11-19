@@ -1,6 +1,8 @@
 #ifndef SOS2_RUNTIME_FILES_H
 #define SOS2_RUNTIME_FILES_H
-#include "fdt.h"
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #define RUNTIME_FILES_BASE  0x50000000u
 #define RUNTIME_FILES_LIMIT 0x60000000u
 
@@ -8,6 +10,8 @@ struct runtime_file {
     char name[128];
     uint32_t offset, size;
 };
+
+struct platform_devices;
 
 bool runtime_files_init(struct platform_devices *devices, uintptr_t dtb, uintptr_t kernel_start,
                         uintptr_t kernel_end);

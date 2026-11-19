@@ -19,18 +19,22 @@
 #include <WebCore/Settings.h>
 #include <WebCore/WebAnimation.h>
 #include <WebCore/Region.h>
+#include <WebCore/RenderLayer.h>
+#include <WebCore/RenderLayerCompositor.h>
+#include <WebCore/RenderView.h>
 #include <WebCore/Scrollbar.h>
 #include <pal/SessionID.h>
+#include <JavaScriptCore/InitializeThreading.h>
+#include <JavaScriptCore/Options.h>
 #include <wtf/MainThread.h>
 #include <wtf/RunLoop.h>
 #include <wtf/text/WTFString.h>
 #include <skia/core/SkSurface.h>
 #include <skia/core/SkCanvas.h>
 #include <sos2/services.h>
-#if USE(MIMALLOC)
 #include <bmalloc/mimalloc.h>
-#endif
 #include <time.h>
+#include <algorithm>
 #include <vector>
 #include "web_input.h"
 #include "web_storage.h"
@@ -52,12 +56,6 @@ using namespace WebCore;
 using namespace WTF;
 using SOS2::microseconds;
 static constexpr unsigned pageWidth = 480, pageHeight = 752;
-// Layer compositing (web_compositor.h). False paints the whole view directly.
-static constexpr bool layerCompositing = true;
-// Paint with Skia's GPU backend when the kernel offers a GPU (web_gpu.h).
-static constexpr bool gpuRasterization = true;
-// With GPU painting, composite with WebKit's compositor (web_gpu_compositor.h).
-static constexpr bool gpuCompositing = true;
 
 // The page's compositors: WebKit's when the page paints on the GPU, else the
 // CPU one. The choice is made once, before WebCore creates any layer.
@@ -69,10 +67,43 @@ struct Compositors {
     bool usesGPU() const { return gpu && current == gpu.get(); }
 };
 
-// After a GPU loss, once WebCore has dropped its layers: CSS animations WebKit's
-// compositor was running would otherwise stay frozen, since WebCore still
-// counts them as accelerated. Stopping their acceleration hands them back to
-// WebCore, which then animates them on the page thread.
+// A blending layer can share a backing with an ancestor while its backdrop
+// lives in another backing. WebCore needs the whole page to blend it correctly.
+static bool needsBlendFallback(Page &page) {
+    for (RefPtr<Frame> frame = &page.mainFrame(); frame; frame = frame->tree().traverseNext()) {
+        auto *local = dynamicDowncast<LocalFrame>(*frame);
+        auto *view = local ? local->contentRenderer() : nullptr;
+        for (auto *layer = view ? view->layer() : nullptr; layer;) {
+            if (layer->blendMode() != BlendMode::Normal)
+                return true;
+            if (auto *child = layer->firstChild()) {
+                layer = child;
+                continue;
+            }
+            while (layer && !layer->nextSibling()) layer = layer->parent();
+            if (layer) layer = layer->nextSibling();
+        }
+    }
+    return false;
+}
+
+static void setLayerCompositing(Page &page, bool enabled) {
+    page.settings().setAcceleratedCompositingEnabled(enabled);
+    for (RefPtr<Frame> frame = &page.mainFrame(); frame; frame = frame->tree().traverseNext()) {
+        auto *local = dynamicDowncast<LocalFrame>(*frame);
+        auto *view = local ? local->contentRenderer() : nullptr;
+        auto *root = view ? view->layer() : nullptr;
+        if (!root) continue;
+        // Re-evaluate even unchanged layers, such as a will-change element.
+        // With no backing, WebCore only starts the traversal for a dirty child.
+        root->setDescendantsNeedCompositingRequirementsTraversal();
+        if (auto *child = root->firstChild()) child->setNeedsPostLayoutCompositingUpdate();
+        view->compositor().updateCompositingLayers(CompositingUpdateType::AfterStyleChange);
+    }
+}
+
+// Once WebCore drops its layers, hand compositor animations back to the page
+// thread so that direct painting uses the current transform, opacity and filters.
 static void handBackAcceleratedAnimations(Page &page) {
     for (RefPtr<Frame> frame = &page.mainFrame(); frame; frame = frame->tree().traverseNext()) {
         auto *local = dynamicDowncast<LocalFrame>(*frame);
@@ -264,10 +295,37 @@ public:
 };
 
 int main() {
-#if USE(MIMALLOC)
     // MADV_DONTNEED only zeroes SOS2 pages and frees nothing: never purge.
     mi_option_set(mi_option_purge_delay, -1);
+    // SOS2 commits memory when it is mapped, so JavaScriptCore's address space
+    // reservations (the JIT pool, and on 64-bit the structure heap) are cut to
+    // what pages use. A process has 16 threads and WebKit stops a page that
+    // cannot start one, so GC marking adds at most 3 threads and the JIT
+    // worklist 2, leaving room for workers and image decoders.
+    // ScriptController's own JSC::initialize() below then does nothing.
+    JSC::initialize([] {
+#if CPU(ADDRESS64)
+        JSC::Options::structureHeapSizeInKB() = 16 * 1024;
+        JSC::Options::jitMemoryReservationSize() = 16 * MB;
+#else
+        // One region, within the ARMv7 JIT's direct branch range (16 MiB).
+        // Pages compile under 1 MiB of code (Wikipedia: 0.9 MiB), and every
+        // page maps the whole pool.
+        JSC::Options::jitMemoryReservationSize() = 4 * MB;
+        // Pages map memory only in the SDK's 128 MiB mmap range: the rest of
+        // the quota that ramSize() reports is the newlib break, which the
+        // engine's allocator never grows (sdk/runtime/internal.h). The heap
+        // grows by the smaller figure.
+        JSC::Options::forceRAMSize() = 128 * MB;
 #endif
+        JSC::Options::numberOfGCMarkers() = std::min(JSC::Options::numberOfGCMarkers(), 4u);
+        JSC::Options::minNumberOfWorklistThreads() = 1;
+        JSC::Options::maxNumberOfWorklistThreads() = 2;
+        // The sos2.jsc= boot argument, such as useDFGJIT=false (LLInt and the
+        // baseline JIT) or useJIT=false (LLInt alone); a bad one stops here.
+        if (const char* options = sos2_engine_options())
+            RELEASE_ASSERT(JSC::Options::setOptions(options));
+    });
     ScriptController::initializeMainThread();
     ProcessCapabilities::setCanUseAcceleratedBuffers(false);
     SOS2::installPlatformStrategies();
@@ -289,7 +347,8 @@ int main() {
     settings.setScriptEnabled(true);
     settings.setImagesEnabled(true);
     settings.setLoadsImagesAutomatically(true);
-    settings.setAcceleratedCompositingEnabled(layerCompositing);
+    // Layer compositing (web_compositor.h).
+    settings.setAcceleratedCompositingEnabled(true);
     // Pages never zoom, so the visual viewport is always the layout viewport.
     // With WebCore's visual-viewport mode on, each scroll step moves the layout
     // viewport and lays out and repaints every fixed-position element; without
@@ -331,10 +390,12 @@ int main() {
     schedule.pixels = pixels.data();
     schedule.surface = surface.get();
     std::unique_ptr<SOS2::GPURaster> gpu;
-    if (gpuRasterization) gpu = SOS2::GPURaster::create(pageWidth, pageHeight);
+    // Skia's GPU backend when the kernel offers a GPU (web_gpu.h), and with it
+    // WebKit's compositor (web_gpu_compositor.h).
+    gpu = SOS2::GPURaster::create(pageWidth, pageHeight);
     schedule.gpu = gpu.get();
     // No layer exists yet: the first compositing update uses this compositor.
-    if (gpu && gpuCompositing &&
+    if (gpu &&
         (compositors.gpu = SOS2::GPUCompositor::create(pageWidth, pageHeight))) {
         // Layer tiles and canvases may then be GPU buffers.
         ProcessCapabilities::setCanUseAcceleratedBuffers(true);
@@ -344,8 +405,8 @@ int main() {
         settings.setAcceleratedCompositingForFixedPositionEnabled(true);
         compositors.current = compositors.gpu.get();
     }
-    // Set by a GPU loss while WebKit's compositor was in use.
-    bool compositorLost = false;
+    bool blendFallback = false;
+    bool handBackAnimations = false;
     // Lost for good: repaint and present everything on the CPU.
     auto loseGPU = [&] {
         gpu.reset();
@@ -359,7 +420,7 @@ int main() {
             compositors.gpu->lose();
             ProcessCapabilities::setCanUseAcceleratedBuffers(false);
             settings.setAcceleratedCompositingEnabled(false);
-            compositorLost = true;
+            handBackAnimations = true;
         }
         compositors.current->redrawAll();
         schedule.updatePending = true;
@@ -416,15 +477,27 @@ int main() {
             schedule.updatePending = false;
             if (update) {
                 page->isolatedUpdateRendering();
+                // Let WebCore take over both painting and animation when a
+                // blend needs its backdrop, keeping GPU raster and presentation.
+                if (gpu && compositors.usesGPU()) {
+                    bool flatten = needsBlendFallback(page.get());
+                    if (flatten != blendFallback) {
+                        blendFallback = flatten;
+                        setLayerCompositing(page.get(), !flatten);
+                        handBackAnimations |= flatten;
+                        schedule.invalidate(IntRect(0, 0, pageWidth, pageHeight));
+                        schedule.updatePending = true;
+                        continue;
+                    }
+                }
+                if (std::exchange(handBackAnimations, false)) {
+                    handBackAcceleratedAnimations(page.get());
+                    schedule.updatePending = true;
+                }
                 // Layer backings repaint inside WebCore's layer flush.
                 if (compositor->active()) {
                     frame->view()->flushCompositingStateIncludingSubframes();
                     compositor->commit();
-                }
-                // That update dropped the layers after a GPU loss.
-                if (std::exchange(compositorLost, false)) {
-                    handBackAcceleratedAnimations(page.get());
-                    schedule.updatePending = true;
                 }
             }
             bool composited = compositor->active();

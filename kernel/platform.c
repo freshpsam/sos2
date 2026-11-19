@@ -3,6 +3,9 @@
 #include "graphics.h"
 #include "display.h"
 #include "haptics.h"
+#ifdef SOS2_BOARD_GTA7LITE
+#include "gta7lite.h"
+#endif
 
 static struct framebuffer *panic_screen;
 
@@ -36,22 +39,22 @@ static int panic_lines(int y, const char *text, bool draw) {
 }
 
 uint64_t time_us(void) {
-    /* ARM architectural generic timer: virtual count and its frequency.
-     * MRRC reads both counter halves atomically, avoiding a rollover race. */
-    uint32_t low, high, frequency;
-    __asm__ volatile("mrrc p15, 1, %0, %1, c14" : "=r"(low), "=r"(high));
-    __asm__ volatile("mrc p15, 0, %0, c14, c0, 0" : "=r"(frequency));
+    /* ARM architectural generic timer: virtual count and its frequency. */
+    uint64_t count = arch_counter();
+    uint32_t frequency = arch_counter_frequency();
     if (!frequency) panic("architected timer has zero frequency");
-    return user_timer_us(((uint64_t)high << 32) | low, frequency);
+    return user_timer_us(count, frequency);
+}
+
+void delay_us(uint64_t us) {
+    for (uint64_t start = time_us(); time_us() - start < us;) { }
 }
 
 _Noreturn void panic(const char *message) {
     /* No loop is left to end a buzz. Only CPU 0 drives the vibrator, and its
      * SPMI wait reads the timer, whose zero frequency is itself a panic. */
-    uint32_t mpidr, frequency;
-    __asm__ volatile("mrc p15, 0, %0, c0, c0, 5" : "=r"(mpidr));
-    __asm__ volatile("mrc p15, 0, %0, c14, c0, 0" : "=r"(frequency));
-    if (!(mpidr & 0xffffff) && frequency) haptics_panic();
+    uint32_t affinity = arch_cpu_affinity(), frequency = arch_counter_frequency();
+    if (!affinity && frequency) haptics_panic();
     if (panic_screen) {
         static const char stopped[] = "Boot stopped. Restart the device.";
         int bottom = panic_lines(panic_lines(52, message, false) + 12, stopped, false);
@@ -62,5 +65,21 @@ _Noreturn void panic(const char *message) {
         barrier();
         display_flush_error();
     }
-    for (;;) __asm__ volatile("wfe");
+#ifdef SOS2_BOARD_GTA7LITE
+    /* LK leaves the watchdog running, and its reset would take the message.
+     * On CPU 0 the USB link stays up, started now if it was not yet: the
+     * computer can restart the tablet, or flash a fixed system. */
+    bool usb = !affinity && !gta7lite_usb_init();
+    if (usb) {
+        gta7lite_fastboot_panic();
+        gta7lite_usb_connect();
+    }
+    for (;;) {
+        gta7lite_watchdog_feed();
+        if (usb) gta7lite_usb_poll();
+        for (uint64_t at = arch_counter(); arch_counter() - at < frequency / 1000;) { }
+    }
+#else
+    for (;;) arch_wait_event();
+#endif
 }

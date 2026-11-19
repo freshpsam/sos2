@@ -1,14 +1,44 @@
 #ifndef SOS2_USER_ABI_H
 #define SOS2_USER_ABI_H
-#define USER_BASE            0x10000000u
-#define USER_END             0x30000000u
-#define WEB_IMAGE_BASE       0x11000000u
-#define WEB_IMAGE_END        0x18000000u
-#define WEB_STACK_BOTTOM     0x2fd80000u
-#define WEB_STACK_TOP        0x2ff80000u
-#define USER_HEAP_BASE       0x20000000u
-#define USER_HEAP_END        0x2f000000u
+/* The user address window. arm64's lies above 4 GiB, where truncating an
+ * address to 32 bits faults instead of reaching other memory. */
+#ifdef __aarch64__
+#define USER_BASE        0x1000000000
+#define USER_END         0x1100000000
+#define WEB_IMAGE_BASE   0x1010000000
+#define WEB_IMAGE_END    0x1020000000
+/* The engine's JIT window: the only pages that may be writable and executable
+ * at once, and only in web page processes. */
+#define USER_JIT_BASE    0x1020000000
+#define USER_JIT_END     0x1024000000
+#define WEB_STACK_BOTTOM 0x10ffb80000
+#define WEB_STACK_TOP    0x10fff80000
+#define USER_HEAP_BASE   0x1040000000
+#define USER_HEAP_END    0x1080000000
+#else
+#define USER_BASE        0x10000000u
+#define USER_END         0x30000000u
+#define WEB_IMAGE_BASE   0x11000000u
+#define WEB_IMAGE_END    0x18000000u
+#define USER_JIT_BASE    0x18000000u
+#define USER_JIT_END     0x1a000000u
+#define WEB_STACK_BOTTOM 0x2fd80000u
+#define WEB_STACK_TOP    0x2ff80000u
+#define USER_HEAP_BASE   0x20000000u
+#define USER_HEAP_END    0x2f000000u
+#endif
+/* A web page process starts with x2 (r2 on ARM32) pointing to the sos2.jsc=
+ * boot argument's value above its initial stack (NUL-terminated, at most this
+ * many bytes with the NUL), or 0 without one. */
+#define USER_ENGINE_OPTIONS_MAX 128u
+/* Each process's memory: 192 MiB, or 384 MiB for the 64-bit engine, whose
+ * pages take 1.6-1.8 times as much (wider objects, a committed JIT pool and
+ * structure heap). */
+#ifdef __aarch64__
+#define USER_PAGE_QUOTA      98304u
+#else
 #define USER_PAGE_QUOTA      49152u
+#endif
 #define SYS_EXIT             0
 #define SYS_YIELD            1
 #define SYS_SLEEP            2
@@ -68,13 +98,23 @@
 #define SYS_FILE_LOCK        69
 #define SYS_HAPTIC_TAP       70
 #define SYS_UPDATE           71
-#define SYS_COUNT            72
+/* ARM32 only: makes code just written into the JIT window (address, size)
+ * visible to instruction fetch, which AArch32 user mode cannot do itself.
+ * Handled on the calling CPU without ending its slice; 0 or USER_EINVAL. */
+#define SYS_ICACHE_SYNC      72
+#define SYS_COUNT            73
 #define USER_FRAME_RECTS     12u
 #define USER_SURFACE_VISIBLE 1u
 /* The display shows the page's GPU frames (USER_GPU_PRESENT). Once clear, a
  * failed GPU, it stays clear: the page must present CPU frames. */
 #define USER_SURFACE_GPU_FRAMES 2u
 #define USER_THREAD_LIMIT       16u
+/* A thread's stack pointer and stack size alignment. */
+#ifdef __aarch64__
+#define USER_STACK_ALIGN 16u
+#else
+#define USER_STACK_ALIGN 8u
+#endif
 #define USER_WAIT_FOREVER       0xffffffffu
 #define USER_PROT_READ          1u
 #define USER_PROT_WRITE         2u
@@ -93,6 +133,15 @@
 #define FILE_DIR                2u
 #ifndef __ASSEMBLER__
 #include <stdint.h>
+
+/* A user address, and the ABI's pointer-sized fields: 32 bits on ARM32 and
+ * 64 bits on arm64. Structures the kernel fills hold only pointer-sized
+ * fields, so they have no padding on arm64 either. */
+#ifdef __aarch64__
+typedef uint64_t user_ptr;
+#else
+typedef uint32_t user_ptr;
+#endif
 
 /* Microseconds from a generic timer count. The kernel's clock and wait
  * deadlines and the SDK's CLOCK_MONOTONIC both convert with it, so they agree. */
@@ -118,20 +167,31 @@ struct user_dir_entry {
 };
 
 struct user_thread_start {
-    uint32_t entry, argument, stack, size, tls, completion;
+    user_ptr entry, argument, stack, size, tls, completion;
 };
 
 struct user_thread_info {
-    uint32_t id, stack, size, tls;
+    user_ptr id, stack, size, tls;
 };
 
+/* The registers: on arm64 x0-x30, sp, pc and pstate, then v0-v31 (two words
+ * each), FPSR and FPCR; on ARM32 r0-r12, sp, lr, pc and cpsr. */
+#ifdef __aarch64__
+struct user_thread_context {
+    uint64_t r[31], sp, pc, pstate;
+    uint64_t v[64];
+    uint32_t fpsr, fpcr;
+};
+#else
 struct user_thread_context {
     uint32_t r[13], sp, lr, pc, cpsr;
 };
+#endif
 
 /* Damage is in the fixed WEB_WIDTH by WEB_HEIGHT pixel buffer. */
 struct user_present_damage {
-    uint32_t pixels, x, y, width, height;
+    user_ptr pixels;
+    uint32_t x, y, width, height;
 };
 
 struct user_pixel_rect {
@@ -170,7 +230,9 @@ struct user_pixel_rect {
     X(94,8) X(31,16)                       /* RGBA16F, RGBA32F */
 
 struct user_gpu_caps {
-    uint32_t capset, buffer, size;
+    uint32_t capset;
+    user_ptr buffer;
+    uint32_t size;
 };
 
 struct user_gpu_resource {
@@ -179,11 +241,13 @@ struct user_gpu_resource {
 };
 
 struct user_gpu_transfer {
-    uint32_t handle, level, x, y, z, width, height, depth, offset, stride, layer_stride, data;
+    uint32_t handle, level, x, y, z, width, height, depth, offset, stride, layer_stride;
+    user_ptr data;
 };
 
 struct user_gpu_submit {
-    uint32_t commands, bytes;
+    user_ptr commands;
+    uint32_t bytes;
 };
 
 /* USER_GPU_PRESENT shows one of the page's resources as the page: a 2D
@@ -206,7 +270,8 @@ struct user_pixel_scroll {
 };
 
 struct user_present_frame {
-    uint32_t pixels, count;
+    user_ptr pixels;
+    uint32_t count;
     struct user_pixel_scroll scroll;
     struct user_pixel_rect damage[USER_FRAME_RECTS];
 };
@@ -223,7 +288,11 @@ struct user_present_frame {
  * returns how many it filled; REMOVE removes the installed app whose id
  * address holds (size 16). CANCEL drops the caller's
  * unfinished file, as when its download failed, and leaves USER_UPDATE_IDLE.
- * RESTART restarts the device. INFO fills struct user_update_info. Address
+ * Once a system update writes the boot image, it finishes even if its updater
+ * ends, and BEGIN, CANCEL and RESTART return USER_EBUSY until it has.
+ * RESTART restarts the device; DOWNLOAD restarts it into its bootloader's
+ * download mode, where INFO's USER_UPDATE_DOWNLOAD_MODE says it can (the
+ * Galaxy Tab A7 Lite's), and returns USER_ENODEV elsewhere. INFO fills struct user_update_info. Address
  * and size are 0 where unused. A failure leaves USER_UPDATE_FAILED and a
  * message. */
 #define USER_UPDATE_INFO      0
@@ -234,11 +303,12 @@ struct user_present_frame {
 #define USER_UPDATE_APPS      5
 #define USER_UPDATE_REMOVE    6
 #define USER_UPDATE_CANCEL    7
+#define USER_UPDATE_DOWNLOAD  8
 #define USER_UPDATE_HEADER    4096u
 #define USER_UPDATE_WRITE_MAX 65536u
-/* States: RECEIVING after BEGIN; CHECKING while FINISH reads a written system
- * back, WRITING while it writes the boot image; DONE once a file is installed
- * or an app removed. */
+/* States: RECEIVING after BEGIN; WRITING while FINISH writes a system
+ * update's boot image, then CHECKING while it reads it back; DONE once a file
+ * is installed or an app removed. */
 #define USER_UPDATE_IDLE      0
 #define USER_UPDATE_RECEIVING 1
 #define USER_UPDATE_CHECKING  2
@@ -246,9 +316,10 @@ struct user_present_frame {
 #define USER_UPDATE_DONE      4
 #define USER_UPDATE_FAILED    5
 /* flags: this boot installs files, else BEGIN refuses them; an installed
- * system update waits for a restart. */
-#define USER_UPDATE_INSTALLS    1u
-#define USER_UPDATE_RESTART_DUE 2u
+ * system update waits for a restart; DOWNLOAD works here. */
+#define USER_UPDATE_INSTALLS      1u
+#define USER_UPDATE_RESTART_DUE   2u
+#define USER_UPDATE_DOWNLOAD_MODE 4u
 /* An app's flags: installed from a package, else built in; running; built
  * for another USER_ABI_VERSION, so it does not start until it is updated. */
 #define USER_APP_STORED  1u
@@ -256,8 +327,13 @@ struct user_present_frame {
 #define USER_APP_STALE   4u
 /* The ABI native apps are built for (include/app_store.h): the kernel starts
  * only apps built for its own. Raise it when a change breaks programs built
- * before it. */
+ * before it. arm64's carries EM_AARCH64 (183) above it, so the two never
+ * match. tools/package_redmi2.py reads both from these defines. */
+#ifndef __aarch64__
 #define USER_ABI_VERSION 1
+#else
+#define USER_ABI_VERSION ((183u << 16) | 1)
+#endif
 
 struct user_update_info {
     uint32_t state, flags, done, total; /* done/total: bytes of the state's work */

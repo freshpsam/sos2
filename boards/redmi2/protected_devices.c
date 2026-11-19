@@ -40,6 +40,7 @@ static void sleep_set_step(uint64_t now);
 static volatile bool standby_wanted;
 static unsigned request_id, running_id, network_count, scan_generation;
 static struct wifi_network networks[WIFI_NETWORK_MAX];
+static bool scan_truncated;
 static struct net_device *network_device;
 static const char *failure_reason;
 static struct mbedtls_hmac_drbg_context auth_random;
@@ -50,8 +51,7 @@ static struct {
     unsigned char data[1514];
 } received[8];
 
-static unsigned receive_head, receive_count, receive_dropped;
-static unsigned discard_base;
+static unsigned receive_head, receive_count;
 static unsigned char random_pool[512];
 static unsigned random_head, random_count;
 static bool random_wanted;
@@ -131,10 +131,7 @@ static bool send_wire(void *p, const void *data, unsigned size, bool is_data) {
 
 static void ethernet(void *p, const void *data, unsigned size) {
     (void)p;
-    if (size > 1514 || receive_count == 8) {
-        ++receive_dropped;
-        return;
-    }
+    if (size > 1514 || receive_count == 8) return;
     unsigned at = (receive_head + receive_count) % 8;
     memcpy(received[at].data, data, size);
     received[at].size = size;
@@ -167,6 +164,7 @@ static void discovered(void *p, const struct wifi_network *network) {
             !memcmp(networks[i].ssid, network->ssid, network->ssid_length))
             return;
     if (network_count < WIFI_NETWORK_MAX) networks[network_count++] = *network;
+    else scan_truncated = true;
 }
 
 static int seed_random(void *p, unsigned char *out, size_t size) {
@@ -186,10 +184,6 @@ static int authentication_random(void *p, unsigned char *out, size_t size) {
 static void poll(void (*receive)(const void *, unsigned)) {
     /* lwIP stays on the main loop. Only bounded copies cross from the radio
      * worker, so expensive SAE/entropy operations cannot freeze the shell. */
-    if (link())
-        network_device->rx_discarded = dxe.dropped + station.rx_data_seen -
-                                       station.rx_data_admitted + receive_dropped - discard_base;
-    network_device->tx_status = wcn_hal_tx_status(&hal);
     while (receive_count) {
         if (link()) {
             ++network_device->rx_packets;
@@ -303,6 +297,7 @@ static void radio_poll(void) {
         survey_requested = false;
         if (survey) {
             network_count = 0;
+            scan_truncated = false;
             ++scan_generation;
         }
         if (!start_station(now, survey)) return;
@@ -339,6 +334,7 @@ static void radio_poll(void) {
             survey_requested = false;
             if (survey) {
                 network_count = 0;
+                scan_truncated = false;
                 ++scan_generation;
             }
             if (!start_station(time_us(), survey)) return;
@@ -353,11 +349,8 @@ static void radio_poll(void) {
         fail(station.error);
         return;
     }
-    if (!linked && link()) {
-        linked = true;
-        discard_base =
-            dxe.dropped + station.rx_data_seen - station.rx_data_admitted + receive_dropped;
-    } else if (linked && !link()) {
+    if (!linked && link()) linked = true;
+    else if (linked && !link()) {
         linked = false;
         receive_head = receive_count = 0;
     }
@@ -503,14 +496,15 @@ static void scan_networks(void) {
 }
 
 static void snapshot(struct wifi_radio_view *out) {
-    *out = (struct wifi_radio_view){
-        .message = redmi2_wifi_status(),
-        .detail = boot.firmware_detail[0] ? boot.firmware_detail : network_status_detail(),
-        .count = network_count,
-        .scan_generation = scan_generation,
-        .request_id = running_id,
-        .startup_pending = stop_pending || (enabled && !failed && !startup_complete)};
-    memcpy(out->networks, networks, sizeof(networks));
+    /* Every field before the network list, then the networks found. */
+    memset(out, 0, offsetof(struct wifi_radio_view, networks));
+    out->message = redmi2_wifi_status();
+    out->count = network_count;
+    out->scan_generation = scan_generation;
+    out->scan_truncated = scan_truncated;
+    out->request_id = running_id;
+    out->startup_pending = stop_pending || (enabled && !failed && !startup_complete);
+    memcpy(out->networks, networks, network_count * sizeof(*networks));
     if (failed) out->state = WIFI_RADIO_FAILED;
     else if (!enabled) out->state = WIFI_RADIO_UNAVAILABLE;
     else if (!station_started) out->state = radio_ready ? WIFI_RADIO_IDLE : WIFI_RADIO_STARTING;
@@ -533,6 +527,9 @@ static void cooperate(void *unused) {
     kernel_io_wait();
 }
 
+static bool wifi_service_pending(void);
+static void wifi_service(void *);
+
 bool redmi2_wifi_init(const struct platform_devices *devices, struct net_device *out) {
     (void)devices;
     enabled = failed = opened = station_started = stop_pending = linked = servicing = rng_ready =
@@ -546,8 +543,9 @@ bool redmi2_wifi_init(const struct platform_devices *devices, struct net_device 
     sleep_set_deadline = 0;
     restart_requested = survey_requested = survey_resume = radio_ready = startup_complete = false;
     request_id = running_id = network_count = scan_generation = 0;
+    scan_truncated = false;
     network_device = out;
-    receive_head = receive_count = receive_dropped = 0;
+    receive_head = receive_count = 0;
     failure_reason = 0;
     wifi_port_reset();
     wifi_port_set_yield(cooperate, 0);
@@ -561,7 +559,7 @@ bool redmi2_wifi_init(const struct platform_devices *devices, struct net_device 
     struct wifi_profile bootstrap;
     bool imported = wifi_profile_read(&bootstrap, config.data, config.size);
     const struct wifi_setup_ops ops = {
-        start_radio,     redmi2_wifi_service_pending, redmi2_wifi_service, snapshot, scan_networks,
+        start_radio,     wifi_service_pending, wifi_service, snapshot, scan_networks,
         connect_profile, wifi_auth_credential};
     wifi_setup_init(&ops, imported ? &bootstrap : 0);
     wifi_secret_clear(&bootstrap, sizeof(bootstrap));
@@ -581,12 +579,12 @@ size_t redmi2_wifi_random(void *out, size_t size) {
     return size;
 }
 
-bool redmi2_wifi_service_pending(void) {
+static bool wifi_service_pending(void) {
     return stop_pending || (enabled && !failed && time_us() >= next_service) ||
            (enabled && !failed && random_wanted && random_count < 256 && entropy_available());
 }
 
-void redmi2_wifi_service(void *unused) {
+static void wifi_service(void *unused) {
     (void)unused;
     if (stop_pending) {
         wcn_dxe_stop(&dxe);

@@ -7,7 +7,7 @@
  * on process exit. */
 struct gpu_client;
 int gpu_client_call(struct gpu_client **state, const struct vm_space *space, unsigned slot,
-                    uint32_t op, uint32_t address, uint32_t size);
+                    uint32_t op, user_ptr address, uint32_t size);
 void gpu_client_close(struct gpu_client **state);
 /* Backing pages kept for good after an unconfirmed GPU reset: they never
  * return to the pool, so they do not count as a process page leak. */

@@ -68,7 +68,7 @@ bool qcom_mdt_prepare(firmware_lookup lookup, void *context, struct qcom_mdt *ou
         hash = (struct firmware_file){p + auth_header, hash_size};
     else hash = segment(lookup, context, file, hp, hash_index, false);
     if (!hash.data) return false;
-    struct qcom_mdt plan = {.span = high - low, .metadata_size = auth_header + hash_size};
+    struct qcom_mdt plan = {.span = high - low};
     for (unsigned i = 1; i < count; ++i) {
         const unsigned char *ph = p + 52 + i * 32;
         uint32_t memory = le32(ph + 20), bytes = le32(ph + 16), address = le32(ph + 12);

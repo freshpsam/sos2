@@ -4,7 +4,7 @@
 
 /* Native apps. Built in: from the resource bundle, one directory each,
  * /apps/<id>/:
- *   program  static ARM32 ELF built with the SDK (tools/build_native_apps.py)
+ *   program  static ELF built with the SDK (tools/build_native_apps.py)
  *   icon     APP_ICON_SIZE x APP_ICON_SIZE little-endian ARGB8888 pixels;
  *            alpha below 128 is transparent
  *   name     its launcher name, 1..APP_NAME_MAX printable ASCII characters
@@ -50,7 +50,7 @@ struct app {
 };
 
 /* Scan the bundle once it is mapped, then the app store; invalid entries are
- * skipped and logged. */
+ * skipped. */
 void apps_init(void);
 /* The apps the launcher shows, built in first: at most APP_LIMIT, none stale. */
 unsigned apps_count(void);

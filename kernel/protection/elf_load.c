@@ -1,20 +1,7 @@
 #include "elf_load.h"
 #include "platform.h"
 #include "kernel_io.h"
-
-struct elf_header {
-    unsigned char ident[16];
-    uint16_t type, machine;
-    uint32_t version, entry, phoff, shoff, flags;
-    uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx;
-};
-
-struct program_header {
-    uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
-};
-
-_Static_assert(sizeof(struct elf_header) == 52, "ELF32 header");
-_Static_assert(sizeof(struct program_header) == 32, "ELF32 segment");
+#include "arch/elf.h"
 
 /* Every page process runs the same immutable engine image. Its read-only
  * segments (code and constants) are loaded once into the shared block and
@@ -41,8 +28,8 @@ static bool share_segments(const void *image, size_t size, const struct program_
         const struct program_header *p = &headers[i];
         if (p->type != 1 || (p->flags & 2)) continue;
         /* The block is zeroed; copy file bytes in 64 KiB steps between polls. */
-        for (uint32_t offset = 0; offset < p->filesz; offset += 0x10000) {
-            uint32_t n = p->filesz - offset;
+        for (user_ptr offset = 0; offset < p->filesz; offset += 0x10000) {
+            size_t n = p->filesz - offset;
             if (n > 0x10000) n = 0x10000;
             memcpy(block + (size_t)shared_first[i] * PAGE_SIZE + offset,
                    (const unsigned char *)image + p->offset + offset, n);
@@ -64,15 +51,15 @@ static bool load_segments(struct vm_space *space, const void *image, size_t size
         unsigned permissions =
             VM_READ | ((p->flags & 2) ? VM_WRITE : 0) | ((p->flags & 1) ? VM_EXEC : 0);
         if (share && !(p->flags & 2)) {
-            for (uint32_t offset = 0; offset < p->memsz; offset += PAGE_SIZE) {
-                if (!vm_map_shared(space, p->vaddr + offset, shared_first[i] + offset / PAGE_SIZE,
-                                   permissions))
+            for (user_ptr offset = 0; offset < p->memsz; offset += PAGE_SIZE) {
+                if (!vm_map_shared(space, p->vaddr + offset,
+                                   shared_first[i] + (unsigned)(offset / PAGE_SIZE), permissions))
                     return false;
                 if ((offset & 0xffffu) == 0xf000u) kernel_io_wait();
             }
             continue;
         }
-        for (uint32_t offset = 0; offset < p->memsz; offset += PAGE_SIZE) {
+        for (user_ptr offset = 0; offset < p->memsz; offset += PAGE_SIZE) {
             /* Populate through the cached supervisor alias before publishing
              * executable permissions. vm_protect cleans the completed code to
              * the point of coherency; an I-cache invalidation alone cannot
@@ -101,9 +88,9 @@ static bool parse(const void *image, size_t size, struct elf_header *out,
     struct elf_header h;
     if (!image || size < sizeof(h)) return false;
     memcpy(&h, image, sizeof(h));
-    if (memcmp(h.ident, "\177ELF\1\1\1", 7) || h.type != 2 || h.machine != 40 || h.version != 1 ||
-        h.ehsize != sizeof(h) || h.phentsize != sizeof(struct program_header) || !h.phnum ||
-        h.phnum > 8 || h.phoff > size ||
+    if (memcmp(h.ident, ELF_IDENT, 7) || h.type != 2 || h.machine != ELF_MACHINE ||
+        h.version != 1 || h.ehsize != sizeof(h) || h.phentsize != sizeof(struct program_header) ||
+        !h.phnum || h.phnum > 8 || h.phoff > size ||
         h.phnum > (size - h.phoff) / sizeof(struct program_header) || (h.entry & 3))
         return false;
     memcpy(headers, (const unsigned char *)image + h.phoff, h.phnum * sizeof(headers[0]));
@@ -121,7 +108,7 @@ static bool parse(const void *image, size_t size, struct elf_header *out,
             (p->offset & (PAGE_SIZE - 1)) || !(p->flags & 4) || (p->flags & ~7u) ||
             ((p->flags & 3) == 3))
             return false;
-        uint32_t end = (p->vaddr + p->memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        user_ptr end = (p->vaddr + p->memsz + PAGE_SIZE - 1) & ~(user_ptr)(PAGE_SIZE - 1);
         for (unsigned j = 0; j < i; ++j) {
             const struct program_header *q = &headers[j];
             if (q->type == 1 && p->vaddr < q->vaddr + q->memsz && q->vaddr < end) return false;
@@ -140,7 +127,7 @@ bool elf_valid(const void *image, size_t size) {
 }
 
 bool elf_load(struct vm_space *space, const void *image, size_t size, bool shared,
-              uint32_t *entry) {
+              user_ptr *entry) {
     struct elf_header h;
     struct program_header headers[8];
     if (!entry || !parse(image, size, &h, headers)) return false;

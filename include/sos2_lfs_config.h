@@ -38,7 +38,13 @@ static inline uint32_t lfs_npw2(uint32_t a) {
 
 static inline uint32_t lfs_ctz(uint32_t a) { return __builtin_ctz(a); }
 
-static inline uint32_t lfs_popc(uint32_t a) { return __builtin_popcount(a); }
+/* Integer only: AArch64's libgcc counts bits with SIMD registers, which the
+ * kernel leaves to user code (arch/arm64/entry.S). */
+static inline uint32_t lfs_popc(uint32_t a) {
+    a -= (a >> 1) & 0x55555555u;
+    a = (a & 0x33333333u) + ((a >> 2) & 0x33333333u);
+    return (((a + (a >> 4)) & 0x0f0f0f0fu) * 0x01010101u) >> 24;
+}
 
 static inline int lfs_scmp(uint32_t a, uint32_t b) { return (int32_t)(a - b); }
 

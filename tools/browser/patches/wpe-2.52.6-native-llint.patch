@@ -1,0 +1,49 @@
+--- a/Source/JavaScriptCore/assembler/ARMv7Assembler.h
++++ b/Source/JavaScriptCore/assembler/ARMv7Assembler.h
+@@ -2886,6 +2886,12 @@ public:
+             linuxPageFlush(current, current + page);
+ 
+         linuxPageFlush(current, end);
++#elif OS(SOS2)
++        // SOS2 has no JIT, so no code is generated, and user code cannot
++        // maintain caches: the kernel cleans code that it makes executable.
++        UNUSED_PARAM(code);
++        UNUSED_PARAM(size);
++        RELEASE_ASSERT_NOT_REACHED();
+ #else
+ #error "The cacheFlush support is missing on this platform."
+ #endif
+--- a/Source/JavaScriptCore/offlineasm/arm.rb
++++ b/Source/JavaScriptCore/offlineasm/arm.rb
+@@ -980,6 +980,11 @@ class Instruction
+             $asm.puts "add #{dest.armOperand}, pc, #{dest.armOperand}"
+             $asm.puts "ldr #{dest.armOperand}, [#{dest.armOperand}, #{temp.armOperand}]"
+ 
++            # SOS2 runs static executables at their link addresses.
++            $asm.putStr("#elif OS(SOS2)")
++            $asm.puts "movw #{dest.armOperand}, :lower16:#{labelRef.asmLabel}"
++            $asm.puts "movt #{dest.armOperand}, :upper16:#{labelRef.asmLabel}"
++
+             # Throw a compiler error everywhere else.
+             $asm.putStr("#else")
+             $asm.putStr("#error Missing globaladdr implementation")
+--- a/Source/WTF/wtf/InlineASM.h
++++ b/Source/WTF/wtf/InlineASM.h
+@@ -70,7 +70,8 @@
+     || OS(HPUX)                \
+     || OS(NETBSD)              \
+     || OS(OPENBSD)             \
+-    || OS(QNX)
++    || OS(QNX)                 \
++    || OS(SOS2)
+     // ELF platform
+ #define HIDE_SYMBOL(name) ".hidden " #name
+ #else
+@@ -90,6 +91,7 @@
+     || OS(HURD)                \
+     || OS(NETBSD)              \
+     || OS(QNX)                 \
++    || OS(SOS2)                \
+     || OS(WINDOWS)
+     // GNU as-compatible syntax.
+ #define LOCAL_LABEL_STRING(name) ".L" #name

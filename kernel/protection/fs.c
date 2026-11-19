@@ -464,7 +464,7 @@ void fs_space_close(struct fs_space *s) {
     }
 }
 
-static int path_from_user(struct vm_space *vm, char *path, uint32_t address, uint32_t length) {
+static int path_from_user(struct vm_space *vm, char *path, user_ptr address, uint32_t length) {
     if (!length || length > USER_PATH_MAX) return USER_EINVAL;
     if (!vm_copy_from_user(vm, path, address, length)) return USER_EFAULT;
     if (path[0] != '/' || memchr(path, 0, length)) return USER_EINVAL;
@@ -864,16 +864,16 @@ int32_t fs_seek(struct fs_space *s, uint32_t handle, uint32_t offset) {
     return (int32_t)offset;
 }
 
-int32_t fs_call(struct fs_space *s, struct vm_space *vm, uint32_t number, uint32_t a, uint32_t b,
-                uint32_t c, uint32_t d) {
+int32_t fs_call(struct fs_space *s, struct vm_space *vm, uint32_t number, user_ptr a, user_ptr b,
+                user_ptr c, user_ptr d) {
     char path[128], other[128];
     if (number == SYS_FILE_OPEN || number == SYS_PATH_MKDIR || number == SYS_PATH_REMOVE ||
         number == SYS_PATH_RENAME || number == SYS_PATH_INFO || number == SYS_FS_INFO ||
         number == SYS_FILE_LOCK) {
-        int err = path_from_user(vm, path, a, b);
+        int err = path_from_user(vm, path, a, (uint32_t)b);
         if (err) return err;
-        if (number == SYS_FILE_OPEN) return open_file(s, path, c);
-        if (number == SYS_FILE_LOCK) return file_lock(s, path, c);
+        if (number == SYS_FILE_OPEN) return open_file(s, path, (uint32_t)c);
+        if (number == SYS_FILE_LOCK) return file_lock(s, path, (uint32_t)c);
         if (number == SYS_PATH_INFO) {
             struct user_file_info info;
             err = path_info(s, path, &info);
@@ -899,7 +899,7 @@ int32_t fs_call(struct fs_space *s, struct vm_space *vm, uint32_t number, uint32
             return vm_copy_to_user(vm, c, &info, sizeof(info)) ? 0 : USER_EFAULT;
         }
         if (number == SYS_PATH_RENAME) {
-            err = path_from_user(vm, other, c, d);
+            err = path_from_user(vm, other, c, (uint32_t)d);
             if (err) return err;
         }
         return path_operation(s, number, path, other);
@@ -927,7 +927,7 @@ int32_t fs_call(struct fs_space *s, struct vm_space *vm, uint32_t number, uint32
             if (!(h->flags & FILE_READ)) return USER_EBADF;
             if (c > USER_FILE_READ_MAX) return USER_EINVAL;
             uint32_t count = h->offset >= info.size ? 0 : info.size - h->offset;
-            if (count > c) count = c;
+            if (count > c) count = (uint32_t)c;
             if (!count) return 0;
             if (!vm_accessible(vm, b, count, VM_WRITE)) return USER_EFAULT;
             const void *data;
@@ -955,7 +955,7 @@ int32_t fs_call(struct fs_space *s, struct vm_space *vm, uint32_t number, uint32
                 if (offset > LFS_FILE_MAX || c > LFS_FILE_MAX - offset) return USER_EFBIG;
                 err = lfs_file_seek(&n->volume->fs, &n->file, offset, LFS_SEEK_SET);
                 if (err < 0) return error(err);
-                err = lfs_file_write(&n->volume->fs, &n->file, transfer, c);
+                err = lfs_file_write(&n->volume->fs, &n->file, transfer, (lfs_size_t)c);
                 if (err >= 0) h->offset = offset + (unsigned)err;
                 return error(err);
             }
@@ -963,8 +963,9 @@ int32_t fs_call(struct fs_space *s, struct vm_space *vm, uint32_t number, uint32
             if (info.type != FILE_REGULAR) return USER_EISDIR;
             if (!n) return USER_EROFS;
             if (!(h->flags & FILE_WRITE)) return USER_EBADF;
-            return b > LFS_FILE_MAX ? USER_EFBIG
-                                    : error(lfs_file_truncate(&n->volume->fs, &n->file, b));
+            return b > LFS_FILE_MAX
+                       ? USER_EFBIG
+                       : error(lfs_file_truncate(&n->volume->fs, &n->file, (lfs_off_t)b));
         case SYS_FILE_SYNC: return n ? error(lfs_file_sync(&n->volume->fs, &n->file)) : 0;
         default: return USER_ENOSYS;
     }

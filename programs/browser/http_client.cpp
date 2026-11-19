@@ -620,12 +620,7 @@ struct Client::Impl {
                     continue;
                 }
                 if (result) {
-                    char message[100];
-                    snprintf(message, sizeof(message),
-                             "TLS handshake or certificate verification failed (%d, flags=%lu)",
-                             result,
-                             (unsigned long)mbedtls_ssl_get_verify_result(&connection->ssl));
-                    fail(message, -2);
+                    fail("TLS handshake or certificate verification failed", -2);
                     return;
                 }
             }
@@ -697,14 +692,9 @@ struct Client::Impl {
                     parser.eof();
                 } else if (result <= 0) {
                     if (retry()) return;
-                    user_net_status status{};
-                    sos2_net_status(connection->handle, &status);
-                    char message[128];
-                    snprintf(message, sizeof(message), "%s (%d, network=%d, body bytes=%u)",
-                             request.tls ? "TLS stream ended without a complete response"
-                                         : "HTTP receive failed",
-                             result, status.error, unsigned(parser.bodyBytes()));
-                    fail(message, -1);
+                    fail(request.tls ? "TLS stream ended without a complete response"
+                                     : "HTTP receive failed",
+                         -1);
                     return;
                 } else {
                     parser.feed(buffer.data(), result);

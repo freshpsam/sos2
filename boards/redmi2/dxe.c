@@ -151,7 +151,6 @@ bool wcn_dxe_send(struct wcn_dxe *d, const void *frame, unsigned length,
      * firmware (WQ5), before DPU/BTQM. Ordinary hardware stations use WQ25. */
     header.dpu_rf = eapol || (info->station >= 16 && info->station < 41) ? 5 : 25;
     header.dpu_ne = !info->encrypt;
-    header.tx_comp = info->report;
     header.sta_index = info->station;
     header.dpu_desc_idx = info->dpu;
     header.dpu_sign = info->signature;
@@ -260,7 +259,7 @@ bool wcn_dxe_poll(struct wcn_dxe *d,
                                                .key_index = bd.rx_key_id,
                                                .data_offset = data - offset};
                     receive(context, bytes + offset, length, &info);
-                } else ++d->dropped;
+                }
                 if (d->failed) return false;
                 /* Clear stale bytes before returning ownership to the device. */
                 memset(d->dma->buffers[c][slot], 0, WCN_PACKET);

@@ -130,21 +130,6 @@ static void wcn_signal(void *p) {
     b->io.signal(b->io.context, 1u << 17);
 }
 
-static bool crash_reason(struct wcnss_boot *b, char reason[81]) {
-    struct smem_item item;
-    enum smem_status result = smem_get_status(b->smem, 422, &item);
-    memset(reason, 0, 81);
-    if (result == SMEM_ABSENT) return true;
-    if (result != SMEM_FOUND) return false;
-    for (unsigned i = 0; i < 80 && i < item.size; ++i) {
-        unsigned char c = item.data[i];
-        if (!c) break;
-        reason[i] = (char)c;
-    }
-    barrier();
-    return true;
-}
-
 /* Linux's qcom_scm votes for the crypto engine's clocks only around each
  * secure-firmware call (qcom_scm_pas_init_image, _mem_setup, _auth_and_reset,
  * _shutdown) and drops the vote afterwards; the running WCNSS does not use
@@ -177,33 +162,6 @@ static enum wcnss_boot_state failed(struct wcnss_boot *b, const char *why) {
     return b->state;
 }
 
-static enum wcnss_boot_state radio_failed(struct wcnss_boot *b, const char *fallback) {
-    char reason[81];
-    /* Capture before shutdown can erase the evidence. A failed baseline read
-     * gives no basis for attributing an inherited crash to this boot. Keep the
-     * actual failure visible: this buffer is initialized during a normal boot,
-     * so a changed string alone does not establish a fatal/watchdog event. */
-    if (b->crash_baseline && crash_reason(b, reason) && reason[0] &&
-        strcmp(reason, b->prior_crash)) {
-        /* This exact default is copied to SMEM 422 by the supplied firmware's
-         * error-framework initialization, before it has reported any fault. */
-        if (!strcmp(reason, "SFR Init: wdog or kernel error suspected."))
-            strcpy(b->firmware_detail,
-                   "Firmware error log initialized; no specific crash reason supplied.");
-        else {
-            const char prefix[] = "Firmware: ";
-            unsigned n = sizeof(prefix) - 1;
-            memcpy(b->firmware_detail, prefix, n);
-            for (unsigned i = 0; reason[i] && n < sizeof(b->firmware_detail) - 1; ++i) {
-                unsigned char c = (unsigned char)reason[i];
-                b->firmware_detail[n++] = c >= 32 && c < 127 ? (char)c : '?';
-            }
-            b->firmware_detail[n] = 0;
-        }
-    }
-    return failed(b, fallback);
-}
-
 static enum wcnss_boot_state radio_event(struct wcnss_boot *b, const char *event) {
     const char *phase = b->state == WB_READY_WAIT ? "waiting for radio ready"
                         : b->state == WB_CONTROL  ? "sending board calibration"
@@ -214,7 +172,7 @@ static enum wcnss_boot_state radio_event(struct wcnss_boot *b, const char *event
         for (const char *p = parts[i]; *p && n < sizeof(b->diagnostic) - 1; ++p)
             b->diagnostic[n++] = *p;
     b->diagnostic[n] = 0;
-    return radio_failed(b, b->diagnostic);
+    return failed(b, b->diagnostic);
 }
 
 void wcnss_boot_stop(struct wcnss_boot *b) {
@@ -236,7 +194,6 @@ bool wcnss_boot_begin(struct wcnss_boot *b, firmware_lookup lookup, void *contex
     b->smem = smem;
     b->memory = memory;
     b->physical = physical;
-    b->metadata = metadata;
     b->metadata_physical = metadata_physical;
     if (!qcom_mdt_prepare(lookup, context, &b->plan, metadata, QCOM_MDT_METADATA)) {
         b->error = "missing or invalid relocatable WCNSS firmware";
@@ -332,7 +289,7 @@ static enum wcnss_boot_state value_timeout(struct wcnss_boot *b, const char *lab
     for (unsigned i = 0; i < 8; ++i)
         b->diagnostic[n++] = "0123456789abcdef"[(value >> (28 - 4 * i)) & 15];
     b->diagnostic[n] = 0;
-    return b->state == WB_READY_WAIT ? radio_failed(b, b->diagnostic) : failed(b, b->diagnostic);
+    return b->state == WB_READY_WAIT ? failed(b, b->diagnostic) : failed(b, b->diagnostic);
 }
 
 static enum wcnss_boot_state absent_timeout(struct wcnss_boot *b) {
@@ -354,7 +311,7 @@ static enum wcnss_boot_state absent_timeout(struct wcnss_boot *b) {
             p[n++] = "0123456789abcdef"[(values[j] >> (28 - 4 * i)) & 15];
     }
     p[n] = 0;
-    return radio_failed(b, p);
+    return failed(b, p);
 }
 
 static int signals(struct wcnss_boot *b, uint32_t *value) {
@@ -683,7 +640,6 @@ enum wcnss_boot_state wcnss_boot_poll(struct wcnss_boot *b, uint64_t now) {
             advance(b, WB_AUTH);
             break;
         case WB_AUTH:
-            b->crash_baseline = crash_reason(b, b->prior_crash);
             b->watchdog_clear_seen = !(b->io.read(b->io.context, WDOG_PENDING) & WDOG_BIT);
             barrier();
             if (!qcom_scm_pas_start())
@@ -701,11 +657,11 @@ enum wcnss_boot_state wcnss_boot_poll(struct wcnss_boot *b, uint64_t now) {
                     return failed(b, "WCNSS ready timeout: shared-memory lock busy");
                 if (notification == NOTIFY_ABSENT) return absent_timeout(b);
                 if (notification == NOTIFY_UNPUBLISHED)
-                    return radio_failed(b, "WCNSS ready timeout: header unpublished");
+                    return failed(b, "WCNSS ready timeout: header unpublished");
                 if (notification == NOTIFY_NEGOTIATING)
-                    return radio_failed(b, "WCNSS ready timeout: negotiation incomplete");
+                    return failed(b, "WCNSS ready timeout: negotiation incomplete");
                 if (notification == NOTIFY_NO_ENTRY)
-                    return radio_failed(b, "WCNSS ready timeout: slave-kernel missing");
+                    return failed(b, "WCNSS ready timeout: slave-kernel missing");
                 return value_timeout(b, " state=", notification_value);
             }
             break;

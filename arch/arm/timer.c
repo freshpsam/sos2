@@ -13,50 +13,12 @@
 #ifdef SOS2_BOARD_REDMI2
 #include "redmi2_cpu_power.h"
 #endif
+#ifdef SOS2_BOARD_GTA7LITE
+#include "arm_smp.h"
+#endif
 #define read32  mmio_read32
 #define write32 mmio_write32
 #define sync    barrier
-
-static uint32_t frequency(void) {
-    uint32_t v;
-    __asm__ volatile("mrc p15, 0, %0, c14, c0, 0" : "=r"(v));
-    return v;
-}
-
-static uint64_t count(void) {
-    uint32_t lo, hi;
-    __asm__ volatile("isb\n mrrc p15, 1, %0, %1, c14" : "=r"(lo), "=r"(hi));
-    return ((uint64_t)hi << 32) | lo;
-}
-
-static uint64_t compare(void) {
-    uint32_t lo, hi;
-    __asm__ volatile("mrrc p15, 3, %0, %1, c14" : "=r"(lo), "=r"(hi));
-    return ((uint64_t)hi << 32) | lo;
-}
-
-static void set_compare(uint64_t v) {
-    __asm__ volatile("mcrr p15, 3, %0, %1, c14\n isb"
-                     :
-                     : "r"((uint32_t)v), "r"((uint32_t)(v >> 32))
-                     : "memory");
-}
-
-static uint32_t control(void) {
-    uint32_t v;
-    __asm__ volatile("mrc p15, 0, %0, c14, c3, 1" : "=r"(v));
-    return v;
-}
-
-static void set_control(uint32_t v) {
-    __asm__ volatile("mcr p15, 0, %0, c14, c3, 1\n isb" : : "r"(v) : "memory");
-}
-
-static uint32_t masks(void) {
-    uint32_t v;
-    __asm__ volatile("mrs %0, cpsr" : "=r"(v));
-    return v;
-}
 
 enum {
     D_CTLR = 0,
@@ -81,6 +43,10 @@ static bool ready, changed;
 static unsigned banks;
 static uint32_t hz, bit, priority_offset, priority_shift, edge;
 static const char *error;
+#ifdef SOS2_BOARD_GTA7LITE
+static uintptr_t gicv3_frames[ARM_CPU_MAX];
+static uintptr_t gicv3_local(void);
+#endif
 
 static struct {
     uint32_t enabled[32], distributor, cpu, pmr, priority, config, timer;
@@ -90,8 +56,15 @@ static struct {
 const char *arm_timer_error(void) { return error; }
 
 static void stop(void) {
-    set_control(0);
+    arch_timer_set_control(0);
     sync();
+#ifdef SOS2_BOARD_GTA7LITE
+    if (route.gicv3) {
+        write32(gicv3_local() + 0x280, bit); /* GICR_ICPENDR0 */
+        sync();
+        return;
+    }
+#endif
     write32(route.distributor + D_CLEAR, bit);
     sync();
 }
@@ -108,8 +81,8 @@ static void restore(void) {
     write32(route.cpu + C_PMR, saved.pmr);
     write32(route.cpu + C_CTLR, saved.cpu);
     write32(route.distributor + D_CTLR, saved.distributor);
-    set_compare(saved.compare);
-    set_control(saved.timer);
+    arch_timer_set_compare(saved.compare);
+    arch_timer_set_control(saved.timer);
     sync();
     changed = false;
 }
@@ -137,6 +110,175 @@ static bool fail_value(const char *reason, uint32_t value) {
 
 static uint64_t ticks(uint32_t us) { return ((uint64_t)hz * us + 999999) / 1000000; }
 
+#ifdef SOS2_BOARD_GTA7LITE
+/* GICv3 (the tablet's MT8768): the CPU interface is in system registers and
+ * each CPU's SGIs and PPIs are in its own redistributor, found by affinity.
+ * Firmware keeps Secure configuration; SOS2 needs affinity routing and the
+ * timer PPI in Non-secure Group 1. With two security states the Non-secure
+ * GICD_CTLR names bits 1 and 4 EnableGrp1A and ARE_NS; with one, EnableGrp1
+ * and ARE.
+ * https://developer.arm.com/documentation/ihi0069/latest
+ * https://github.com/torvalds/linux/blob/master/drivers/irqchip/irq-gic-v3.c */
+enum {
+    D3_PIDR2 = 0xffe8,
+    R_CTLR = 0,
+    R_TYPER = 8,
+    R_WAKER = 0x14,
+    R_SGI = 0x10000,
+    S_IGROUPR0 = 0x80,
+    S_ISENABLER0 = 0x100,
+    S_ICENABLER0 = 0x180,
+    S_ISPENDR0 = 0x200,
+    S_ICPENDR0 = 0x280,
+    S_ISACTIVER0 = 0x300,
+    S_IPRIORITYR = 0x400,
+    S_ICFGR1 = 0xc04
+};
+
+#define icc_read(name) \
+    ({ \
+        uint64_t value; \
+        __asm__ volatile("mrs %0, " #name : "=r"(value)); \
+        value; \
+    })
+#define icc_write(name, value) \
+    __asm__ volatile("msr " #name ", %0" : : "r"((uint64_t)(value)) : "memory")
+
+static uintptr_t gicv3_local(void) { return gicv3_frames[arch_cpu_local()->index]; }
+
+static bool gicv3_settled(uintptr_t address, uint32_t busy) {
+    for (unsigned n = 0; n < 1000000; ++n)
+        if (!(read32(address) & busy)) return true;
+    return false;
+}
+
+/* This CPU's SGI frame: wake its redistributor and route the timer PPI to the
+ * system-register CPU interface. */
+static uintptr_t gicv3_cpu(void) {
+    unsigned index = arch_cpu_local()->index;
+    uint64_t mpidr;
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+    uint32_t affinity = (uint32_t)((mpidr >> 32 & 255) << 24 | (mpidr & 0xffffff));
+    uintptr_t frame = 0;
+    for (uintptr_t at = route.redistributor;
+         at - route.redistributor <= route.redistributor_size - 0x20000;) {
+        uint32_t typer = read32(at + R_TYPER);
+        if (read32(at + R_TYPER + 4) == affinity) {
+            frame = at;
+            break;
+        }
+        if (typer & (1u << 4)) break;                /* Last */
+        at += typer & (1u << 1) ? 0x40000 : 0x20000; /* GICv4 adds two frames */
+    }
+    if (!frame || index >= ARM_CPU_MAX) return 0;
+    write32(frame + R_WAKER, read32(frame + R_WAKER) & ~2u); /* ProcessorSleep */
+    if (!gicv3_settled(frame + R_WAKER, 4)) return 0;        /* ChildrenAsleep */
+    icc_write(icc_sre_el1, icc_read(icc_sre_el1) | 1);
+    __asm__ volatile("isb");
+    if (!(icc_read(icc_sre_el1) & 1)) return 0;
+    uintptr_t sgi = frame + R_SGI;
+    if (read32(sgi + S_ISACTIVER0) & bit) return 0;
+    /* Inherited PPIs stay off until an SOS2 driver claims them; SGIs stay. */
+    write32(sgi + S_ICENABLER0, 0xffff0000u);
+    if (!gicv3_settled(frame + R_CTLR, 1u << 3)) return 0; /* RWP */
+    /* Group 1. With two security states (the tablet's firmware) this register
+     * is Secure, reads as zero and ignores the write, and the firmware has
+     * already made the PPIs Non-secure Group 1. Only such an interrupt can be
+     * enabled from here and reach ICC_HPPIR1_EL1 (gicv3_routed). */
+    write32(sgi + S_IGROUPR0, read32(sgi + S_IGROUPR0) | bit);
+    uint32_t priority = S_IPRIORITYR + (route.interrupt & ~3u);
+    write32(sgi + priority,
+            (read32(sgi + priority) & ~(255u << priority_shift)) | (0xa0u << priority_shift));
+    write32(sgi + S_ICFGR1, read32(sgi + S_ICFGR1) & ~edge);
+    write32(sgi + S_ICPENDR0, bit);
+    icc_write(icc_pmr_el1, 255);
+    icc_write(icc_bpr1_el1, 0);
+    icc_write(icc_ctlr_el1, icc_read(icc_ctlr_el1) & ~(uint64_t)2); /* EOImode 0 */
+    icc_write(icc_igrpen1_el1, 1);
+    __asm__ volatile("isb");
+    write32(sgi + S_ISENABLER0, bit);
+    sync();
+    if (!(read32(sgi + S_ISENABLER0) & bit) || (read32(sgi + S_ICFGR1) & edge)) return 0;
+    gicv3_frames[index] = sgi;
+    return sgi;
+}
+
+/* A bounded live check: this CPU's virtual timer reaches its interface. */
+static bool gicv3_routed(uintptr_t sgi) {
+    uint64_t previous = arch_timer_compare(), start = arch_counter_synchronized();
+    arch_timer_set_compare(start + ticks(1000));
+    arch_timer_set_control(1);
+    sync();
+    bool routed = false;
+    for (unsigned n = 0; n < 200000; ++n) {
+        if ((arch_timer_control() & 4) &&
+            (icc_read(icc_hppir1_el1) & 0xffffff) == route.interrupt) {
+            routed = true;
+            break;
+        }
+        if (arch_counter_synchronized() - start > ticks(20000)) break;
+    }
+    stop();
+    arch_timer_set_compare(previous);
+    if (!routed) return false;
+    /* The redistributor tells the CPU interface asynchronously that the
+     * stopped timer is no longer pending. */
+    start = arch_counter_synchronized();
+    for (unsigned n = 0; n < 200000; ++n) {
+        if (!(read32(sgi + S_ISPENDR0) & bit) && (icc_read(icc_hppir1_el1) & 0xffffff) == 1023)
+            return true;
+        if (arch_counter_synchronized() - start > ticks(20000)) break;
+    }
+    return false;
+}
+
+static bool gicv3_init(const struct arm_timer_route *configuration) {
+    if (!configuration->distributor || !configuration->redistributor ||
+        ((configuration->distributor | configuration->redistributor) & 0xffff) ||
+        configuration->redistributor_size < 0x20000 || configuration->interrupt < 16 ||
+        configuration->interrupt > 31)
+        return fail("invalid interrupt route");
+    route = *configuration;
+    if (!arch_kernel_masked()) return fail("requires EL1 with IRQ/FIQ masked");
+    hz = arch_counter_frequency();
+    if (hz < 1000 || hz > 1000000000) return fail("invalid timer frequency");
+    if ((read32(route.distributor + D3_PIDR2) >> 4 & 15) < 3) return fail("GICv3 not identified");
+    bit = 1u << route.interrupt;
+    priority_shift = (route.interrupt & 3u) * 8;
+    edge = 2u << ((route.interrupt - 16) * 2);
+    if (arch_timer_control() & 1) return fail("virtual timer already owned");
+    /* Affinity routing first: its group enables must be off before changing
+     * ARE. Bits 0:1 cover the Non-secure Group 1 alias in legacy mode, or
+     * both groups with one security state; Non-secure accesses leave Secure
+     * configuration alone. RWP must clear before setting ARE. */
+    uint32_t control = read32(route.distributor + D_CTLR);
+    if (!(control & 0x10)) {
+        write32(route.distributor + D_CTLR, control & ~3u);
+        if (!gicv3_settled(route.distributor + D_CTLR, 1u << 31))
+            return fail("GICv3 distributor busy");
+        control = read32(route.distributor + D_CTLR);
+        if (control & 3) return fail("GICv3 refused group disable");
+        write32(route.distributor + D_CTLR, control | 0x10);
+        if (!gicv3_settled(route.distributor + D_CTLR, 1u << 31))
+            return fail("GICv3 distributor busy");
+    }
+    /* Inherited SPIs stay off until an SOS2 driver claims them, as on GICv2;
+     * Non-secure writes leave Secure interrupts alone. Then Group 1. */
+    unsigned lines = (read32(route.distributor + D_TYPER) & 31) + 1;
+    for (unsigned i = 1; i < lines; ++i) write32(route.distributor + D_DISABLE + 4 * i, UINT32_MAX);
+    if (!gicv3_settled(route.distributor + D_CTLR, 1u << 31)) return fail("GICv3 distributor busy");
+    write32(route.distributor + D_CTLR, read32(route.distributor + D_CTLR) | 2);
+    if (!gicv3_settled(route.distributor + D_CTLR, 1u << 31) ||
+        (read32(route.distributor + D_CTLR) & 0x12) != 0x12)
+        return fail("GICv3 refused affinity routing or Group 1");
+    uintptr_t sgi = gicv3_cpu();
+    if (!sgi) return fail("GICv3 redistributor unavailable");
+    if (!gicv3_routed(sgi)) return fail("virtual timer did not reach CPU interrupt interface");
+    ready = true;
+    return true;
+}
+#endif
+
 bool arm_timer_init(const struct arm_timer_route *configuration) {
     if (ready)
         return configuration && configuration->distributor == route.distributor &&
@@ -144,13 +286,16 @@ bool arm_timer_init(const struct arm_timer_route *configuration) {
                configuration->qcom == route.qcom;
     error = 0;
     changed = false;
+#ifdef SOS2_BOARD_GTA7LITE
+    if (configuration && configuration->gicv3) return gicv3_init(configuration);
+#endif
     if (!configuration || !configuration->distributor || !configuration->cpu ||
         ((configuration->distributor | configuration->cpu) & 4095) ||
         configuration->interrupt < 16 || configuration->interrupt > 31)
         return fail("invalid interrupt route");
     route = *configuration;
-    if ((masks() & 0xdf) != 0xd3) return fail("requires SVC with IRQ/FIQ masked");
-    hz = frequency();
+    if (!arch_kernel_masked()) return fail("requires SVC with IRQ/FIQ masked");
+    hz = arch_counter_frequency();
     if (hz < 1000 || hz > 1000000000) return fail("invalid timer frequency");
     if (!route.qcom && (read32(route.distributor + D_PIDR2) & 0xf0) != 0x20)
         return fail("GICv2 not identified");
@@ -161,8 +306,8 @@ bool arm_timer_init(const struct arm_timer_route *configuration) {
     priority_offset = D_PRIORITY + (route.interrupt & ~3u);
     priority_shift = (route.interrupt & 3u) * 8;
     edge = 2u << ((route.interrupt - 16) * 2);
-    saved.timer = control() & 3;
-    saved.compare = compare();
+    saved.timer = arch_timer_control() & 3;
+    saved.compare = arch_timer_compare();
     if (saved.timer & 1) return fail("virtual timer already owned");
     if (read32(route.distributor + D_PENDING) & bit)
         return fail_value("inherited pending timer IRQ", route.interrupt);
@@ -219,20 +364,20 @@ bool arm_timer_init(const struct arm_timer_route *configuration) {
         !(read32(route.distributor + D_CTLR) & 1) || !(read32(route.cpu + C_CTLR) & 1) ||
         (read32(route.cpu + C_CTLR) & (1u << 9)) || (read32(route.distributor + D_CONFIG) & edge))
         return fail("interrupt configuration denied");
-    uint64_t start = count();
-    set_compare(start + ticks(1000));
-    set_control(1);
+    uint64_t start = arch_counter_synchronized();
+    arch_timer_set_compare(start + ticks(1000));
+    arch_timer_set_control(1);
     sync();
     bool routed = false;
     for (unsigned n = 0; n < 200000; ++n) {
-        if ((control() & 4) && (read32(route.cpu + C_HPPIR) & 1023) == route.interrupt) {
+        if ((arch_timer_control() & 4) && (read32(route.cpu + C_HPPIR) & 1023) == route.interrupt) {
             routed = true;
             break;
         }
-        if (count() - start > ticks(20000)) break;
+        if (arch_counter_synchronized() - start > ticks(20000)) break;
     }
     stop();
-    set_compare(saved.compare);
+    arch_timer_set_compare(saved.compare);
     if (!routed) return fail("virtual timer did not reach CPU interrupt interface");
     if (read32(route.distributor + D_PENDING) & bit)
         return fail("timer pending state did not clear");
@@ -243,17 +388,27 @@ bool arm_timer_init(const struct arm_timer_route *configuration) {
 }
 
 bool arm_timer_secondary_init(void) {
+#ifdef SOS2_BOARD_GTA7LITE
+    if (route.gicv3) {
+        if (!ready || arch_counter_frequency() != hz || !arch_kernel_masked() ||
+            (arch_timer_control() & 1))
+            return false;
+        uintptr_t sgi = gicv3_cpu();
+        return sgi && gicv3_routed(sgi);
+    }
+#endif
     /* GICv2 SGIs/PPIs and the CPU interface are banked. Never reinitialize the
      * distributor or touch an SPI here: CPU 0 already owns those registers. */
-    if (!ready || frequency() != hz || (masks() & 0xdf) != 0xd3 || (control() & 1) ||
-        read32(route.distributor + D_ACTIVE) || (read32(route.distributor + D_PENDING) & bit))
+    if (!ready || arch_counter_frequency() != hz || !arch_kernel_masked() ||
+        (arch_timer_control() & 1) || read32(route.distributor + D_ACTIVE) ||
+        (read32(route.distributor + D_PENDING) & bit))
         return false;
     uint32_t enabled = read32(route.distributor + D_ENABLE),
              config = read32(route.distributor + D_CONFIG);
     uint32_t priority = read32(route.distributor + priority_offset),
              cpu = read32(route.cpu + C_CTLR), pmr = read32(route.cpu + C_PMR);
     uint32_t running = read32(route.cpu + C_RPR) & 255;
-    uint64_t previous_compare = compare();
+    uint64_t previous_compare = arch_timer_compare();
     write32(route.distributor + D_DISABLE, 0xffff0000u);
     write32(route.distributor + priority_offset, priority | (255u << priority_shift));
     sync();
@@ -278,20 +433,21 @@ bool arm_timer_secondary_init(void) {
     }
     bool routed = false;
     if (valid) {
-        uint64_t start = count();
-        set_compare(start + ticks(1000));
-        set_control(1);
+        uint64_t start = arch_counter_synchronized();
+        arch_timer_set_compare(start + ticks(1000));
+        arch_timer_set_control(1);
         sync();
         for (unsigned n = 0; n < 200000; ++n) {
-            if ((control() & 4) && (read32(route.cpu + C_HPPIR) & 1023) == route.interrupt) {
+            if ((arch_timer_control() & 4) &&
+                (read32(route.cpu + C_HPPIR) & 1023) == route.interrupt) {
                 routed = true;
                 break;
             }
-            if (count() - start > ticks(20000)) break;
+            if (arch_counter_synchronized() - start > ticks(20000)) break;
         }
     }
     stop();
-    set_compare(previous_compare);
+    arch_timer_set_compare(previous_compare);
     if (valid && routed && !(read32(route.distributor + D_PENDING) & bit) &&
         (read32(route.cpu + C_HPPIR) & 1023) == 1023)
         return true;
@@ -308,15 +464,28 @@ bool arm_timer_secondary_init(void) {
 void arm_timer_arm_us(uint32_t microseconds) {
     if (!ready) panic("scheduler timer not initialized");
     if (!microseconds || microseconds > 5000) microseconds = 5000;
-    set_control(0);
-    set_compare(count() + ticks(microseconds));
-    set_control(1);
+    arch_timer_set_control(0);
+    arch_timer_set_compare(arch_counter_synchronized() + ticks(microseconds));
+    arch_timer_set_control(1);
 }
 
 void arm_timer_stop(bool acknowledge) {
+#ifdef SOS2_BOARD_GTA7LITE
+    if (route.gicv3) {
+        if (acknowledge) {
+            uint64_t id = icc_read(icc_iar1_el1);
+            arch_timer_set_control(0);
+            sync();
+            if ((id & 0xffffff) != route.interrupt) panic("unexpected scheduler interrupt");
+            icc_write(icc_eoir1_el1, id);
+        }
+        stop();
+        return;
+    }
+#endif
     if (acknowledge) {
         uint32_t id = read32(route.cpu + C_IAR);
-        set_control(0);
+        arch_timer_set_control(0);
         sync();
         if ((id & 1023) != route.interrupt) panic("unexpected scheduler interrupt");
         write32(route.cpu + C_EOIR, id);
@@ -336,23 +505,23 @@ void arm_timer_stop(bool acknowledge) {
 void arm_cpu_sleep_us(uint32_t microseconds) {
     if (!ready || !microseconds) return;
     if (microseconds > 1000000) microseconds = 1000000;
-    uint64_t deadline = count() + ticks(microseconds);
+    uint64_t deadline = arch_counter_synchronized() + ticks(microseconds);
 #ifdef SOS2_BOARD_REDMI2
     if (redmi2_cpu0_sleep(microseconds)) return;
-    uint32_t saved_kctl;
-    __asm__ volatile("mrc p15, 0, %0, c14, c1, 0" : "=r"(saved_kctl));
+    uint32_t saved_kctl = arch_timer_kernel_control();
     uint32_t stream = (saved_kctl & ~0xfcu) | (15u << 4) | (1u << 2);
-    __asm__ volatile("mcr p15, 0, %0, c14, c1, 0\n isb" : : "r"(stream) : "memory");
+    arch_timer_set_kernel_control(stream);
     /* The power key's line rising ends the wait, as it ends a power-down;
      * one already up is left to the caller's polls. */
     bool watch = !redmi2_cpu0_source_raised();
-    while ((int64_t)(count() - deadline) < 0 && !(watch && redmi2_cpu0_source_raised()))
+    while ((int64_t)(arch_counter_synchronized() - deadline) < 0 &&
+           !(watch && redmi2_cpu0_source_raised()))
         __asm__ volatile("wfe" ::: "memory");
-    __asm__ volatile("mcr p15, 0, %0, c14, c1, 0\n isb" : : "r"(saved_kctl) : "memory");
+    arch_timer_set_kernel_control(saved_kctl);
 #else
-    set_control(0);
-    set_compare(deadline);
-    set_control(1);
+    arch_timer_set_control(0);
+    arch_timer_set_compare(deadline);
+    arch_timer_set_control(1);
     sync();
     __asm__ volatile("dsb sy\n wfi" ::: "memory");
     stop();

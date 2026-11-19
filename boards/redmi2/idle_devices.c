@@ -200,9 +200,6 @@ enum {
     PHY_RESET_US = 1000
 };
 
-static void usb_wait(uint32_t microseconds) {
-    for (uint64_t start = time_us(); time_us() - start < microseconds;) { }
-}
 
 /* A ULPI register write through the viewport, its wake-up first as Linux's
  * ci_ulpi_write sends it; only the write itself must finish. */
@@ -215,22 +212,22 @@ static bool ulpi_write(uint8_t reg, uint8_t value) {
 
 /* lk2nd's fastboot ends with udc_stop, which clears the PHY's external VBUS
  * input and resets the controller, with the PHY running. A PHY suspended
- * straight from there was later found deaf to ULPI and drawing about 3 mA in
- * standby; a controller reset did not wake it, a PHY reset did (standby
- * trials). So the PHY is reset first, through its block reset
+ * straight from there is deaf to ULPI and draws about 3 mA in standby; a
+ * controller reset does not wake it, a PHY reset does. So the PHY is reset
+ * first, through its block reset
  * (GCC_USB2A_PHY_BCR, its "phy" reset in Linux's msm8916.dtsi), woken if the
  * controller still holds it suspended (msm_otg_resume), and the controller
  * reset and set up as lk2nd's udc_init sets it up: the ULPI PHY selected,
  * VBUS taken as valid through the PHY's external input, bus access mode,
  * device mode, interrupts off, stopped. Then the suspend, tried whatever
- * failed before it, as the old USB console tried it. Without GPLL0 the
- * controller could not be reached afterwards, so the PHY is left alone. */
+ * failed before it. Without GPLL0 the controller cannot be reached, so the
+ * PHY is left alone. */
 static void usb_off(void) {
     if (!(read32(GPLL0_STATUS) & GPLL0_ACTIVE)) return;
     write32(USB_PHY_BCR, read32(USB_PHY_BCR) | 1u);
-    usb_wait(PHY_RESET_US);
+    delay_us(PHY_RESET_US);
     write32(USB_PHY_BCR, read32(USB_PHY_BCR) & ~1u);
-    usb_wait(PHY_RESET_US);
+    delay_us(PHY_RESET_US);
     /* Registers need both clocks, so they run until it is done. */
     bool clocks = true;
     if ((read32(USB_SYSTEM_CFG) & RCG_MASK) != RCG_GPLL0_DIV10) {

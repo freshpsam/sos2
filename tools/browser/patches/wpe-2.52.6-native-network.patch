@@ -1,0 +1,68 @@
+--- a/Source/WebCore/loader/EmptyFrameLoaderClient.h
++++ b/Source/WebCore/loader/EmptyFrameLoaderClient.h
+@@ -39,7 +39,7 @@ public:
+ private:
+     Ref<DocumentLoader> createDocumentLoader(ResourceRequest&&, SubstituteData&&) override;
+ 
+-    bool hasWebView() const final;
++    bool hasWebView() const override;
+ 
+     void makeRepresentation(DocumentLoader*) final;
+ 
+@@ -89,19 +89,19 @@ private:
+     void dispatchDidStartProvisionalLoad() final;
+     void dispatchDidReceiveTitle(const StringWithDirection&) final;
+     void dispatchDidCommitLoad(std::optional<HasInsecureContent>, std::optional<UsedLegacyTLS>, std::optional<WasPrivateRelayed>) final;
+-    void dispatchDidFailProvisionalLoad(const ResourceError&, WillContinueLoading, WillInternallyHandleFailure) final;
+-    void dispatchDidFailLoad(const ResourceError&) final;
++    void dispatchDidFailProvisionalLoad(const ResourceError&, WillContinueLoading, WillInternallyHandleFailure) override;
++    void dispatchDidFailLoad(const ResourceError&) override;
+     void dispatchDidFinishDocumentLoad() final;
+-    void dispatchDidFinishLoad() final;
++    void dispatchDidFinishLoad() override;
+     void dispatchDidReachLayoutMilestone(OptionSet<LayoutMilestone>) final;
+     void dispatchDidReachVisuallyNonEmptyState() final;
+ 
+     LocalFrame* dispatchCreatePage(const NavigationAction&, NewFrameOpenerPolicy) final;
+     void dispatchShow() final;
+ 
+-    void dispatchDecidePolicyForResponse(const ResourceResponse&, const ResourceRequest&, const String&, FramePolicyFunction&&) final;
+-    void dispatchDecidePolicyForNewWindowAction(const NavigationAction&, const ResourceRequest&, FormState*, const String&, std::optional<HitTestResult>&&, FramePolicyFunction&&) final;
+-    void dispatchDecidePolicyForNavigationAction(const NavigationAction&, const ResourceRequest&, const ResourceResponse& redirectResponse, FormState*, const String&, std::optional<NavigationIdentifier>, std::optional<HitTestResult>&&, bool, NavigationUpgradeToHTTPSBehavior, SandboxFlags, PolicyDecisionMode, FramePolicyFunction&&) final;
++    void dispatchDecidePolicyForResponse(const ResourceResponse&, const ResourceRequest&, const String&, FramePolicyFunction&&) override;
++    void dispatchDecidePolicyForNewWindowAction(const NavigationAction&, const ResourceRequest&, FormState*, const String&, std::optional<HitTestResult>&&, FramePolicyFunction&&) override;
++    void dispatchDecidePolicyForNavigationAction(const NavigationAction&, const ResourceRequest&, const ResourceResponse& redirectResponse, FormState*, const String&, std::optional<NavigationIdentifier>, std::optional<HitTestResult>&&, bool, NavigationUpgradeToHTTPSBehavior, SandboxFlags, PolicyDecisionMode, FramePolicyFunction&&) override;
+     void updateSandboxFlags(SandboxFlags) final;
+     void updateOpener(std::optional<FrameIdentifier>) final;
+     void setPrinting(bool, FloatSize, FloatSize, float, AdjustViewSize) final;
+@@ -125,16 +125,16 @@ private:
+     void willReplaceMultipartContent() final;
+     void didReplaceMultipartContent() final;
+ 
+-    void committedLoad(DocumentLoader*, const SharedBuffer&) final;
+-    void finishedLoading(DocumentLoader*) final;
++    void committedLoad(DocumentLoader*, const SharedBuffer&) override;
++    void finishedLoading(DocumentLoader*) override;
+ 
+     void loadStorageAccessQuirksIfNeeded() final;
+ 
+     bool shouldFallBack(const ResourceError&) const final;
+ 
+-    bool canHandleRequest(const ResourceRequest&) const final;
+-    bool canShowMIMEType(const String&) const final;
+-    bool canShowMIMETypeAsHTML(const String&) const final;
++    bool canHandleRequest(const ResourceRequest&) const override;
++    bool canShowMIMEType(const String&) const override;
++    bool canShowMIMETypeAsHTML(const String&) const override;
+     bool representationExistsForURLScheme(StringView) const final;
+     String generatedMIMETypeForURLScheme(StringView) const final;
+ 
+@@ -154,7 +154,7 @@ private:
+ #if PLATFORM(IOS_FAMILY)
+     void didRestoreFrameHierarchyForCachedFrame() final;
+ #endif
+-    void transitionToCommittedForNewPage(InitializingIframe) final;
++    void transitionToCommittedForNewPage(InitializingIframe) override;
+ 
+     void didRestoreFromBackForwardCache() final;
+ 

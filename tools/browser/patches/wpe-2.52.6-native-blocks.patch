@@ -1,0 +1,183 @@
+--- a/Source/JavaScriptCore/heap/AlignedMemoryAllocator.cpp
++++ b/Source/JavaScriptCore/heap/AlignedMemoryAllocator.cpp
+@@ -28,8 +28,16 @@
+ 
+ #include "BlockDirectory.h"
+ #include "HeapInlines.h"
++#include "SOS2BlockPool.h"
+ #include "Subspace.h"
+ 
++#if OS(SOS2)
++#include "MarkedBlock.h"
++#include <sys/mman.h>
++#include <wtf/Lock.h>
++#include <wtf/PageBlock.h>
++#endif
++
+ namespace JSC { 
+ 
+ AlignedMemoryAllocator::AlignedMemoryAllocator() = default;
+@@ -55,6 +63,52 @@ void AlignedMemoryAllocator::registerSubspace(Subspace* subspace)
+     m_subspaces.append(std::mem_fn(&Subspace::setNextSubspaceInAlignedMemoryAllocator), subspace);
+ }
+ 
++#if OS(SOS2)
++
++// Each block is mapped on its own, with mmap's page-aligned slack unmapped
++// around it, and up to 16 freed blocks are kept for reuse: SOS2 frees memory
++// only when it is unmapped, and each mapping change pauses the process's other
++// threads.
++static constexpr unsigned sos2CachedBlocks = 16;
++static Lock sos2BlockLock;
++static void* sos2FreeBlocks[sos2CachedBlocks];
++static unsigned sos2FreeBlockCount;
++
++void* tryAllocateSOS2Block()
++{
++    {
++        Locker locker { sos2BlockLock };
++        if (sos2FreeBlockCount)
++            return sos2FreeBlocks[--sos2FreeBlockCount];
++    }
++    size_t mapped = 2 * MarkedBlock::blockSize - pageSize();
++    void* memory = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    if (memory == MAP_FAILED)
++        return nullptr;
++    uintptr_t start = reinterpret_cast<uintptr_t>(memory);
++    uintptr_t block = roundUpToMultipleOf<MarkedBlock::blockSize>(start);
++    uintptr_t end = block + MarkedBlock::blockSize;
++    if (block != start)
++        munmap(memory, block - start);
++    if (start + mapped != end)
++        munmap(reinterpret_cast<void*>(end), start + mapped - end);
++    return reinterpret_cast<void*>(block);
++}
++
++void freeSOS2Block(void* block)
++{
++    {
++        Locker locker { sos2BlockLock };
++        if (sos2FreeBlockCount < sos2CachedBlocks) {
++            sos2FreeBlocks[sos2FreeBlockCount++] = block;
++            return;
++        }
++    }
++    munmap(block, MarkedBlock::blockSize);
++}
++
++#endif // OS(SOS2)
++
+ } // namespace JSC
+ 
+ 
+--- a/Source/JavaScriptCore/heap/FastMallocAlignedMemoryAllocator.cpp
++++ b/Source/JavaScriptCore/heap/FastMallocAlignedMemoryAllocator.cpp
+@@ -26,6 +26,7 @@
+ #include "config.h"
+ #include "FastMallocAlignedMemoryAllocator.h"
+ 
++#include "SOS2BlockPool.h"
+ #include <wtf/FastMalloc.h>
+ 
+ namespace JSC {
+@@ -43,6 +44,10 @@ void* FastMallocAlignedMemoryAllocator::tryAllocateAlignedMemory(size_t alignmen
+ {
+ #if ENABLE(MALLOC_HEAP_BREAKDOWN)
+     return m_heap.memalign(alignment, size, true);
++#elif OS(SOS2)
++    UNUSED_PARAM(alignment);
++    UNUSED_PARAM(size);
++    return tryAllocateSOS2Block();
+ #else
+     return tryFastCompactAlignedMalloc(alignment, size);
+ #endif
+@@ -53,6 +58,8 @@ void FastMallocAlignedMemoryAllocator::freeAlignedMemory(void* basePtr)
+ {
+ #if ENABLE(MALLOC_HEAP_BREAKDOWN)
+     return m_heap.free(basePtr);
++#elif OS(SOS2)
++    freeSOS2Block(basePtr);
+ #else
+     fastAlignedFree(basePtr);
+ #endif
+--- a/Source/JavaScriptCore/heap/GigacageAlignedMemoryAllocator.cpp
++++ b/Source/JavaScriptCore/heap/GigacageAlignedMemoryAllocator.cpp
+@@ -26,6 +26,8 @@
+ #include "config.h"
+ #include "GigacageAlignedMemoryAllocator.h"
+ 
++#include "SOS2BlockPool.h"
++
+ #if ENABLE(MALLOC_HEAP_BREAKDOWN)
+ #include <wtf/text/MakeString.h>
+ #endif
+@@ -48,6 +50,10 @@ void* GigacageAlignedMemoryAllocator::tryAllocateAlignedMemory(size_t alignment,
+ {
+ #if ENABLE(MALLOC_HEAP_BREAKDOWN)
+     return m_heap.memalign(alignment, size, true);
++#elif OS(SOS2)
++    UNUSED_PARAM(alignment);
++    UNUSED_PARAM(size);
++    return tryAllocateSOS2Block();
+ #else
+     return Gigacage::tryAlignedMalloc(m_kind, alignment, size);
+ #endif
+@@ -57,6 +63,8 @@ void GigacageAlignedMemoryAllocator::freeAlignedMemory(void* basePtr)
+ {
+ #if ENABLE(MALLOC_HEAP_BREAKDOWN)
+     return m_heap.free(basePtr);
++#elif OS(SOS2)
++    freeSOS2Block(basePtr);
+ #else
+     Gigacage::alignedFree(m_kind, basePtr);
+ #endif
+--- /dev/null
++++ b/Source/JavaScriptCore/heap/SOS2BlockPool.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++#if OS(SOS2)
++
++namespace JSC {
++
++// MarkedBlocks on SOS2 (AlignedMemoryAllocator.cpp). SOS2 commits every
++// mapping, and mimalloc serves a block aligned beyond 4 KiB from an OS
++// allocation with a page header and alignment slack: 32 KiB per 16 KiB block.
++// These map each block exactly instead.
++void* tryAllocateSOS2Block();
++void freeSOS2Block(void*);
++
++} // namespace JSC
++
++#endif // OS(SOS2)
+--- a/Source/JavaScriptCore/heap/StructureAlignedMemoryAllocator.cpp
++++ b/Source/JavaScriptCore/heap/StructureAlignedMemoryAllocator.cpp
+@@ -29,6 +29,7 @@
+ #include "JSCConfig.h"
+ #include "MarkedBlock.h"
+ #include "Options.h"
++#include "SOS2BlockPool.h"
+ #include "StructureID.h"
+ #include <wtf/BitVector.h>
+ 
+@@ -253,12 +254,20 @@ void* StructureAlignedMemoryAllocator::tryAllocateAlignedMemory(size_t alignment
+ {
+     ASSERT_UNUSED(alignment, alignment == MarkedBlock::blockSize);
+     ASSERT_UNUSED(size, size == MarkedBlock::blockSize);
++#if OS(SOS2)
++    return tryAllocateSOS2Block();
++#else
+     return tryFastCompactAlignedMalloc(MarkedBlock::blockSize, MarkedBlock::blockSize);
++#endif
+ }
+ 
+ void StructureAlignedMemoryAllocator::freeAlignedMemory(void* block)
+ {
++#if OS(SOS2)
++    freeSOS2Block(block);
++#else
+     fastAlignedFree(block);
++#endif
+ }
+ 
+ #endif // CPU(ADDRESS64)

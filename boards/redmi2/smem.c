@@ -215,10 +215,6 @@ enum smem_status smem_get_peer_status(struct smem_region *s, unsigned peer, unsi
     return result;
 }
 
-enum smem_status smem_get_status(struct smem_region *s, unsigned id, struct smem_item *out) {
-    return smem_get_peer_status(s, SMEM_HOST_GLOBAL, id, out);
-}
-
 static int smem_get_peer(struct smem_region *s, unsigned peer, unsigned id, struct smem_item *out) {
     enum smem_status result = smem_get_peer_status(s, peer, id, out);
     return result == SMEM_BUSY ? 0 : result;

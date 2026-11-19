@@ -3,7 +3,7 @@
 
 Encoding reference: freedreno/freedreno includes/instr-a3xx.h, Rob Clark,
 MIT. See boards/redmi2/adreno-notices.txt. No compiler runs on the phone.
-The readable assembly and binary are generated together; --check detects drift.
+The readable assembly and binary are generated together.
 """
 import argparse
 from pathlib import Path
@@ -147,13 +147,6 @@ def generate():
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--check', action='store_true')
-    args = parser.parse_args()
+    argparse.ArgumentParser(description=__doc__).parse_args()
     for name, content in generate().items():
-        path = ROOT/'boards/redmi2'/name
-        if args.check:
-            if path.read_text() != content:
-                raise SystemExit(f'Regenerate {path}')
-        else:
-            path.write_text(content)
+        (ROOT/'boards/redmi2'/name).write_text(content)

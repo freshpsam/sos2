@@ -25,7 +25,7 @@
 
 #include "config.h"
 // SOS2 platform adapter: private writable sites and native HTTP(S) transport.
-// Derived from WebKit's platform adapter scaffolding; engine code is unchanged.
+// Derived from WebKit's platform adapter scaffolding.
 
 #include <WebCore/BlobRegistry.h>
 #include <WebCore/Color.h>
@@ -189,8 +189,6 @@ public:
 
     ResourceError blockedError(const ResourceRequest &) const final { return unavailable(); }
 
-    bool isBlockedError(const ResourceError &) const final { return false; }
-
     ResourceError blockedByContentBlockerError(const ResourceRequest &) const final {
         return unavailable();
     }
@@ -200,11 +198,6 @@ public:
     ResourceError interruptedForPolicyChangeError(const ResourceRequest &request) const final {
         return cancelledError(request);
     }
-#if ENABLE(CONTENT_FILTERING)
-    ResourceError blockedByContentFilterError(const ResourceRequest &) const final {
-        return unavailable();
-    }
-#endif
     ResourceError cannotShowMIMETypeError(const ResourceResponse &) const final {
         return unavailable();
     }
@@ -221,8 +214,6 @@ public:
         return unavailable();
     }
 
-    bool isHttpNavigationWithHTTPSOnlyError(const ResourceError &) const final { return false; }
-
     ResourceError pluginWillHandleLoadError(const ResourceResponse &) const final {
         return unavailable();
     }
@@ -230,84 +221,6 @@ public:
 
 class LocalPasteboardStrategy final : public PasteboardStrategy {
 public:
-#if PLATFORM(IOS_FAMILY)
-    void writeToPasteboard(const PasteboardURL &, const String &, const PasteboardContext *) final {
-    }
-
-    void writeToPasteboard(const PasteboardWebContent &, const String &,
-                           const PasteboardContext *) final { }
-
-    void writeToPasteboard(const PasteboardImage &, const String &,
-                           const PasteboardContext *) final { }
-
-    void writeToPasteboard(const String &, const String &, const String &,
-                           const PasteboardContext *) final { }
-
-    void updateSupportedTypeIdentifiers(const Vector<String> &, const String &,
-                                        const PasteboardContext *) final { }
-#endif
-#if PLATFORM(COCOA)
-    void getTypes(Vector<String> &, const String &, const PasteboardContext *) final { }
-
-    RefPtr<SharedBuffer> bufferForType(const String &, const String &,
-                                       const PasteboardContext *) final {
-        return nullptr;
-    }
-
-    void getPathnamesForType(Vector<String> &, const String &, const String &,
-                             const PasteboardContext *) final { }
-
-    String stringForType(const String &, const String &, const PasteboardContext *) final {
-        return {};
-    }
-
-    Vector<String> allStringsForType(const String &, const String &,
-                                     const PasteboardContext *) final {
-        return {};
-    }
-
-    int64_t changeCount(const String &, const PasteboardContext *) final { return 0; }
-
-    Color color(const String &, const PasteboardContext *) final { return {}; }
-
-    URL url(const String &, const PasteboardContext *) final { return {}; }
-
-    int getNumberOfFiles(const String &, const PasteboardContext *) final { return 0; }
-
-    int64_t addTypes(const Vector<String> &, const String &, const PasteboardContext *) final {
-        return 0;
-    }
-
-    int64_t setTypes(const Vector<String> &, const String &, const PasteboardContext *) final {
-        return 0;
-    }
-
-    int64_t setBufferForType(SharedBuffer *, const String &, const String &,
-                             const PasteboardContext *) final {
-        return 0;
-    }
-
-    int64_t setURL(const PasteboardURL &, const String &, const PasteboardContext *) final {
-        return 0;
-    }
-
-    int64_t setColor(const Color &, const String &, const PasteboardContext *) final { return 0; }
-
-    int64_t setStringForType(const String &, const String &, const String &,
-                             const PasteboardContext *) final {
-        return 0;
-    }
-
-    int64_t writeWebArchive(LegacyWebArchive &, const String &) final { return 0; }
-
-    bool containsURLStringSuitableForLoading(const String &, const PasteboardContext *) final {
-        return false;
-    }
-
-    String urlStringSuitableForLoading(const String &, String &, const PasteboardContext *) final {
-        return {};
-    }
-#endif
     String readStringFromPasteboard(size_t, const String &, const String &,
                                     const PasteboardContext *) final {
         return {};
@@ -348,29 +261,6 @@ public:
                                                const PasteboardContext *) final {
         return false;
     }
-#if PLATFORM(GTK) || PLATFORM(WPE)
-    Vector<String> types(const String &) final { return {}; }
-
-    String readTextFromClipboard(const String &, const String &) final { return {}; }
-
-    Vector<String> readFilePathsFromClipboard(const String &) final { return {}; }
-
-    RefPtr<SharedBuffer> readBufferFromClipboard(const String &, const String &) final {
-        return nullptr;
-    }
-
-    void writeToClipboard(const String &, SelectionData &&) final { }
-
-    void clearClipboard(const String &) final { }
-
-    int64_t changeCount(const String &) final { return 0; }
-#elif USE(LIBWPE)
-    void getTypes(Vector<String> &) final { }
-
-    void writeToPasteboard(const PasteboardWebContent &) final { }
-
-    void writeToPasteboard(const String &, const String &) final { }
-#endif
 };
 
 class LocalBlobRegistry final : public BlobRegistry {
@@ -431,11 +321,6 @@ public:
 
 class LocalMediaStrategy final : public MediaStrategy {
 public:
-#if ENABLE(WEB_AUDIO)
-    Ref<AudioDestination> createAudioDestination(const AudioDestinationCreationOptions &) final {
-        RELEASE_ASSERT_NOT_REACHED();
-    }
-#endif
 };
 
 class LocalPlatformStrategies final : public PlatformStrategies {
@@ -447,9 +332,6 @@ private:
     MediaStrategy *createMediaStrategy() final { return new LocalMediaStrategy; }
 
     BlobRegistry *createBlobRegistry() final { return new LocalBlobRegistry; }
-#if ENABLE(DECLARATIVE_WEB_PUSH)
-    PushStrategy *createPushStrategy() final { return nullptr; }
-#endif
 };
 
 } // anonymous namespace

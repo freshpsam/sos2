@@ -1,5 +1,10 @@
 {
-  "version": "2.54.2",
-  "url": "https://wpewebkit.org/releases/wpewebkit-2.54.2.tar.xz",
-  "sha256": "f3284e19e47fcb5ac8c63c2e1c113dbd65b2423eb8a545f5b345707829004f56"
+  "version": "2.52.6",
+  "url": "https://wpewebkit.org/releases/wpewebkit-2.52.6.tar.xz",
+  "sha256": "b2bafef2751625b7fdf530f230ff0f542ff0eeba3590c3a989d931b2a55c858e",
+  "mimalloc": {
+    "url": "https://wpewebkit.org/releases/wpewebkit-2.54.2.tar.xz",
+    "sha256": "f3284e19e47fcb5ac8c63c2e1c113dbd65b2423eb8a545f5b345707829004f56",
+    "path": "wpewebkit-2.54.2/Source/bmalloc/mimalloc"
+  }
 }

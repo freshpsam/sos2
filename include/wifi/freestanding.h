@@ -5,7 +5,6 @@
  * are discarded at link time; the kernel does not provide a POSIX runtime. */
 typedef struct wifi_unused_file FILE;
 long strtol(const char *, char **, int);
-unsigned long strtoul(const char *, char **, int);
 char *strrchr(const char *, int);
 void qsort(void *, size_t, size_t, int (*)(const void *, const void *));
 int vsnprintf(char *, size_t, const char *, __builtin_va_list);

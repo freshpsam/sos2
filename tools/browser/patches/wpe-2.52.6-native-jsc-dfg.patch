@@ -1,0 +1,156 @@
+JavaScriptCore correctness fixes for SOS2’s DFG pipeline.
+Production changes from the upstream webkitglib/2.52 branch.
+
+WebKit bug 316723 — [JSC] Validate RegExps in DFG strength reduction phase
+Upstream: https://github.com/WebKit/WebKit/commit/2091c251b2ea0b9fb85ea476a2ec21f8a7a7cc53
+
+--- a/Source/JavaScriptCore/dfg/DFGStrengthReductionPhase.cpp
++++ b/Source/JavaScriptCore/dfg/DFGStrengthReductionPhase.cpp
+@@ -712,6 +712,9 @@ class StrengthReductionPhase : public Phase {
+             if (!regExp)
+                 break;
+ 
++            if (!regExp->isValid())
++                break;
++
+             m_node->convertToNewRegExp(m_graph.freezeStrong(regExp), m_insertionSet.insertConstantForUse(m_nodeIndex, m_node->origin, jsNumber(0), UntypedUse));
+             m_changed = true;
+             break;
+--- a/Source/JavaScriptCore/runtime/RegExp.cpp
++++ b/Source/JavaScriptCore/runtime/RegExp.cpp
+@@ -164,12 +164,18 @@ void RegExp::finishCreation(VM& vm)
+         return;
+     }
+ 
++    updateMetadataFromPattern(pattern);
++}
++
++void RegExp::updateMetadataFromPattern(Yarr::YarrPattern& pattern)
++{
+     m_atom = WTF::move(pattern.m_atom);
+     m_specificPattern = pattern.m_specificPattern;
+ 
+     m_numSubpatterns = pattern.m_numSubpatterns;
+     if (!pattern.m_captureGroupNames.isEmpty() || !pattern.m_namedGroupToParenIndices.isEmpty()) {
+-        m_rareData = makeUnique<RareData>();
++        if (!m_rareData)
++            m_rareData = makeUnique<RareData>();
+         m_rareData->m_numDuplicateNamedCaptureGroups = pattern.m_numDuplicateNamedCaptureGroups;
+         m_rareData->m_captureGroupNames.swap(pattern.m_captureGroupNames);
+         m_rareData->m_namedGroupToParenIndices.swap(pattern.m_namedGroupToParenIndices);
+@@ -226,10 +232,7 @@ void RegExp::byteCodeCompileIfNecessary(VM* vm)
+         m_state = ParseError;
+         return;
+     }
+-    ASSERT(m_numSubpatterns == pattern.m_numSubpatterns);
+-
+-    m_atom = WTF::move(pattern.m_atom);
+-    m_specificPattern = pattern.m_specificPattern;
++    updateMetadataFromPattern(pattern);
+ 
+     m_regExpBytecode = byteCodeCompilePattern(vm, pattern, m_constructionErrorCode);
+     if (!m_regExpBytecode) {
+@@ -247,10 +250,7 @@ void RegExp::compile(VM* vm, Yarr::CharSize charSize, std::optional<StringView>
+         m_state = ParseError;
+         return;
+     }
+-    ASSERT(m_numSubpatterns == pattern.m_numSubpatterns);
+-
+-    m_atom = WTF::move(pattern.m_atom);
+-    m_specificPattern = pattern.m_specificPattern;
++    updateMetadataFromPattern(pattern);
+ 
+     if (!hasCode()) {
+         ASSERT(m_state == NotCompiled);
+@@ -315,10 +315,7 @@ void RegExp::compileMatchOnly(VM* vm, Yarr::CharSize charSize, std::optional<Str
+         m_state = ParseError;
+         return;
+     }
+-    ASSERT(m_numSubpatterns == pattern.m_numSubpatterns);
+-
+-    m_atom = WTF::move(pattern.m_atom);
+-    m_specificPattern = pattern.m_specificPattern;
++    updateMetadataFromPattern(pattern);
+ 
+     if (!hasCode()) {
+         ASSERT(m_state == NotCompiled);
+--- a/Source/JavaScriptCore/runtime/RegExp.h
++++ b/Source/JavaScriptCore/runtime/RegExp.h
+@@ -35,6 +35,10 @@
+ 
+ namespace JSC {
+ 
++namespace Yarr {
++struct YarrPattern;
++}
++
+ struct RegExpRepresentation;
+ class VM;
+ 
+@@ -176,6 +180,8 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
+     RegExp(VM&, const String&, OptionSet<Yarr::Flags>);
+     void finishCreation(VM&);
+ 
++    void updateMetadataFromPattern(Yarr::YarrPattern&);
++
+     static RegExp* createWithoutCaching(VM&, const String&, OptionSet<Yarr::Flags>);
+ 
+     enum RegExpState : uint8_t {
+--- a/Source/JavaScriptCore/runtime/RegExpCache.cpp
++++ b/Source/JavaScriptCore/runtime/RegExpCache.cpp
+@@ -57,6 +57,9 @@ RegExp* RegExpCache::lookupOrCreate(VM& vm, const String& patternString, OptionS
+     vm.addRegExpToTrace(regExp);
+ #endif
+ 
++    if (!regExp->isValid())
++        return regExp;
++
+     {
+         Locker locker { m_lock };
+         weakAdd(m_weakCache, key, Weak<RegExp>(regExp, this));
+
+WebKit bug 316803 — [JSC] Refresh AI state when folding GetScope to Identity
+Upstream: https://github.com/WebKit/WebKit/commit/fba8cb51df0521c4537718a4a9de7f94b6a344e6
+
+--- a/Source/JavaScriptCore/dfg/DFGConstantFoldingPhase.cpp
++++ b/Source/JavaScriptCore/dfg/DFGConstantFoldingPhase.cpp
+@@ -1403,6 +1403,7 @@ class ConstantFoldingPhase : public Phase {
+                 case NewAsyncFunction: {
+                     node->convertToIdentityOn(node->child1()->child1().node());
+                     node->child1().setUseKind(KnownCellUse);
++                    m_interpreter.execute(indexInBlock); // Catch the fact that we may overwrite a stale AbstractValue.
+                     eliminated = true;
+                     break;
+                 }
+
+WebKit bug 315213 — [JSC] NodeMustGenerate incorrectly cleared on CheckOverflow ArithAdd/ArithSub in DFGFixupPhase Inc/Dec handler
+Upstream: https://github.com/WebKit/WebKit/commit/99f7cbec1ad46d9eb486fe7097bd2fef5c90ff44
+
+--- a/Source/JavaScriptCore/dfg/DFGFixupPhase.cpp
++++ b/Source/JavaScriptCore/dfg/DFGFixupPhase.cpp
+@@ -263,8 +263,8 @@ class FixupPhase : public Phase {
+                 fixEdge<DoubleRepUse>(node->child1());
+                 fixEdge<DoubleRepUse>(node->child2());
+                 node->setResult(NodeResultDouble);
++                node->clearFlags(NodeMustGenerate);
+             }
+-            node->clearFlags(NodeMustGenerate);
+             break;
+         }
+ 
+
+WebKit bug 317570 — [JSC] ObjectCreate folding should emit checks
+Upstream: https://github.com/WebKit/WebKit/commit/1fc4157004126e2ca466fda70ed03b87de81a1cd
+
+--- a/Source/JavaScriptCore/dfg/DFGConstantFoldingPhase.cpp
++++ b/Source/JavaScriptCore/dfg/DFGConstantFoldingPhase.cpp
+@@ -1063,6 +1063,9 @@ class ConstantFoldingPhase : public Phase {
+                     }
+                     
+                     if (structure) {
++                        m_interpreter.execute(indexInBlock); // Push CFA over this node after we get the state before.
++                        alreadyHandled = true; // Don't allow the default constant folder to do things to this.
++                        m_insertionSet.insertCheck(indexInBlock, node->origin, node->children);
+                         node->convertToNewObject(m_graph.registerStructure(structure));
+                         changed = true;
+                         break;

@@ -4,78 +4,75 @@
 #include "page_host.h"
 #include "process.h"
 #include "boot_bundle.h"
-#include "boot_memory.h"
-#include "boot_progress.h"
 #include "elf_load.h"
 #include "fs.h"
 #include "runtime_files.h"
 #include "kernel_io.h"
 #include "sha256.h"
 #include "platform.h"
+#include "wire.h"
 #include <stddef.h>
 #ifdef SOS2_BOARD_REDMI2
 #include "redmi2_power.h"
-#else
-extern int32_t arm_psci_cpu_on(unsigned method, uint32_t function, uint32_t a, uint32_t b);
+#elif defined(SOS2_BOARD_GTA7LITE)
+#include "gta7lite.h"
 #endif
 
 /* The formats are in include/system_store.h, written by
- * tools/package_redmi2.py. An update is installed in the order that keeps the
- * phone starting at every step: the cache slot the boot image does not use
- * loses its header, takes the resources and is read back against their
- * SHA-256, gets its header again; then the boot image loses its first sector,
- * which lk2nd needs to start it, takes the rest, and gets that sector last.
- * Until then the old boot image and its slot are untouched, and an
- * interrupted boot-image write leaves lk2nd's fastboot. An app's package
- * (include/app_store.h) arrives whole in RAM, is checked, and goes to its
- * app store position the same way. Nothing is signed: the SHA-256s guard
- * against damage, not against whoever publishes the files. */
+ * tools/package_redmi2.py and tools/package_gta7lite.py. A system update is a
+ * whole boot image: kernel, device tree and compressed resources. It arrives
+ * in RAM and is checked against its SHA-256 and the shape the device's
+ * loader starts (lk2nd on the phone, Samsung's LK on the tablet); then the
+ * boot partition's first sector, which the loader needs to start an image,
+ * is cleared, the rest is written and read back, and the first sector is
+ * written last. Until it is cleared the old image is untouched; from then
+ * until the last write, which a closed updater does not stop, an
+ * interruption leaves no image to start: the phone falls back to lk2nd's
+ * fastboot, the tablet to download mode. An app's package
+ * (include/app_store.h) arrives whole in RAM, is checked, and goes to its app
+ * store position. Nothing is signed: the SHA-256s guard against damage, not
+ * against whoever publishes the files. */
 enum {
     ANDROID_PAGE = 2048,
     KERNEL_ADDRESS = 0x80008000,
     TAGS_ADDRESS = 0x81e00000,
-    RESOURCES_MAX = BOOT_RAMDISK_END - BOOT_RAMDISK_BASE,
-    WORK_US = 2000,   /* of eMMC or hashing work before the desktop runs */
-    CHECK_US = 250000 /* of reading back per FINISH, between app updates */
+    /* The boot image's RAM, in pieces the page allocator finds. */
+    IMAGE_CHUNK = 1024 * 1024,
+    IMAGE_CHUNKS = (SYSTEM_BOOT_LIMIT + IMAGE_CHUNK - 1) / IMAGE_CHUNK,
+    WORK_US = 2000,  /* of eMMC or hashing work before the desktop runs */
+    STEP_US = 250000 /* of writing or reading back per FINISH, between app updates */
 };
 
-_Static_assert(SYSTEM_SLOT_HEADER + RESOURCES_MAX <= SYSTEM_SLOT_SECTORS * 512,
-               "a slot holds the largest resources the kernel reads");
-
+#ifdef SOS2_BOARD_GTA7LITE
+static const char board[16] = "gta7litewifi";
+#else
 static const char board[16] = "redmi2-wt88047";
+#endif
 
 static struct {
     uint32_t state, owner; /* owner: the receiving process */
     bool installs;
     struct system_update_header header;
-    struct sha256 boot_hash, system_hash;
-    unsigned char *buffer; /* the boot image, or an app's whole package */
-    unsigned pages, slot;
-    bool app;                          /* receiving an app's package */
-    uint32_t received, total, checked; /* bytes of the file; of the slot read back */
-    uint64_t written;                  /* whole sectors of the slot's data */
-    unsigned char tail[512];           /* data short of a whole sector */
-    unsigned tail_used;
+    struct sha256 hash;
+    unsigned char *buffer; /* an app's whole package */
+    unsigned pages;
+    unsigned char *image[IMAGE_CHUNKS]; /* the boot image */
+    bool app;                           /* receiving an app's package */
+    uint32_t received, total, done;     /* bytes of the file; of the image written or read back */
     char message[64];
 } update;
 
 static char release[SYSTEM_RELEASE_MAX + 1];
 static bool restart_due; /* an installed system update waits for a restart */
-/* The slot the boot partition's image starts from: the one this boot read,
- * until an install names the other. */
-static unsigned boot_slot;
-#ifdef SOS2_BOARD_REDMI2
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE)
 static bool installed; /* started from the installed system */
-#else
-static enum cpu_boot_method psci_method; /* QEMU restarts through PSCI */
+#endif
+#ifndef SOS2_BOARD_REDMI2
+static enum cpu_boot_method psci_method; /* QEMU and the tablet restart through PSCI */
 #endif
 static uint64_t worked_at;
 /* The service worker is serialized, so one buffer serves every request. */
 static uint32_t scratch[1024], sector[128];
-
-static uint32_t u32(const unsigned char *p) {
-    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
-}
 
 static bool printable(const char *text, size_t length) {
     for (size_t i = 0; i < length; ++i)
@@ -100,30 +97,6 @@ static const char *token(const char *args, size_t length, size_t *at, size_t *n)
     return *n ? args + start : 0;
 }
 
-static int nibble(char c) {
-    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
-}
-
-/* sos2.system=<64 lowercase hex digits>: 1 with its SHA-256, 0 when absent,
- * -1 when malformed or repeated. */
-static int system_argument(const char *args, size_t length, uint8_t out[32]) {
-    static const char prefix[] = "sos2.system=";
-    const size_t skip = sizeof(prefix) - 1;
-    int found = 0;
-    size_t at = 0, n;
-    for (const char *t; (t = token(args, length, &at, &n));) {
-        if (n < skip || memcmp(t, prefix, skip)) continue;
-        if (found || n != skip + 64) return -1;
-        for (unsigned i = 0; i < 32; ++i) {
-            int high = nibble(t[skip + 2 * i]), low = nibble(t[skip + 2 * i + 1]);
-            if (high < 0 || low < 0) return -1;
-            out[i] = (uint8_t)(high << 4 | low);
-        }
-        found = 1;
-    }
-    return found;
-}
-
 /* The storage mode as fs.c reads it at boot: one sos2.storage= token, here
  * sos2.storage=installed. */
 static bool storage_installed(const char *args, size_t length) {
@@ -139,70 +112,15 @@ static bool storage_installed(const char *args, size_t length) {
     return found;
 }
 
-static uint64_t slot_sector(unsigned slot) {
-    return SYSTEM_SLOT_START + (uint64_t)slot * SYSTEM_SLOT_SECTORS;
-}
-
-static bool slot_read(unsigned slot, struct system_slot *out) {
-    if (!system_store_read(SYSTEM_CACHE, slot_sector(slot), sector, 1)) return false;
-    memcpy(out, sector, sizeof(*out));
-    return !memcmp(out->magic, "SOS2SLOT", 8) && out->version == 1 &&
-           out->data_offset == SYSTEM_SLOT_HEADER && out->data_size >= 32 &&
-           out->data_size <= RESOURCES_MAX && !out->reserved &&
-           crc32_ieee(out, offsetof(struct system_slot, crc32)) == out->crc32;
-}
-
-#ifdef SOS2_BOARD_REDMI2
-static uint8_t running[32];
-
-bool system_boot_load(struct platform_devices *d, uintptr_t dtb, uintptr_t ks, uintptr_t ke) {
-    int named = system_argument(d->bootargs, sizeof(d->bootargs), running);
-    if (named < 0) panic("invalid sos2.system boot argument");
-    if (!named) return false;
-    installed = true;
-    boot_progress_report(BOOT_READ_ENGINE, 0, 0);
-    if (!system_store_init(d))
-        panic("Installed SOS2: the eMMC's boot and cache partitions are unavailable");
-    bool found = false;
-    for (unsigned slot = 0; slot < 2; ++slot) {
-        struct system_slot s;
-        if (!slot_read(slot, &s) || memcmp(s.sha256, running, 32)) continue;
-        found = true;
-        uint32_t size = s.data_size, sectors = (size + 511) / 512;
-        /* The page-rounded range covers the last sector's padding too. */
-        if (!boot_memory_available(d, BOOT_RAMDISK_BASE, size, dtb, ks, ke, false))
-            panic("Installed SOS2: no free RAM to read its resources into");
-        unsigned char *to = (unsigned char *)BOOT_RAMDISK_BASE;
-        uint64_t first = slot_sector(slot) + SYSTEM_SLOT_HEADER / 512;
-        bool read = true;
-        for (uint32_t done = 0; read && done < sectors;) {
-            unsigned n = sectors - done < 128 ? sectors - done : 128;
-            boot_progress_report(BOOT_READ_ENGINE, done * 512, size);
-            read = system_store_read(SYSTEM_CACHE, first + done, to + (size_t)done * 512, n);
-            done += n;
-        }
-        if (!read) break;
-        boot_progress_report(BOOT_READ_ENGINE, size, size);
-        d->has_initrd_start = d->has_initrd_end = true;
-        d->initrd_start = BOOT_RAMDISK_BASE;
-        d->initrd_end = BOOT_RAMDISK_BASE + size;
-        if (boot_bundle_prepare(d, dtb, ks, ke)) {
-            boot_slot = slot;
-            return true;
-        }
-    }
-    if (!system_store_sectors(SYSTEM_CACHE))
-        panic("Installed SOS2: the eMMC failed while reading its resources");
-    panic(found ? "Installed SOS2: its resources fail their check; flash flash-cache.img again"
-                : "Installed SOS2: no cache slot holds its resources; flash flash-cache.img");
-}
-#endif
-
 void system_update_init(const struct platform_devices *d) {
 #ifndef SOS2_BOARD_REDMI2
     psci_method = d->psci_method;
-#else
-    (void)d;
+#endif
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE)
+    /* The installed system's boot image says so; the cache partition holds
+     * its app store and data volume. Without the eMMC it runs as a RAM
+     * session. */
+    installed = storage_installed(d->bootargs, sizeof(d->bootargs)) && system_store_init(d);
 #endif
     release[0] = 0;
     const struct runtime_file *f = runtime_file_find("/system/release");
@@ -211,8 +129,8 @@ void system_update_init(const struct platform_devices *d) {
         release[f->size] = 0;
     }
     update = (__typeof__(update)){0};
-#ifdef SOS2_BOARD_REDMI2
-    /* Read from the eMMC, it installs there; BEGIN tells a failed card. */
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE)
+    /* Installed on the eMMC, it installs there; BEGIN tells a failed card. */
     update.installs = installed;
 #endif
 }
@@ -229,7 +147,30 @@ static void drop(void) {
     if (update.buffer) vm_cpu_free(update.buffer, update.pages);
     update.buffer = 0;
     update.pages = 0;
+    for (unsigned i = 0; i < IMAGE_CHUNKS; ++i) {
+        if (update.image[i]) vm_cpu_free(update.image[i], IMAGE_CHUNK / PAGE_SIZE);
+        update.image[i] = 0;
+    }
     update.owner = 0;
+}
+
+/* The boot image's bytes from offset on, to the end of their piece. */
+static unsigned char *image_at(uint32_t offset) {
+    return update.image[offset / IMAGE_CHUNK] + offset % IMAGE_CHUNK;
+}
+
+/* The next run of whole sectors to write or read back from offset: at most
+ * eight, inside one piece. */
+static unsigned image_sectors(uint32_t offset) {
+    uint32_t left = update.header.boot_size - offset, piece = IMAGE_CHUNK - offset % IMAGE_CHUNK;
+    uint32_t n = (left < piece ? left : piece) / 512;
+    return n < 8 ? n : 8;
+}
+
+/* From the first sector's clearing until the install's end, the boot
+ * partition starts nothing. */
+static bool boot_open(void) {
+    return update.state == USER_UPDATE_WRITING || update.state == USER_UPDATE_CHECKING;
 }
 
 static int32_t failure(const char *text, int32_t error) {
@@ -240,17 +181,21 @@ static int32_t failure(const char *text, int32_t error) {
 }
 
 static const char storage_failed[] = "Storage failed; restart to try again";
+static const char boot_failed[] = "Boot image write failed; flash flash-boot.img";
 
-int32_t system_update_info(struct vm_space *space, uint32_t address, uint32_t size) {
+int32_t system_update_info(struct vm_space *space, user_ptr address, uint32_t size) {
     struct user_update_info info = {.state = update.state,
                                     .flags = (update.installs ? USER_UPDATE_INSTALLS : 0) |
                                              (restart_due ? USER_UPDATE_RESTART_DUE : 0)};
+#ifdef SOS2_BOARD_GTA7LITE
+    if (gta7lite_download_mode_available()) info.flags |= USER_UPDATE_DOWNLOAD_MODE;
+#endif
     if (update.state == USER_UPDATE_RECEIVING) {
         info.done = update.received;
         info.total = update.total;
-    } else if (update.state == USER_UPDATE_CHECKING) {
-        info.done = update.checked;
-        info.total = update.header.system_size;
+    } else if (boot_open()) {
+        info.done = update.done;
+        info.total = update.header.boot_size;
     }
     memcpy(info.release, release, sizeof(release));
     memcpy(info.message, update.message, sizeof(update.message));
@@ -263,15 +208,12 @@ static bool header_valid(const struct system_update_header *h) {
     size_t length = end ? (size_t)(end - h->release) : 0;
     for (size_t i = length; end && i < sizeof(h->release); ++i)
         if (h->release[i]) return false;
-    uint64_t system_offset = h->boot_offset + (((uint64_t)h->boot_size + 4095) & ~4095ull);
     return crc32_ieee(h, offsetof(struct system_update_header, crc32)) == h->crc32 &&
-           !memcmp(h->magic, "SOS2UPDT", 8) && h->version == 1 &&
+           !memcmp(h->magic, "SOS2UPDT", 8) && h->version == 2 &&
            h->header_size == SYSTEM_UPDATE_HEADER && !memcmp(h->board, board, sizeof(board)) &&
            length && printable(h->release, length) && h->boot_offset == SYSTEM_UPDATE_HEADER &&
            h->boot_size > ANDROID_PAGE && h->boot_size <= SYSTEM_BOOT_LIMIT &&
-           !(h->boot_size % ANDROID_PAGE) && h->system_offset == system_offset &&
-           h->system_size >= 32 && h->system_size <= RESOURCES_MAX &&
-           h->total_size == system_offset + h->system_size;
+           !(h->boot_size % ANDROID_PAGE) && h->total_size == h->boot_offset + h->boot_size;
 }
 
 /* An app's package: its header checked now, the rest kept in RAM. */
@@ -293,12 +235,10 @@ static int32_t app_begin(uint32_t pid, const unsigned char *bytes) {
     return 0;
 }
 
-static int32_t begin(uint32_t pid, struct vm_space *space, uint32_t address, uint32_t size) {
+static int32_t begin(uint32_t pid, struct vm_space *space, user_ptr address, uint32_t size) {
     /* Only the installed system takes files, to install them. */
     if (!update.installs) return USER_ENODEV;
-    if ((update.state == USER_UPDATE_RECEIVING || update.state == USER_UPDATE_CHECKING ||
-         update.state == USER_UPDATE_WRITING) &&
-        update.owner != pid)
+    if (boot_open() || (update.state == USER_UPDATE_RECEIVING && update.owner != pid))
         return USER_EBUSY;
     drop();
     update.state = USER_UPDATE_IDLE;
@@ -313,90 +253,36 @@ static int32_t begin(uint32_t pid, struct vm_space *space, uint32_t address, uin
     for (size_t i = sizeof(update.header); i < size; ++i)
         if (bytes[i]) return failure("Not an SOS2 update", USER_EINVAL);
     if (!header_valid(&update.header))
-        return failure("Not an SOS2 update for this phone", USER_EINVAL);
+        return failure("Not an SOS2 update for this device", USER_EINVAL);
     if (update.header.boot_size > system_store_sectors(SYSTEM_BOOT) * 512)
         return failure("Boot image does not fit", USER_EFBIG);
-    /* The slot the boot image does not start from; once an install has named
-     * the other, even the one this boot read, which RAM holds. */
-    update.slot = 1 - boot_slot;
-    /* A slot is whole once its header is back, written last. */
-    memset(sector, 0, sizeof(sector));
-    if (!system_store_write(SYSTEM_CACHE, slot_sector(update.slot), sector, 1) ||
-        !system_store_sync())
-        return failure(storage_failed, USER_EIO);
-    update.pages = (update.header.boot_size + PAGE_SIZE - 1) / PAGE_SIZE;
-    update.buffer = vm_cpu_alloc(update.pages);
-    if (!update.buffer) return failure("Not enough memory for the update", USER_ENOMEM);
-    sha256_begin(&update.boot_hash);
-    sha256_begin(&update.system_hash);
+    for (uint32_t at = 0; at < update.header.boot_size; at += IMAGE_CHUNK)
+        if (!(update.image[at / IMAGE_CHUNK] = vm_cpu_alloc(IMAGE_CHUNK / PAGE_SIZE)))
+            return failure("Not enough memory for the update", USER_ENOMEM);
+    sha256_begin(&update.hash);
     update.app = false;
     update.total = update.header.total_size;
     update.received = SYSTEM_UPDATE_HEADER;
-    update.checked = 0;
-    update.written = 0;
-    update.tail_used = 0;
+    update.done = 0;
     update.owner = pid;
     update.state = USER_UPDATE_RECEIVING;
     return 0;
 }
 
-static bool write_sectors(const void *data, unsigned count) {
-    uint64_t at = slot_sector(update.slot) + SYSTEM_SLOT_HEADER / 512 + update.written;
-    if (!system_store_write(SYSTEM_CACHE, at, data, count)) return false;
-    update.written += count;
-    work();
-    return true;
-}
-
-/* The resources into the slot, a whole sector at a time. */
-static bool store(const unsigned char *p, uint32_t n) {
+/* The file's bytes after its header: the boot image, into RAM. */
+static void consume(const unsigned char *p, uint32_t n) {
+    sha256_add(&update.hash, p, n);
     while (n) {
-        if (update.tail_used || n < 512) {
-            uint32_t take = 512 - update.tail_used < n ? 512 - update.tail_used : n;
-            memcpy(update.tail + update.tail_used, p, take);
-            update.tail_used += take;
-            p += take;
-            n -= take;
-            if (update.tail_used == 512) {
-                if (!write_sectors(update.tail, 1)) return false;
-                update.tail_used = 0;
-            }
-        } else {
-            unsigned count = n / 512 < 8 ? n / 512 : 8;
-            if (!write_sectors(p, count)) return false;
-            p += count * 512;
-            n -= count * 512;
-        }
-    }
-    return true;
-}
-
-/* The file's bytes in order: the boot image, zero padding, the resources. */
-static const char *consume(const unsigned char *p, uint32_t n) {
-    const struct system_update_header *h = &update.header;
-    while (n) {
-        uint32_t at = update.received, take;
-        if (at < h->boot_offset + h->boot_size) {
-            take = h->boot_offset + h->boot_size - at < n ? h->boot_offset + h->boot_size - at : n;
-            memcpy(update.buffer + (at - h->boot_offset), p, take);
-            sha256_add(&update.boot_hash, p, take);
-        } else if (at < h->system_offset) {
-            take = h->system_offset - at < n ? h->system_offset - at : n;
-            for (uint32_t i = 0; i < take; ++i)
-                if (p[i]) return "The download is damaged";
-        } else {
-            take = n;
-            sha256_add(&update.system_hash, p, take);
-            if (!store(p, take)) return storage_failed;
-        }
+        uint32_t at = update.received - SYSTEM_UPDATE_HEADER, take = IMAGE_CHUNK - at % IMAGE_CHUNK;
+        if (take > n) take = n;
+        memcpy(image_at(at), p, take);
         update.received += take;
         p += take;
         n -= take;
     }
-    return 0;
 }
 
-static int32_t receive(uint32_t pid, struct vm_space *space, uint32_t address, uint32_t size) {
+static int32_t receive(uint32_t pid, struct vm_space *space, user_ptr address, uint32_t size) {
     if (update.state != USER_UPDATE_RECEIVING || update.owner != pid || !size ||
         size > USER_UPDATE_WRITE_MAX)
         return USER_EINVAL;
@@ -410,8 +296,7 @@ static int32_t receive(uint32_t pid, struct vm_space *space, uint32_t address, u
             memcpy(update.buffer + update.received, scratch, n);
             update.received += n;
         } else {
-            const char *problem = consume((const unsigned char *)scratch, n);
-            if (problem) return failure(problem, USER_EIO);
+            consume((const unsigned char *)scratch, n);
         }
         done += n;
         work();
@@ -419,52 +304,37 @@ static int32_t receive(uint32_t pid, struct vm_space *space, uint32_t address, u
     return 0;
 }
 
+#ifndef SOS2_BOARD_GTA7LITE
 /* An image lk2nd starts as the installed system: the kernel at its address
- * with the DTB after it, no ramdisk or second stage, and a command line that
- * keeps data in RAM and names the update's resources, parsed as the next boot
- * will: lk2nd's bootargs start with it, the kernel keeps their first 255
- * bytes, and nothing else may join it. */
+ * with the DTB after it, the compressed resources as the ramdisk, where lk2nd
+ * puts one, no second stage, and a command line that keeps data on the eMMC,
+ * parsed as the next boot will: it fits the 255 bytes of sos2.* arguments
+ * the kernel keeps, and nothing else may join it. */
 static bool boot_image_valid(void) {
-    const unsigned char *image = update.buffer;
-    const struct system_update_header *h = &update.header;
-    uint32_t kernel = u32(image + 8);
-    if (memcmp(image, "ANDROID!", 8) || kernel < 64 || u32(image + 12) != KERNEL_ADDRESS ||
-        u32(image + 16) || u32(image + 24) || u32(image + 32) != TAGS_ADDRESS ||
-        u32(image + 36) != ANDROID_PAGE ||
-        ANDROID_PAGE + ((uint64_t)kernel + ANDROID_PAGE - 1) / ANDROID_PAGE * ANDROID_PAGE !=
-            h->boot_size ||
-        u32(image + ANDROID_PAGE + 0x24) != 0x016f2818)
+    const unsigned char *image = update.image[0];
+    uint32_t kernel = le32(image + 8), ramdisk = le32(image + 16);
+    uint64_t at =
+        ANDROID_PAGE + ((uint64_t)kernel + ANDROID_PAGE - 1) / ANDROID_PAGE * ANDROID_PAGE;
+    if (memcmp(image, "ANDROID!", 8) || kernel < 64 || le32(image + 12) != KERNEL_ADDRESS ||
+        ramdisk <= BOOT_BUNDLE_HEADER || le32(image + 20) != BOOT_RAMDISK_BASE || le32(image + 24) ||
+        le32(image + 32) != TAGS_ADDRESS || le32(image + 36) != ANDROID_PAGE ||
+        at + ((uint64_t)ramdisk + ANDROID_PAGE - 1) / ANDROID_PAGE * ANDROID_PAGE !=
+            update.header.boot_size ||
+        le32(image + ANDROID_PAGE + 0x24) != 0x016f2818)
+        return false;
+    /* The ramdisk starts a page, inside one piece: a SORZ header of its size. */
+    const unsigned char *resources = image_at((uint32_t)at);
+    if (le32(resources) != BOOT_BUNDLE_MAGIC || le32(resources + 4) != BOOT_BUNDLE_VERSION ||
+        le32(resources + 8) != BOOT_BUNDLE_HEADER ||
+        le32(resources + 12) != ramdisk - BOOT_BUNDLE_HEADER)
         return false;
     const char *cmdline = (const char *)image + 64, *end = memchr(cmdline, 0, 512);
     for (unsigned i = 608; i < 608 + 1024; ++i) /* the extra command line */
         if (image[i]) return false;
-    uint8_t named[32];
     return end && (size_t)(end - cmdline) < sizeof(((struct platform_devices *)0)->bootargs) &&
-           system_argument(cmdline, 512, named) == 1 && !memcmp(named, h->system_sha256, 32) &&
            storage_installed(cmdline, 512);
 }
-
-static bool write_boot(uint32_t first, uint32_t count) {
-    for (uint32_t at = first; at < first + count;) {
-        unsigned n = first + count - at < 8 ? first + count - at : 8;
-        if (!system_store_write(SYSTEM_BOOT, at, update.buffer + (size_t)at * 512, n)) return false;
-        at += n;
-        work();
-    }
-    return true;
-}
-
-static bool boot_matches(uint32_t first, uint32_t count) {
-    for (uint32_t at = first; at < first + count;) {
-        unsigned n = first + count - at < 8 ? first + count - at : 8;
-        if (!system_store_read(SYSTEM_BOOT, at, scratch, n) ||
-            memcmp(scratch, update.buffer + (size_t)at * 512, n * 512))
-            return false;
-        at += n;
-        work();
-    }
-    return true;
-}
+#endif
 
 /* The package against its SHA-256, a program the kernel can load, then the
  * app store. */
@@ -497,77 +367,53 @@ static int32_t app_finish(void) {
     return 0;
 }
 
-static int32_t finish(uint32_t pid) {
+/* A checked boot image in RAM: its first sector cleared, so that from now
+ * until the last write no release starts, then WRITING. */
+static int32_t install_begin(void) {
+    restart_due = false;
+    update.state = USER_UPDATE_WRITING;
+    update.done = 512;
+    memset(sector, 0, sizeof(sector));
+    if (!system_store_write(SYSTEM_BOOT, 0, sector, 1) || !system_store_sync())
+        return failure(boot_failed, USER_EIO);
+    return USER_EAGAIN;
+}
+
+/* Up to STEP_US of writing, then of reading back, then the first sector:
+ * USER_EAGAIN until the image is installed. */
+static int32_t install_step(void) {
     const struct system_update_header *h = &update.header;
-    if (update.owner != pid) return USER_EINVAL;
-    if (update.app) return app_finish();
-    uint8_t digest[32];
-    if (update.state == USER_UPDATE_RECEIVING) {
-        if (update.received != h->total_size) return failure("The download ended early", USER_EIO);
-        sha256_end(&update.boot_hash, digest);
-        if (memcmp(digest, h->boot_sha256, 32))
-            return failure("Boot image does not match its SHA-256", USER_EIO);
-        sha256_end(&update.system_hash, digest);
-        if (memcmp(digest, h->system_sha256, 32))
-            return failure("Resources do not match their SHA-256", USER_EIO);
-        if (!boot_image_valid()) return failure("Boot image not for this phone", USER_EINVAL);
-        if (update.tail_used) {
-            memset(update.tail + update.tail_used, 0, 512 - update.tail_used);
-            if (!write_sectors(update.tail, 1)) return failure(storage_failed, USER_EIO);
-            update.tail_used = 0;
+    uint64_t start = time_us();
+    if (update.state == USER_UPDATE_WRITING) {
+        while (update.done < h->boot_size) {
+            if (time_us() - start >= STEP_US) return USER_EAGAIN;
+            unsigned n = image_sectors(update.done);
+            if (!system_store_write(SYSTEM_BOOT, update.done / 512, image_at(update.done), n))
+                return failure(boot_failed, USER_EIO);
+            update.done += n * 512;
+            work();
         }
-        if (!system_store_sync()) return failure(storage_failed, USER_EIO);
-        sha256_begin(&update.system_hash);
-        update.checked = 0;
+        if (!system_store_sync()) return failure(boot_failed, USER_EIO);
         update.state = USER_UPDATE_CHECKING;
+        update.done = 512;
         return USER_EAGAIN;
     }
     if (update.state == USER_UPDATE_CHECKING) {
-        uint64_t start = time_us(), first = slot_sector(update.slot) + SYSTEM_SLOT_HEADER / 512;
-        while (update.checked < h->system_size) {
-            if (time_us() - start >= CHECK_US) return USER_EAGAIN;
-            uint32_t left = h->system_size - update.checked,
-                     n = left < sizeof(scratch) ? left : sizeof(scratch);
-            if (!system_store_read(SYSTEM_CACHE, first + update.checked / 512, scratch,
-                                   (n + 511) / 512))
-                return failure(storage_failed, USER_EIO);
-            sha256_add(&update.system_hash, scratch, n);
-            update.checked += n;
+        while (update.done < h->boot_size) {
+            if (time_us() - start >= STEP_US) return USER_EAGAIN;
+            unsigned n = image_sectors(update.done);
+            if (!system_store_read(SYSTEM_BOOT, update.done / 512, scratch, n) ||
+                memcmp(scratch, image_at(update.done), n * 512))
+                return failure(boot_failed, USER_EIO);
+            update.done += n * 512;
             work();
         }
-        sha256_end(&update.system_hash, digest);
-        if (memcmp(digest, h->system_sha256, 32))
-            return failure("Storage did not keep the update", USER_EIO);
-        struct system_slot slot = {.magic = {'S', 'O', 'S', '2', 'S', 'L', 'O', 'T'},
-                                   .version = 1,
-                                   .data_offset = SYSTEM_SLOT_HEADER,
-                                   .data_size = h->system_size};
-        memcpy(slot.sha256, h->system_sha256, 32);
-        slot.crc32 = crc32_ieee(&slot, offsetof(struct system_slot, crc32));
-        memset(sector, 0, sizeof(sector));
-        memcpy(sector, &slot, sizeof(slot));
-        if (!system_store_write(SYSTEM_CACHE, slot_sector(update.slot), sector, 1) ||
-            !system_store_sync())
-            return failure(storage_failed, USER_EIO);
-        /* The boot image will name this slot: its header too must be kept. */
-        struct system_slot stored;
-        if (!slot_read(update.slot, &stored) || memcmp(&stored, &slot, sizeof(slot)))
-            return failure("Storage did not keep the update", USER_EIO);
-        update.state = USER_UPDATE_WRITING;
-        return USER_EAGAIN;
-    }
-    if (update.state == USER_UPDATE_WRITING) {
-        uint32_t sectors = h->boot_size / 512;
-        /* From the first write until the last, no release starts. */
-        restart_due = false;
-        memset(sector, 0, sizeof(sector));
-        if (!system_store_write(SYSTEM_BOOT, 0, sector, 1) || !system_store_sync() ||
-            !write_boot(1, sectors - 1) || !system_store_sync() || !boot_matches(1, sectors - 1) ||
-            !write_boot(0, 1) || !system_store_sync() || !boot_matches(0, 1))
-            return failure("Boot image write failed; flash flash-boot.img", USER_EIO);
+        /* The first sector last: from here lk2nd starts the new image. */
+        if (!system_store_write(SYSTEM_BOOT, 0, update.image[0], 1) || !system_store_sync() ||
+            !system_store_read(SYSTEM_BOOT, 0, scratch, 1) || memcmp(scratch, update.image[0], 512))
+            return failure(boot_failed, USER_EIO);
         drop();
         update.state = USER_UPDATE_DONE;
-        boot_slot = update.slot;
         restart_due = true;
         say("Installed; restart to use it");
         return 0;
@@ -575,22 +421,209 @@ static int32_t finish(uint32_t pid) {
     return USER_EINVAL;
 }
 
+#ifdef SOS2_BOARD_GTA7LITE
+static bool tablet_update_valid(void);
+#endif
+
+static int32_t finish(uint32_t pid) {
+    const struct system_update_header *h = &update.header;
+    if (update.owner != pid) return USER_EINVAL;
+    if (update.app) return app_finish();
+    if (update.state == USER_UPDATE_RECEIVING) {
+        uint8_t digest[32];
+        if (update.received != h->total_size) return failure("The download ended early", USER_EIO);
+        sha256_end(&update.hash, digest);
+        if (memcmp(digest, h->boot_sha256, 32))
+            return failure("Boot image does not match its SHA-256", USER_EIO);
+#ifdef SOS2_BOARD_GTA7LITE
+        if (!tablet_update_valid()) return failure("Boot image not for this device", USER_EINVAL);
+#else
+        if (!boot_image_valid()) return failure("Boot image not for this device", USER_EINVAL);
+#endif
+        return install_begin();
+    }
+    return install_step();
+}
+
 static int32_t restart(void) {
-    /* The boot image is written within one FINISH: waiting for it means a
-     * FINISH still to come. */
-    if (update.state == USER_UPDATE_WRITING) return USER_EBUSY;
+    /* Until the boot image's last write, the boot partition starts nothing. */
+    if (boot_open()) return USER_EBUSY;
 #ifdef SOS2_BOARD_REDMI2
     (void)redmi2_power_restart();
     say("Did not restart; hold Power for 10 s");
 #else
     if (psci_method == CPU_BOOT_HVC || psci_method == CPU_BOOT_SMC)
-        (void)arm_psci_cpu_on(psci_method, 0x84000009 /* PSCI SYSTEM_RESET */, 0, 0);
+        (void)arm_psci_call(psci_method, 0x84000009 /* PSCI SYSTEM_RESET */, 0, 0);
     say("This machine did not restart");
 #endif
     return USER_EIO;
 }
 
-int32_t system_update_apps(struct vm_space *space, uint32_t address, uint32_t size) {
+/* Samsung's download mode, which the tablet's LK starts when the reboot
+ * reason asks for it; cleared again if the restart does not happen. */
+static int32_t restart_download(void) {
+#ifdef SOS2_BOARD_GTA7LITE
+    if (boot_open()) return USER_EBUSY;
+    if (!gta7lite_download_mode(true)) return USER_ENODEV;
+    int32_t result = restart();
+    (void)gta7lite_download_mode(false);
+    return result;
+#else
+    return USER_ENODEV;
+#endif
+}
+
+bool system_update_busy(void) { return boot_open(); }
+
+#ifdef SOS2_BOARD_GTA7LITE
+/* fastboot's downloads (boards/gta7lite/fastboot.c) hold the update in place
+ * of a process, which no pid matches. */
+enum { FASTBOOT_OWNER = UINT32_MAX, TABLET_KERNEL = 0x40080000, TABLET_HEADER = 1660 };
+
+static uint32_t page_align(uint32_t n) { return (n + ANDROID_PAGE - 1) & ~(uint32_t)(ANDROID_PAGE - 1); }
+
+/* The image's bytes at offset, which may cross from one piece to the next. */
+static bool image_is(uint32_t offset, const void *bytes, uint32_t n) {
+    const unsigned char *b = bytes;
+    for (uint32_t i = 0; i < n; ++i)
+        if (*image_at(offset + i) != b[i]) return false;
+    return true;
+}
+
+/* tools/package_gta7lite.py's installed image: an Android boot image header
+ * v2 with 2 KiB pages; a gzip kernel at LK's address; the compressed
+ * resources as the ramdisk, a SORZ header of its size; no second stage or
+ * recovery DTBO; a device tree or DT table; Samsung's trailer ending the
+ * image. Its command line keeps LK's 64-bit switch and the installed
+ * system's storage. */
+static bool tablet_image_valid(uint32_t size) {
+    static const unsigned char gzip[2] = {0x1f, 0x8b}, fdt[4] = {0xd0, 0x0d, 0xfe, 0xed},
+                               dt_table[4] = {0xd7, 0xb7, 0xab, 0x1e};
+    const unsigned char *h = update.image[0];
+    uint32_t kernel = le32(h + 8), ramdisk = le32(h + 16);
+    uint32_t dtb = le32(h + 1648);
+    if (memcmp(h, "ANDROID!", 8) || kernel < 64 || kernel > SYSTEM_BOOT_LIMIT ||
+        le32(h + 12) != TABLET_KERNEL || ramdisk <= BOOT_BUNDLE_HEADER ||
+        ramdisk > SYSTEM_BOOT_LIMIT || le32(h + 24) || le32(h + 36) != ANDROID_PAGE ||
+        le32(h + 40) != 2 || le32(h + 1632) || le32(h + 1644) != TABLET_HEADER || !dtb ||
+        dtb > SYSTEM_BOOT_LIMIT)
+        return false;
+    uint64_t ramdisk_at = ANDROID_PAGE + (uint64_t)page_align(kernel);
+    uint64_t dtb_at = ramdisk_at + page_align(ramdisk);
+    if (dtb_at + page_align(dtb) + 16 != size || !image_is(ANDROID_PAGE, gzip, 2) ||
+        !image_is(size - 16, "SEANDROIDENFORCE", 16) ||
+        !(image_is((uint32_t)dtb_at, fdt, 4) || image_is((uint32_t)dtb_at, dt_table, 4)))
+        return false;
+    /* The ramdisk starts a page, so its header lies inside one piece. */
+    const unsigned char *resources = image_at((uint32_t)ramdisk_at);
+    if (le32(resources) != BOOT_BUNDLE_MAGIC || le32(resources + 4) != BOOT_BUNDLE_VERSION ||
+        le32(resources + 8) != BOOT_BUNDLE_HEADER ||
+        le32(resources + 12) != ramdisk - BOOT_BUNDLE_HEADER)
+        return false;
+    const char *cmdline = (const char *)h + 64;
+    if (!memchr(cmdline, 0, 512) || !storage_installed(cmdline, 512)) return false;
+    static const char bootopt[] = "bootopt=64S3,32N2,64N2";
+    size_t at = 0, n;
+    for (const char *t; (t = token(cmdline, 512, &at, &n));)
+        if (n == sizeof(bootopt) - 1 && !memcmp(t, bootopt, n)) return true;
+    return false;
+}
+
+/* A downloaded update's image (sos2-gta7lite.update): header_valid wants
+ * whole 2 KiB pages, so the image, which Samsung's trailer ends 16 bytes
+ * into a page, comes padded with zeros to the next page; its own header
+ * gives its end. */
+static bool tablet_update_valid(void) {
+    const unsigned char *h = update.image[0];
+    uint32_t kernel = le32(h + 8), ramdisk = le32(h + 16), dtb = le32(h + 1648);
+    if (kernel > SYSTEM_BOOT_LIMIT || ramdisk > SYSTEM_BOOT_LIMIT || dtb > SYSTEM_BOOT_LIMIT) return false;
+    uint64_t size = ANDROID_PAGE + (uint64_t)page_align(kernel) + page_align(ramdisk) + page_align(dtb) + 16;
+    if (size > update.header.boot_size || page_align((uint32_t)size) != update.header.boot_size)
+        return false;
+    for (uint32_t at = (uint32_t)size; at < update.header.boot_size; ++at)
+        if (*image_at(at)) return false;
+    return tablet_image_valid((uint32_t)size);
+}
+
+uint32_t system_update_boot_capacity(void) {
+    if (!installed) return 0;
+    uint64_t bytes = system_store_sectors(SYSTEM_BOOT) * 512;
+    return bytes < SYSTEM_BOOT_LIMIT ? (uint32_t)bytes : SYSTEM_BOOT_LIMIT;
+}
+
+uint32_t system_update_boot_partition(void) {
+    uint64_t bytes = installed ? system_store_sectors(SYSTEM_BOOT) * 512 : 0;
+    return bytes < UINT32_MAX ? (uint32_t)bytes : 0;
+}
+
+const char *system_update_boot_begin(uint32_t size) {
+    if (!installed) return "not the installed system";
+    if (boot_open() || update.state == USER_UPDATE_RECEIVING) return "an update is in progress";
+    if (size <= ANDROID_PAGE || size > SYSTEM_BOOT_LIMIT) return "not a boot image's size";
+    /* Samsung's trailer ends the image 16 bytes into a sector: it is written
+     * padded with zeros to whole sectors, boot_size, while total is its size. */
+    uint32_t padded = (size + 511) & ~511u;
+    if (padded > system_store_sectors(SYSTEM_BOOT) * 512) return "too large for the boot partition";
+    drop();
+    update.state = USER_UPDATE_IDLE;
+    update.message[0] = 0;
+    update.header = (struct system_update_header){.boot_size = padded};
+    for (uint32_t at = 0; at < padded; at += IMAGE_CHUNK)
+        if (!(update.image[at / IMAGE_CHUNK] = vm_cpu_alloc(IMAGE_CHUNK / PAGE_SIZE))) {
+            drop();
+            return "not enough memory";
+        }
+    update.app = false;
+    update.total = size;
+    update.received = update.done = 0;
+    update.owner = FASTBOOT_OWNER;
+    update.state = USER_UPDATE_RECEIVING;
+    return 0;
+}
+
+const char *system_update_boot_receive(bool (*read)(void *data, uint32_t size)) {
+    if (update.owner != FASTBOOT_OWNER || update.state != USER_UPDATE_RECEIVING)
+        return "no download begun";
+    while (update.received < update.total) {
+        uint32_t piece = IMAGE_CHUNK - update.received % IMAGE_CHUNK;
+        if (piece > update.total - update.received) piece = update.total - update.received;
+        if (!read(image_at(update.received), piece)) {
+            drop();
+            update.state = USER_UPDATE_IDLE;
+            return "the download stopped";
+        }
+        update.received += piece;
+    }
+    /* The padding lies inside the last sector, so inside one piece. */
+    if (update.header.boot_size > update.total)
+        memset(image_at(update.total), 0, update.header.boot_size - update.total);
+    return 0;
+}
+
+const char *system_update_boot_install(void (*progress)(uint32_t done, uint32_t total, bool checking)) {
+    if (update.owner != FASTBOOT_OWNER || update.state != USER_UPDATE_RECEIVING ||
+        update.received != update.total)
+        return "nothing downloaded";
+    if (!tablet_image_valid(update.total)) {
+        (void)failure("Not an installed SOS2 image for this tablet", USER_EINVAL);
+        return update.message;
+    }
+    int32_t result = install_begin();
+    while (result == USER_EAGAIN) {
+        progress(update.done, update.header.boot_size, update.state == USER_UPDATE_CHECKING);
+        result = install_step();
+    }
+    return result ? update.message : 0;
+}
+#endif
+
+int32_t system_update_restart(bool download_mode) {
+    return download_mode ? restart_download() : restart();
+}
+
+const char *system_update_running_release(void) { return release; }
+
+int32_t system_update_apps(struct vm_space *space, user_ptr address, uint32_t size) {
     const struct app *records[2 * APP_LIMIT];
     unsigned count = apps_records(records, 2 * APP_LIMIT), n = 0;
     if (size % sizeof(struct user_update_app)) return USER_EINVAL;
@@ -609,7 +642,7 @@ int32_t system_update_apps(struct vm_space *space, uint32_t address, uint32_t si
     return (int32_t)n;
 }
 
-static int32_t remove_app(struct vm_space *space, uint32_t address, uint32_t size) {
+static int32_t remove_app(struct vm_space *space, user_ptr address, uint32_t size) {
     char id[16];
     if (!update.installs) return USER_ENODEV;
     if (update.owner) return USER_EBUSY;
@@ -633,13 +666,14 @@ static int32_t remove_app(struct vm_space *space, uint32_t address, uint32_t siz
 /* The receiving app's download failed: nothing is left to finish. */
 static int32_t cancel(uint32_t pid) {
     if (!pid || update.owner != pid) return USER_EINVAL;
+    if (boot_open()) return USER_EBUSY;
     drop();
     update.state = USER_UPDATE_IDLE;
     update.message[0] = 0;
     return 0;
 }
 
-int32_t system_update_call(uint32_t pid, struct vm_space *space, uint32_t op, uint32_t address,
+int32_t system_update_call(uint32_t pid, struct vm_space *space, uint32_t op, user_ptr address,
                            uint32_t size) {
     worked_at = time_us();
     switch (op) {
@@ -649,11 +683,18 @@ int32_t system_update_call(uint32_t pid, struct vm_space *space, uint32_t op, ui
         case USER_UPDATE_RESTART: return address || size ? USER_EINVAL : restart();
         case USER_UPDATE_REMOVE: return remove_app(space, address, size);
         case USER_UPDATE_CANCEL: return address || size ? USER_EINVAL : cancel(pid);
+        case USER_UPDATE_DOWNLOAD: return address || size ? USER_EINVAL : restart_download();
         default: return USER_EINVAL;
     }
 }
 
 void system_update_release(uint32_t pid) {
     if (!pid || update.owner != pid) return;
+    /* Past the first sector, only the whole write leaves a phone that starts:
+     * it goes on, on the service worker, without the updater. */
+    if (boot_open()) {
+        while (finish(pid) == USER_EAGAIN) continue;
+        return;
+    }
     (void)failure("Updater closed; update stopped", 0);
 }

@@ -1,0 +1,116 @@
+--- a/Source/WTF/wtf/PlatformUse.h
++++ b/Source/WTF/wtf/PlatformUse.h
+@@ -83,7 +83,8 @@
+ #define USE_SOUP 1
+ #endif
+ 
+-#if USE(COORDINATED_GRAPHICS) && USE(THEME_ADWAITA) && USE(SKIA)
++/* SOS2 has no scrolling thread; WebCore paints its scrollbars. */
++#if USE(COORDINATED_GRAPHICS) && USE(THEME_ADWAITA) && USE(SKIA) && !OS(SOS2)
+ #define USE_COORDINATED_GRAPHICS_ASYNC_SCROLLBAR 1
+ #endif
+ 
+--- a/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/PlatformDisplaySkia.cpp
+@@ -41,6 +41,10 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #if USE(LIBEPOXY)
+ #include <epoxy/egl.h>
+ #include <skia/gpu/ganesh/gl/epoxy/GrGLMakeEpoxyEGLInterface.h>
++#elif OS(SOS2)
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <skia/gpu/ganesh/gl/GrGLAssembleInterface.h>
+ #else
+ #include <EGL/egl.h>
+ #include <EGL/eglext.h>
+@@ -82,6 +86,11 @@ static sk_sp<const GrGLInterface> skiaGLInterface()
+     static NeverDestroyed<sk_sp<const GrGLInterface>> grGLInterface {
+ #if USE(LIBEPOXY)
+         GrGLInterfaces::MakeEpoxyEGL()
++#elif OS(SOS2)
++        // Mesa is linked statically: its EGL resolves every GLES entry point.
++        GrGLMakeAssembledGLESInterface(nullptr, [](void*, const char* name) -> GrGLFuncPtr {
++            return eglGetProcAddress(name);
++        })
+ #else
+         GrGLInterfaces::MakeEGL()
+ #endif
+@@ -202,6 +211,12 @@ static unsigned initializeMSAASampleCount(GrDirectContext* grContext)
+     static int sampleCount = s_defaultSampleCount;
+ 
+     std::call_once(onceFlag, [grContext] {
++#if OS(SOS2)
++        // SYS_GPU has no multisampled resources.
++        UNUSED_PARAM(grContext);
++        sampleCount = 0;
++        return;
++#endif
+         // Let the user override the default sample count if they want to.
+         String envString = String::fromLatin1(getenv("WEBKIT_SKIA_MSAA_SAMPLE_COUNT"));
+         if (!envString.isEmpty())
+@@ -264,7 +279,14 @@ private:
+         // FIXME: add GrContextOptions, shader cache, etc.
+         GrContextOptions options;
+         options.fAllowMSAAOnNewIntel = shouldAllowMSAAOnNewIntel();
++#if OS(SOS2)
++        options.fInternalMultisampleCount = 0;
++#endif
+         if (auto grContext = GrDirectContexts::MakeGL(skiaGLInterface(), options)) {
++#if OS(SOS2)
++            // Uploaded textures keep a shadow copy in page memory, which has a quota.
++            grContext->setResourceCacheLimit(32 * MB);
++#endif
+             m_skiaGLContext = WTF::move(glContext);
+             m_skiaGrContext = WTF::move(grContext);
+             m_sampleCount = initializeMSAASampleCount(m_skiaGrContext.get());
+@@ -280,7 +302,7 @@ private:
+ 
+ GLContext* PlatformDisplay::skiaGLContext()
+ {
+-#if PLATFORM(GTK) || PLATFORM(WPE) || (PLATFORM(PLAYSTATION) && !USE(COORDINATED_GRAPHICS))
++#if PLATFORM(GTK) || PLATFORM(WPE) || OS(SOS2) || (PLATFORM(PLAYSTATION) && !USE(COORDINATED_GRAPHICS))
+     if (!s_skiaGLContext) {
+         s_skiaGLContext = SkiaGLContext::create(*this);
+         m_skiaGLContexts.add(*s_skiaGLContext);
+--- a/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp
++++ b/Source/WebCore/platform/graphics/skia/SkiaPaintingEngine.cpp
+@@ -215,7 +215,12 @@ unsigned SkiaPaintingEngine::numberOfCPUPaintingThreads()
+     static unsigned numberOfThreads = 0;
+ 
+     std::call_once(onceFlag, [] {
++#if OS(SOS2)
++        // Tiles are painted on the calling thread, which then composites them.
++        numberOfThreads = 0;
++#else
+         numberOfThreads = std::max(1, std::min(8, WTF::numberOfProcessorCores() / 2)); // By default, use half the CPU cores, capped at 8.
++#endif
+ 
+         if (const char* envString = getenv("WEBKIT_SKIA_CPU_PAINTING_THREADS")) {
+             auto newValue = parseInteger<unsigned>(StringView::fromLatin1(envString));
+@@ -235,8 +240,13 @@ unsigned SkiaPaintingEngine::numberOfGPUPaintingThreads()
+     static unsigned numberOfThreads = 0;
+ 
+     std::call_once(onceFlag, [] {
++#if OS(SOS2)
++        // Pages paint and composite their tiles on one thread.
++        numberOfThreads = 0;
++#else
+         // By default, use 2 GPU worker threads if there are four or more CPU cores, otherwise use 1 thread only.
+         numberOfThreads = WTF::numberOfProcessorCores() >= 4 ? 2 : 1;
++#endif
+ 
+         if (const char* envString = getenv("WEBKIT_SKIA_GPU_PAINTING_THREADS")) {
+             auto newValue = parseInteger<unsigned>(StringView::fromLatin1(envString));
+--- a/Source/WebCore/platform/graphics/texmap/TextureMapperGLHeaders.h
++++ b/Source/WebCore/platform/graphics/texmap/TextureMapperGLHeaders.h
+@@ -36,6 +36,10 @@
+ #define GL_BGRA 0x80E1
+ #endif
+ 
++#ifndef GL_RGBA8
++#define GL_RGBA8 0x8058
++#endif
++
+ #ifndef GL_TEXTURE_RECTANGLE_ARB
+ #define GL_TEXTURE_RECTANGLE_ARB 0x84F5
+ #endif

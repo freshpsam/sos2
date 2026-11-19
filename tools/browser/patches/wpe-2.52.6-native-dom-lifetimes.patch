@@ -1,0 +1,235 @@
+WebKitGTK/WPE 2.52 stable branch fixes for SOS2.
+Upstream commits in application order:
+https://github.com/WebKit/WebKit/commit/d532453033db6ecd94418d3c5309fb31cd0dbb69
+https://github.com/WebKit/WebKit/commit/a98add16dcd426c9891aa5b061199eef0dc4b999
+https://github.com/WebKit/WebKit/commit/9e2b19d8e67b855ca789e9b2b3f6797ad5e2b73d
+https://github.com/WebKit/WebKit/commit/3c52c9cfaecb9e2d87b986d80814140d164113a2
+https://github.com/WebKit/WebKit/commit/c88db38e4ddeeb5b2445ece985c6d7fdd54abb64
+https://github.com/WebKit/WebKit/commit/289d3ee2940d5771e0c7af454283c92d0463c694
+
+--- a/Source/WebCore/css/CSSPrimitiveValue.cpp
++++ b/Source/WebCore/css/CSSPrimitiveValue.cpp
+@@ -43,7 +43,9 @@
+ #include "RenderView.h"
+ #include "StyleCalculationValue.h"
+ #include "StyleLengthResolution.h"
++#include <type_traits>
+ #include <wtf/Hasher.h>
++#include <wtf/MainThread.h>
+ #include <wtf/NeverDestroyed.h>
+ #include <wtf/StdLibExtras.h>
+ #include <wtf/text/MakeString.h>
+@@ -412,6 +414,7 @@
+         break;
+     }
+     if (m_hasCachedCSSText) {
++        ASSERT(isMainThread());
+         ASSERT(serializedPrimitiveValues().contains(this));
+         serializedPrimitiveValues().remove(this);
+     }
+@@ -1050,11 +1053,20 @@
+     case CSSUnitType::CSS_PROPERTY_ID:
+         return nameString(m_value.propertyID);
+     default:
++        // The memoization map and m_hasCachedCSSText are not thread-safe, and worker threads can
++        // serialize FontFace descriptors concurrently with the main thread. Only memoize on the
++        // main thread; other threads serialize without touching the shared state.
++        if (!isMainThread())
++            return serializeInternal(context);
+         auto& map = serializedPrimitiveValues();
+         ASSERT(map.contains(this) == m_hasCachedCSSText);
+         if (m_hasCachedCSSText)
+             return map.get(this);
+         String serializedValue = serializeInternal(context);
++        // m_hasCachedCSSText is written here without synchronization, so it must live in its own
++        // memory location (not a bit-field packed with concurrently-read members).
++        static_assert(std::is_member_object_pointer_v<decltype(&CSSPrimitiveValue::m_hasCachedCSSText)>,
++            "m_hasCachedCSSText must not be a bit-field");
+         m_hasCachedCSSText = true;
+         map.add(this, serializedValue);
+         return serializedValue;
+--- a/Source/WebCore/css/CSSValue.h
++++ b/Source/WebCore/css/CSSValue.h
+@@ -301,12 +301,13 @@
+ 
+     // CSSPrimitiveValue:
+     uint8_t m_primitiveUnitType : 7 { 0 }; // CSSUnitType
+-    mutable uint8_t m_hasCachedCSSText : 1 { false };
+     uint8_t m_isImplicitInitialValue : 1 { false };
+ 
+     // CSSValueList and CSSValuePair:
+     uint8_t m_valueSeparator : ValueSeparatorBits { 0 };
+ 
++    mutable uint8_t m_hasCachedCSSText { false };
++
+ private:
+     ClassType m_classType : ClassTypeBits;
+ };
+--- a/Source/WebCore/dom/Attr.cpp
++++ b/Source/WebCore/dom/Attr.cpp
+@@ -114,7 +114,7 @@
+             auto type = trustedTypeForAttribute(element->nodeName(), qualifiedName().localName(),
+                 element->namespaceURI(), qualifiedName().namespaceURI());
+             if (!type.attributeType.isNull()) {
+-                auto compliantValue = trustedTypesCompliantAttributeValue(document().contextDocument(), type.attributeType, value,
++                auto compliantValue = trustedTypesCompliantAttributeValue(protect(document().contextDocument()), type.attributeType, value,
+                     type.sink);
+                 if (compliantValue.hasException())
+                     return compliantValue.releaseException();
+--- a/Source/WebCore/dom/Element.cpp
++++ b/Source/WebCore/dom/Element.cpp
+@@ -2160,7 +2160,7 @@
+         AttributeTypeAndSink type;
+         if (document().contextDocument().requiresTrustedTypes())
+             type = trustedTypeForAttribute(nodeName(), name.localName().convertToASCIILowercase(), this->namespaceURI(), name.namespaceURI());
+-        auto compliantValue = trustedTypesCompliantAttributeValue(document().contextDocument(), type.attributeType, value, type.sink);
++        auto compliantValue = trustedTypesCompliantAttributeValue(protect(document().contextDocument()), type.attributeType, value, type.sink);
+ 
+         if (compliantValue.hasException())
+             return compliantValue.releaseException();
+@@ -3798,7 +3798,7 @@
+     if (document().contextDocument().requiresTrustedTypes()) {
+         auto& name = attrNode.qualifiedName();
+         auto type = trustedTypeForAttribute(nodeName(), name.localName().convertToASCIILowercase(), this->namespaceURI(), name.namespaceURI());
+-        auto compliantValue = trustedTypesCompliantAttributeValue(document().contextDocument(), type.attributeType, attrNodeValue, type.sink);
++        auto compliantValue = trustedTypesCompliantAttributeValue(protect(document().contextDocument()), type.attributeType, attrNodeValue, type.sink);
+ 
+         if (compliantValue.hasException())
+             return compliantValue.releaseException();
+@@ -3855,7 +3855,7 @@
+     if (document().contextDocument().requiresTrustedTypes()) {
+         auto& name = attrNode.qualifiedName();
+         auto type = trustedTypeForAttribute(nodeName(), name.localName(), this->namespaceURI(), name.namespaceURI());
+-        auto compliantValue = trustedTypesCompliantAttributeValue(document().contextDocument(), type.attributeType, attrNodeValue, type.sink);
++        auto compliantValue = trustedTypesCompliantAttributeValue(protect(document().contextDocument()), type.attributeType, attrNodeValue, type.sink);
+ 
+         if (compliantValue.hasException())
+             return compliantValue.releaseException();
+@@ -3949,7 +3949,7 @@
+         AttributeTypeAndSink type;
+         if (document().contextDocument().requiresTrustedTypes())
+             type = trustedTypeForAttribute(nodeName(), parsedAttributeName.localName(), this->namespaceURI(), parsedAttributeName.namespaceURI());
+-        auto compliantValue = trustedTypesCompliantAttributeValue(document().contextDocument(), type.attributeType, value, type.sink);
++        auto compliantValue = trustedTypesCompliantAttributeValue(protect(document().contextDocument()), type.attributeType, value, type.sink);
+ 
+         if (compliantValue.hasException())
+             return compliantValue.releaseException();
+--- a/Source/WebCore/html/canvas/CanvasRenderingContext2DBase.cpp
++++ b/Source/WebCore/html/canvas/CanvasRenderingContext2DBase.cpp
+@@ -2883,7 +2883,6 @@
+     // FIXME: Need to refetch fontProxy. CanvasFilterContextSwitcher might have called save().
+     // https://bugs.webkit.org/show_bug.cgi?id=193077.
+     auto* c = effectiveDrawingContext();
+-    auto& fontProxy = *this->fontProxy();
+ 
+ #if USE(CG)
+     const CanvasStyle& drawStyle = fill ? state().fillStyle : state().strokeStyle;
+@@ -2913,7 +2912,7 @@
+             else
+                 c->setStrokeColor(Color::black);
+ 
+-            fontProxy.drawBidiText(*c, textRun, location + offset, FontCascade::CustomFontNotReadyAction::UseFallbackIfFontNotReady);
++            fontProxy()->drawBidiText(*c, textRun, location + offset, FontCascade::CustomFontNotReadyAction::UseFallbackIfFontNotReady);
+         }
+ 
+         auto maskImage = c->createAlignedImageBuffer(maskRect.size());
+@@ -2935,10 +2934,10 @@
+             maskImageContext.translate(location - maskRect.location());
+             // We draw when fontWidth is 0 so compositing operations (eg, a "copy" op) still work.
+             maskImageContext.scale(FloatSize((fontWidth > 0 ? (width / fontWidth) : 0), 1));
+-            fontProxy.drawBidiText(maskImageContext, textRun, FloatPoint(0, 0), FontCascade::CustomFontNotReadyAction::UseFallbackIfFontNotReady);
++            fontProxy()->drawBidiText(maskImageContext, textRun, FloatPoint(0, 0), FontCascade::CustomFontNotReadyAction::UseFallbackIfFontNotReady);
+         } else {
+             maskImageContext.translate(-maskRect.location());
+-            fontProxy.drawBidiText(maskImageContext, textRun, location, FontCascade::CustomFontNotReadyAction::UseFallbackIfFontNotReady);
++            fontProxy()->drawBidiText(maskImageContext, textRun, location, FontCascade::CustomFontNotReadyAction::UseFallbackIfFontNotReady);
+         }
+ 
+         GraphicsContextStateSaver stateSaver(*c);
+@@ -2966,15 +2965,15 @@
+     bool repaintEntireCanvas = false;
+     if (isFullCanvasCompositeMode(state().globalComposite)) {
+         beginCompositeLayer();
+-        fontProxy.drawBidiText(*c, textRun, location, FontCascade::CustomFontNotReadyAction::UseFallbackIfFontNotReady);
++        fontProxy()->drawBidiText(*c, textRun, location, FontCascade::CustomFontNotReadyAction::UseFallbackIfFontNotReady);
+         endCompositeLayer();
+         repaintEntireCanvas = true;
+     } else if (state().globalComposite == CompositeOperator::Copy) {
+         clearCanvas();
+-        fontProxy.drawBidiText(*c, textRun, location, FontCascade::CustomFontNotReadyAction::UseFallbackIfFontNotReady);
++        fontProxy()->drawBidiText(*c, textRun, location, FontCascade::CustomFontNotReadyAction::UseFallbackIfFontNotReady);
+         repaintEntireCanvas = true;
+     } else
+-        fontProxy.drawBidiText(*c, textRun, location, FontCascade::CustomFontNotReadyAction::UseFallbackIfFontNotReady);
++        fontProxy()->drawBidiText(*c, textRun, location, FontCascade::CustomFontNotReadyAction::UseFallbackIfFontNotReady);
+ 
+     didDraw(repaintEntireCanvas, targetSwitcher ? targetSwitcher->expandedBounds() : textRect);
+ }
+--- a/Source/WebCore/layout/integration/inline/LayoutIntegrationInlineContentBuilder.cpp
++++ b/Source/WebCore/layout/integration/inline/LayoutIntegrationInlineContentBuilder.cpp
+@@ -337,15 +337,22 @@
+         return { boxCount };
+     }();
+ 
++    auto damagedRect = FloatRect { };
++
+     if (!firstDamagedLineIndex || !numberOfDamagedLines || !firstDamagedBoxIndex || !numberOfDamagedBoxes) {
+         ASSERT_NOT_REACHED();
+-        return { };
++        // We failed to compute the damaged range. The existing display content may still hold references to
++        // layout boxes that were detached (see InlineDamage::m_detachedLayoutBoxes) and will be destroyed as
++        // soon as line damage is released. Do not leave those stale display boxes in place.
++        for (auto& line : inlineContent.displayContent().lines)
++            damagedRect.unite(line.inkOverflow());
++        inlineContent.displayContent().clear();
++        return damagedRect;
+     }
+ 
+     auto numberOfNewLines = layoutResult.displayContent.lines.size();
+     auto numberOfNewBoxes = layoutResult.displayContent.boxes.size();
+ 
+-    auto damagedRect = FloatRect { };
+     auto adjustDamagedRectWithLineRange = [&](size_t firstLineIndex, size_t lineCount) {
+         auto& lines = inlineContent.displayContent().lines;
+         ASSERT(firstLineIndex + lineCount <= lines.size());
+--- a/Source/WebCore/loader/NavigationAction.h
++++ b/Source/WebCore/loader/NavigationAction.h
+@@ -143,7 +143,7 @@
+     std::optional<PrivateClickMeasurement> m_privateClickMeasurement;
+     std::function<bool()> m_pendingDispatchNavigateEvent;
+ 
+-    NavigationType m_type;
++    NavigationType m_type { NavigationType::Other };
+     std::optional<NavigationNavigationType> m_navigationAPIType;
+ 
+     bool m_hasOpenedFrames { false };
+--- a/Source/WebCore/xml/parser/XMLDocumentParser.cpp
++++ b/Source/WebCore/xml/parser/XMLDocumentParser.cpp
+@@ -208,14 +208,25 @@
+             return;
+     } else {
+         updateLeafTextNode();
++
++        // Appending to the leaf text node may have fired mutation events, which can run arbitrary scripts.
++        if (isDetached())
++            return;
+         document()->styleScope().didChangeStyleSheetEnvironment();
+     }
+ 
+     if (isParsing())
+         prepareToStopParsing();
+-    protectedDocument()->setReadyState(Document::ReadyState::Interactive);
++
++    Ref document = *this->document();
++    document->setReadyState(Document::ReadyState::Interactive);
++
++    // Setting the ready state above dispatches readystatechange, which can run arbitrary scripts.
++    if (isDetached())
++        return;
++
+     clearCurrentNodeStack();
+-    protectedDocument()->finishedParsing();
++    document->finishedParsing();
+ }
+ 
+ void XMLDocumentParser::finish()

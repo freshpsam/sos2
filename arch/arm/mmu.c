@@ -78,6 +78,27 @@ static void clean_user_page(uintptr_t address) {
     __asm__ volatile("dsb ish" ::: "memory");
 }
 
+/* Writable and executable at once only in the engine's JIT window, which
+ * kernel/protection/process.c offers to web page processes alone. */
+static bool user_permissions(user_ptr address, unsigned permissions) {
+    return (permissions & (VM_WRITE | VM_EXEC)) != (VM_WRITE | VM_EXEC) ||
+           (address >= USER_JIT_BASE && address < USER_JIT_END);
+}
+
+/* A private page's entry. No permissions make it kernel-only: mapped and
+ * counted, but inaccessible to the process. */
+static uint32_t user_pte(uintptr_t physical, unsigned permissions) {
+    return physical | SMALL | CACHED | SHARED |
+           (permissions ? ((permissions & VM_WRITE) ? USER_RW : USER_RO) : KERNEL_RW) |
+           ((permissions & VM_EXEC) ? 0 : XN);
+}
+
+/* The heap, or the JIT window, for page-granular allocation and release. */
+static bool allocation_range(user_ptr lower, user_ptr upper) {
+    return lower < upper && ((lower >= USER_HEAP_BASE && upper <= USER_HEAP_END) ||
+                             (lower >= USER_JIT_BASE && upper <= USER_JIT_END));
+}
+
 static void user_alias(uintptr_t address, bool cached) {
     uint32_t *table = table_for(kernel_root, address);
     if (!table) panic("missing user physical alias");
@@ -215,8 +236,11 @@ static bool enable_translation(bool secondary) {
                      : "memory");
     __asm__ volatile("mcr p15, 0, %0, c1, c0, 2\n isb" : : "r"(cpacr) : "memory");
     vm_switch(0);
-    control &= ~((1u << 29) | (1u << 28));               /* AFE/TRE */
-    control |= (1u << 23) | (1u << 19) | (1u << 12) | 5; /* XP, WXN, I-cache, D-cache, MMU */
+    /* AFE, TRE and WXN off: the JIT window is writable and executable; vm_map
+     * and vm_protect keep W^X everywhere else, and every kernel RW mapping is XN. */
+    control &= ~((1u << 29) | (1u << 28) | (1u << 19));
+    /* XP, I-cache, D-cache, MMU. */
+    control |= (1u << 23) | (1u << 12) | 5;
     __asm__ volatile("dsb sy\n mcr p15, 0, %0, c1, c0, 0\n isb" : : "r"(control) : "memory");
     return true;
 }
@@ -280,7 +304,12 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
                     CACHED | KERNEL_RW | XN))
         return false;
     if (!kernel_map(pool_start, pool_end - pool_start, NORMAL | KERNEL_RW | XN)) return false;
-    if (resource_size && !kernel_map(resources, resource_size, NORMAL | KERNEL_RO | XN))
+    /* Cached: the resources are immutable from here. They arrived with the
+     * MMU off (a ramdisk, or read from the eMMC), or were decoded through
+     * boot_cache.c, which cleans them to the point of coherency; nothing
+     * writes them again, and this is their only mapping. The engine block
+     * is copied from them. */
+    if (resource_size && !kernel_map(resources, resource_size, CACHED | KERNEL_RO | XN))
         return false;
     for (unsigned i = 0; i < machine->device_count; ++i) {
         const struct arm_mapping *r = &machine->devices[i];
@@ -395,10 +424,10 @@ void vm_destroy(struct vm_space *s) {
     *s = (struct vm_space){0};
 }
 
-bool vm_map(struct vm_space *s, uint32_t address, unsigned permissions) {
+bool vm_map(struct vm_space *s, user_ptr address, unsigned permissions) {
     if (!s->root || (address & (PAGE_SIZE - 1)) || address < USER_BASE || address >= USER_END ||
-        s->mapped_pages >= USER_PAGE_QUOTA || !(permissions & VM_READ) || (permissions & ~7u) ||
-        ((permissions & (VM_WRITE | VM_EXEC)) == (VM_WRITE | VM_EXEC)))
+        s->mapped_pages >= USER_PAGE_QUOTA || (permissions & ~7u) ||
+        (permissions && (!(permissions & VM_READ) || !user_permissions(address, permissions))))
         return false;
     uint32_t *table = user_table(s, address);
     if (!table) {
@@ -414,16 +443,15 @@ bool vm_map(struct vm_space *s, uint32_t address, unsigned permissions) {
         release_empty_table(s, address);
         return false;
     }
+    /* user_alias cleans the page to the point of coherency, as code needs. */
     user_alias((uintptr_t)page, true);
-    if (permissions & VM_EXEC) clean_user_page((uintptr_t)page);
-    *pte = (uintptr_t)page | SMALL | CACHED | SHARED |
-           ((permissions & VM_WRITE) ? USER_RW : USER_RO) | ((permissions & VM_EXEC) ? 0 : XN);
+    *pte = user_pte((uintptr_t)page, permissions);
     ++s->mapped_pages;
     if (permissions & VM_EXEC) epoch_advance();
     return true;
 }
 
-bool vm_map_shared(struct vm_space *s, uint32_t address, unsigned page, unsigned permissions) {
+bool vm_map_shared(struct vm_space *s, user_ptr address, unsigned page, unsigned permissions) {
     if (!s->root || (address & (PAGE_SIZE - 1)) || address < USER_BASE || address >= USER_END ||
         page >= shared_pages || !(permissions & VM_READ) || (permissions & ~(VM_READ | VM_EXEC)))
         return false;
@@ -444,7 +472,7 @@ bool vm_map_shared(struct vm_space *s, uint32_t address, unsigned page, unsigned
     return true;
 }
 
-void *vm_resolve(const struct vm_space *s, uint32_t address, unsigned permissions) {
+void *vm_resolve(const struct vm_space *s, user_ptr address, unsigned permissions) {
     uint32_t *table = user_table(s, address);
     if (!table) return 0;
     uint32_t pte = table[(address >> 12) & 255];
@@ -454,44 +482,60 @@ void *vm_resolve(const struct vm_space *s, uint32_t address, unsigned permission
     return (void *)(uintptr_t)((pte & ~4095u) | (address & 4095));
 }
 
-bool vm_mapped(const struct vm_space *s, uint32_t address) {
+/* SYS_ICACHE_SYNC, on the CPU whose TTBR0 holds s's tables: the call trapped
+ * from that process's user mode on this CPU. Code just written into the JIT
+ * window becomes visible to instruction fetch on every core: data lines are
+ * cleaned, then instruction lines and branch predictors invalidated, all
+ * broadcast to the inner shareable domain. It takes the user address, since
+ * the A53's instruction cache is virtually indexed and the kernel's physical
+ * alias would miss its lines. Every page is checked first: a fault here would
+ * stop the CPU. Interrupts are masked throughout, so the length is capped
+ * (the SDK splits longer ranges). */
+int32_t vm_icache_sync(const struct vm_space *s, user_ptr address, uint32_t size) {
+    enum { SYNC_MAX = 256 * 1024 };
+    if (!size) return 0;
+    if (!s || size > SYNC_MAX || address < USER_JIT_BASE || address >= USER_JIT_END ||
+        size > USER_JIT_END - address)
+        return USER_EINVAL;
+    user_ptr end = address + size;
+    for (user_ptr page = address & ~(user_ptr)(PAGE_SIZE - 1); page < end; page += PAGE_SIZE)
+        if (!vm_resolve(s, page, VM_READ)) return USER_EINVAL;
+    uint32_t ctr;
+    __asm__ volatile("mrc p15, 0, %0, c0, c0, 1" : "=r"(ctr));
+    uint32_t data_line = 4u << ((ctr >> 16) & 15), code_line = 4u << (ctr & 15);
+    /* Clean/invalidate to PoC, as clean_user_page, for the A53's errata. */
+    for (user_ptr at = address & ~(data_line - 1); at < end; at += data_line)
+        __asm__ volatile("mcr p15, 0, %0, c7, c14, 1" : : "r"(at) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (user_ptr at = address & ~(code_line - 1); at < end; at += code_line)
+        __asm__ volatile("mcr p15, 0, %0, c7, c5, 1" : : "r"(at) : "memory"); /* ICIMVAU */
+    __asm__ volatile("mcr p15, 0, %0, c7, c1, 6\n dsb ish\n isb" /* BPIALLIS */
+                     :
+                     : "r"(0)
+                     : "memory");
+    return 0;
+}
+
+bool vm_mapped(const struct vm_space *s, user_ptr address) {
     uint32_t *table = user_table(s, address);
     return table && (table[(address >> 12) & 255] & SMALL);
 }
 
-bool vm_protect(struct vm_space *s, uint32_t address, unsigned permissions) {
+bool vm_protect(struct vm_space *s, user_ptr address, unsigned permissions) {
     if ((address & (PAGE_SIZE - 1)) || (permissions & ~7u) ||
-        ((permissions & (VM_WRITE | VM_EXEC)) == (VM_WRITE | VM_EXEC)) ||
-        (permissions && !(permissions & VM_READ)))
+        !user_permissions(address, permissions) || (permissions && !(permissions & VM_READ)))
         return false;
     uint32_t *table = user_table(s, address);
     if (!table || !(table[(address >> 12) & 255] & SMALL)) return false;
     uint32_t *pte = &table[(address >> 12) & 255];
     if (shared_page(*pte & ~4095u)) return false;
     if (permissions & VM_EXEC) clean_user_page(*pte & ~4095u);
-    *pte = (*pte & ~4095u) | SMALL | CACHED | SHARED |
-           (permissions ? ((permissions & VM_WRITE) ? USER_RW : USER_RO) : KERNEL_RW) |
-           ((permissions & VM_EXEC) ? 0 : XN);
+    *pte = user_pte(*pte & ~4095u, permissions);
     epoch_advance();
     return true;
 }
 
-bool vm_unmap(struct vm_space *s, uint32_t address) {
-    if (address & (PAGE_SIZE - 1)) return false;
-    uint32_t *table = user_table(s, address);
-    if (!table || !(table[(address >> 12) & 255] & SMALL)) return false;
-    uint32_t *pte = &table[(address >> 12) & 255];
-    uintptr_t physical = *pte & ~4095u;
-    if (shared_page(physical)) return false;
-    *pte = 0;
-    --s->mapped_pages;
-    free_user_page(physical);
-    release_empty_table(s, address);
-    epoch_advance();
-    return true;
-}
-
-bool vm_clear(struct vm_space *s, uint32_t address) {
+bool vm_clear(struct vm_space *s, user_ptr address) {
     if (address & (PAGE_SIZE - 1)) return false;
     uint32_t *table = user_table(s, address);
     if (!table || !(table[(address >> 12) & 255] & SMALL) ||
@@ -505,7 +549,7 @@ bool vm_clear(struct vm_space *s, uint32_t address) {
     return true;
 }
 
-bool vm_copy_from_user(const struct vm_space *s, void *out, uint32_t address, size_t size) {
+bool vm_copy_from_user(const struct vm_space *s, void *out, user_ptr address, size_t size) {
     if (size && (size - 1 > UINT32_MAX - address)) return false;
     unsigned char *destination = out;
     while (size) {
@@ -521,7 +565,7 @@ bool vm_copy_from_user(const struct vm_space *s, void *out, uint32_t address, si
     return true;
 }
 
-bool vm_copy_to_user(const struct vm_space *s, uint32_t address, const void *data, size_t size) {
+bool vm_copy_to_user(const struct vm_space *s, user_ptr address, const void *data, size_t size) {
     /* Never partially deliver an event. This address space cannot change here. */
     if (!vm_accessible(s, address, size, VM_WRITE)) return false;
     const unsigned char *source = data;
@@ -537,12 +581,16 @@ bool vm_copy_to_user(const struct vm_space *s, uint32_t address, const void *dat
     return true;
 }
 
-bool vm_release(struct vm_space *s, uint32_t address, unsigned count) {
-    if (!count || address < USER_HEAP_BASE || address >= USER_HEAP_END ||
-        (address & (PAGE_SIZE - 1)) || count > (USER_HEAP_END - address) / PAGE_SIZE)
+bool vm_release(struct vm_space *s, user_ptr address, unsigned count) {
+    if (!count || (address & (PAGE_SIZE - 1)) || address >= USER_END ||
+        count > (USER_END - address) / PAGE_SIZE ||
+        !allocation_range(address, address + count * PAGE_SIZE))
         return false;
-    for (unsigned i = 0; i < count; ++i)
-        if (!vm_resolve(s, address + i * PAGE_SIZE, VM_WRITE)) return false;
+    for (unsigned i = 0; i < count; ++i) {
+        uint32_t at = address + i * PAGE_SIZE, *table = user_table(s, at);
+        uint32_t pte = table ? table[(at >> 12) & 255] : 0;
+        if (!(pte & SMALL) || shared_page(pte & ~4095u)) return false;
+    }
     for (unsigned i = 0; i < count; ++i) {
         uint32_t at = address + i * PAGE_SIZE;
         uint32_t *pte = &user_table(s, at)[(at >> 12) & 255];
@@ -560,13 +608,10 @@ bool vm_release(struct vm_space *s, uint32_t address, unsigned count) {
     return true;
 }
 
-uint32_t vm_allocate(struct vm_space *s, unsigned count) {
-    return vm_allocate_range(s, count, USER_HEAP_BASE, USER_HEAP_END);
-}
-
-uint32_t vm_allocate_range(struct vm_space *s, unsigned count, uint32_t lower, uint32_t upper) {
-    if (lower < USER_HEAP_BASE || upper > USER_HEAP_END || lower >= upper ||
-        ((lower | upper) & (PAGE_SIZE - 1)) || count > (upper - lower) / PAGE_SIZE)
+user_ptr vm_allocate_range(struct vm_space *s, unsigned count, user_ptr lower, user_ptr upper,
+                           unsigned permissions) {
+    if (!allocation_range(lower, upper) || ((lower | upper) & (PAGE_SIZE - 1)) ||
+        count > (upper - lower) / PAGE_SIZE)
         return 0;
     if (!s->root || !count || count > USER_PAGE_QUOTA - s->mapped_pages) return 0;
     uint32_t start = lower;
@@ -580,7 +625,7 @@ uint32_t vm_allocate_range(struct vm_space *s, unsigned count, uint32_t lower, u
         if (++free_run < count) continue;
         unsigned mapped = 0;
         for (; mapped < count; ++mapped)
-            if (!vm_map(s, start + mapped * PAGE_SIZE, VM_READ | VM_WRITE)) break;
+            if (!vm_map(s, start + mapped * PAGE_SIZE, permissions)) break;
         if (mapped == count) return start;
         if (mapped && !vm_release(s, start, mapped)) panic("heap rollback failed");
         return 0;

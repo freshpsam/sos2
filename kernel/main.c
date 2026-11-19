@@ -24,6 +24,12 @@
 #include "wifi_setup.h"
 #include "handoff.h"
 #endif
+#ifdef SOS2_BOARD_GTA7LITE
+#include "gta7lite.h"
+#include "arm_smp.h"
+#include "boot_progress.h"
+#include "wifi_setup.h"
+#endif
 extern char __image_start[], __image_end[];
 static struct framebuffer screen;
 
@@ -89,9 +95,18 @@ static void enter_standby(struct pointer_event *cancel) {
     *cancel = (struct pointer_event){.cancelled = true};
     display_blank();
 #endif
+#ifdef SOS2_BOARD_GTA7LITE
+    gta7lite_touch_standby(true);
+    gta7lite_display_standby(true);
+#endif
     page_host_input(cancel);
     process_freeze(true);
     battery_standby(true);
+#ifdef SOS2_BOARD_GTA7LITE
+    arm_smp_sleep();
+    wifi_setup_standby(true);
+    gta7lite_wifi_standby(true);
+#endif
 #ifdef SOS2_BOARD_REDMI2
     chip_slept = false;
     arm_smp_sleep();
@@ -106,6 +121,11 @@ static void enter_standby(struct pointer_event *cancel) {
 
 static void leave_standby(void) {
     standby = false;
+#ifdef SOS2_BOARD_GTA7LITE
+    arm_smp_wake();
+    gta7lite_wifi_standby(false);
+    wifi_setup_standby(false);
+#endif
 #ifdef SOS2_BOARD_REDMI2
     redmi2_cpu_clock_standby(false);
     arm_smp_wake();
@@ -122,8 +142,23 @@ static void leave_standby(void) {
     redmi2_idle_devices_wake(); /* The motion sensor back to sleep soon. */
     phone_input_resume();
 #endif
+#ifdef SOS2_BOARD_GTA7LITE
+    gta7lite_display_standby(false);
+    gta7lite_touch_standby(false);
+#endif
     page_host_redraw();
 }
+
+#ifdef SOS2_BOARD_GTA7LITE
+/* Long boot work (expanding the ramdisk, page tables, zeroing pages) reports
+ * progress every 64 KiB to 1 MiB; each report feeds the watchdog. */
+static void boot_feed(enum boot_phase phase, uint32_t done, uint32_t total) {
+    (void)phase;
+    (void)done;
+    (void)total;
+    gta7lite_watchdog_feed();
+}
+#endif
 
 void kernel_main(const void *dtb) {
     /* Board RAM window: verify the maximum DTB span before parsing its header. */
@@ -153,6 +188,18 @@ void kernel_main(const void *dtb) {
     platform_set_framebuffer(&screen);
 #else
     uintptr_t start = (uintptr_t)__image_start, end = (uintptr_t)__image_end;
+#ifdef SOS2_BOARD_GTA7LITE
+    gta7lite_watchdog_feed();
+    boot_progress_set_handler(boot_feed);
+    const char *error = gta7lite_handoff(&devices, start, end, dtb_address);
+    if (error) {
+        if (devices.has_framebuffer) {
+            screen = devices.framebuffer;
+            platform_set_framebuffer(&screen);
+        }
+        panic(error);
+    }
+#endif
     if (end <= start || !fdt_range_in_ram(&devices, start, end - start))
         panic("kernel static memory outside RAM");
     if (dtb_address < end && dtb_address + devices.dtb_size > start)
@@ -162,6 +209,12 @@ void kernel_main(const void *dtb) {
 #endif
     if (!gfx_framebuffer_valid(&screen)) panic("browser framebuffer invalid");
     page_host_init(&screen);
+#ifdef SOS2_BOARD_GTA7LITE
+    /* The USB link from here on, so that after a panic the tablet can be
+     * restarted from the computer; the host sees it once the main loop
+     * polls it (gta7lite_usb_connect). */
+    page_host_usb_status(gta7lite_usb_init());
+#endif
 #ifdef SOS2_BOARD_REDMI2
     redmi2_startup_begin(&screen);
     (void)phone_input_init(screen.width, screen.height);
@@ -171,13 +224,19 @@ void kernel_main(const void *dtb) {
     page_host_render();
     display_poll();
     barrier();
+#ifndef SOS2_BOARD_GTA7LITE /* Tablet touch starts after process_init; no key driver. */
     if (!input_init(devices.virtio, devices.virtio_count, screen.width, screen.height))
         panic("input initialization failed");
     (void)keyboard_init(devices.virtio, devices.virtio_count);
     if (devices.power_key) (void)power_key_init(devices.gpio, devices.power_key_pin);
 #endif
+#endif
     haptics_init(); /* On the phone, through the power driver's PMIC access. */
     if (!process_init(&devices, dtb_address)) panic("protected process initialization failed");
+#ifdef SOS2_BOARD_GTA7LITE
+    /* Its firmware is a runtime file and its SPI a device mapping, both ready now. */
+    page_host_touch_status(gta7lite_touch_init(devices.lcm_name, screen.width, screen.height));
+#endif
 #ifdef SOS2_BOARD_REDMI2
     redmi2_cpu0_wake_source(redmi2_power_key_irq()); /* CPU 0's power-down is ready now. */
     (void)redmi2_chip_sleep_init();
@@ -191,14 +250,26 @@ void kernel_main(const void *dtb) {
     /* The screen may have been turned off during startup. */
     if (!redmi2_power_screen_on()) enter_standby(&event);
 #endif
+#ifdef SOS2_BOARD_GTA7LITE
+    gta7lite_usb_connect();
+#endif
     for (;;) {
+#ifdef SOS2_BOARD_GTA7LITE
+        gta7lite_watchdog_feed();
+        gta7lite_usb_poll();
+#endif
         (void)haptics_poll();
 #ifdef SOS2_BOARD_REDMI2
         enum redmi2_power_change power_change = redmi2_power_poll();
         if (power_change == REDMI2_POWER_SCREEN_OFF) enter_standby(&event);
         else if (power_change == REDMI2_POWER_SCREEN_ON) leave_standby();
 #else
-        if (power_key_pressed()) {
+#ifdef SOS2_BOARD_GTA7LITE
+        bool power_pressed = gta7lite_power_key_pressed();
+#else
+        bool power_pressed = power_key_pressed();
+#endif
+        if (power_pressed) {
             if (standby) leave_standby();
             else enter_standby(&event);
         }
@@ -207,7 +278,7 @@ void kernel_main(const void *dtb) {
 #ifdef SOS2_BOARD_REDMI2
             /* A GPU job still in flight at standby retires first; then it naps. */
             redmi2_adreno_standby(true);
-#else
+#elif !defined(SOS2_BOARD_GTA7LITE)
             /* Drop input queued while the screen is off; nothing acts on it. */
             int32_t wheel_x, wheel_y;
             struct user_input_event key;
@@ -233,6 +304,9 @@ void kernel_main(const void *dtb) {
             redmi2_idle_devices_poll();
             if (sleep_us == STANDBY_IDLE_US) standby_key_check();
 #else
+#ifdef SOS2_BOARD_GTA7LITE
+            arm_smp_standby_poll();
+#endif
             arm_cpu_sleep_us(STANDBY_POLL_US);
 #endif
             continue;
@@ -245,10 +319,13 @@ void kernel_main(const void *dtb) {
             else if (source == PHONE_INPUT_BACK) page_host_back();
             else page_host_input(&event);
         }
+#elif defined(SOS2_BOARD_GTA7LITE)
+        if (gta7lite_touch_poll(&event)) page_host_input(&event);
 #else
-        /* Drain queued tablet reports. Taking one per pass lets the 64-event
-         * ring fill while the loop is slow, and the device then drops whole
-         * reports, including button releases. page_host merges pure motion. */
+        /* Drain queued virtio tablet reports. Taking one per pass lets the
+         * 64-event ring fill while the loop is slow, and the device then drops
+         * whole reports, including button releases. page_host merges pure
+         * motion. */
         for (unsigned budget = 0; budget < 16; ++budget) {
             int32_t wheel_x = 0, wheel_y = 0;
             if (!input_poll_extended(&event, &wheel_x, &wheel_y)) break;
@@ -256,8 +333,6 @@ void kernel_main(const void *dtb) {
             page_host_wheel(&event, wheel_x, wheel_y);
             if (event.cancelled) break;
         }
-#endif
-#ifndef SOS2_BOARD_REDMI2
         /* Dispatch pointer releases before keyboard events in the same poll. */
         struct user_input_event key;
         for (unsigned budget = 0; budget < 32 && keyboard_poll(&key); ++budget)
@@ -272,7 +347,7 @@ void kernel_main(const void *dtb) {
          * worker can hold CPU 0 for tens of ms; meanwhile the display keeps
          * publishing the press. */
         while (haptics_poll()) display_poll();
-        __asm__ volatile("yield");
+        arch_yield();
         process_step();
     }
 }

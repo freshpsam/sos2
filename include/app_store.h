@@ -6,11 +6,12 @@
 /* Native apps installed apart from the system (docs/redmi2.md#apps). A
  * package, <id>.sos2app (tools/package_redmi2.py), is a 512-byte header
  * (struct app_package), the icon and the program. On a phone started from
- * its installed system, the app store holds them after the two system slots
- * of the cache partition: APP_LIMIT positions of two 3 MiB halves, each a
- * 4 KiB header (struct app_store_half) and a package. A position's app is in
- * the half with a valid header and the higher sequence, so an update writes
- * the other half and commits by writing its header last. */
+ * its installed system, the app store holds them in the cache partition,
+ * after its first MiB (include/system_store.h): APP_LIMIT positions of two
+ * 3 MiB halves, each a 4 KiB header (struct app_store_half) and a package.
+ * A position's app is in the half with a valid header and the higher
+ * sequence, so an update writes the other half and commits by writing its
+ * header last. */
 enum {
     APP_PACKAGE_HEADER = 512,
     APP_ICON_BYTES = APP_ICON_SIZE * APP_ICON_SIZE * 4,
@@ -18,7 +19,7 @@ enum {
     APP_HALF_SECTORS = 6144,
     APP_HALF_HEADER = 4096,
     APP_PACKAGE_MAX = APP_HALF_SECTORS * 512 - APP_HALF_HEADER,
-    APP_STORE_START = SYSTEM_SLOT_START + 2 * SYSTEM_SLOT_SECTORS,
+    APP_STORE_START = SYSTEM_APPS_START,
     APP_STORE_SECTORS = APP_LIMIT * 2 * APP_HALF_SECTORS
 };
 

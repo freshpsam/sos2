@@ -1,0 +1,38 @@
+CVE-2026-65340, WebKit bug 316996
+Upstream: https://github.com/WebKit/WebKit/commit/27bad3866d55a66eb092caffcd4e1caebfc4eeff
+
+--- a/Source/JavaScriptCore/runtime/RegExpMatchesArray.h
++++ b/Source/JavaScriptCore/runtime/RegExpMatchesArray.h
+@@ -76,7 +76,8 @@ ALWAYS_INLINE JSArray* createRegExpMatchesArray(
+ 
+     result.start = position;
+     result.end = subpatternResults[1];
+-    
++    RELEASE_ASSERT(result.end >= result.start);
++
+     JSArray* array;
+     JSArray* indicesArray = nullptr;
+ 
+--- a/Source/JavaScriptCore/yarr/YarrJIT.cpp
++++ b/Source/JavaScriptCore/yarr/YarrJIT.cpp
+@@ -3925,9 +3925,19 @@ class YarrGenerator final : public YarrJITInfo {
+                             // already correctly incremented, if more than one then decrement as appropriate.
+                             unsigned delta = alternative->m_minimumSize - beginOp->m_alternative->m_minimumSize;
+                             ASSERT(delta);
++                            bool advancedIndexForNonBMP = false;
++#if ENABLE(YARR_JIT_UNICODE_EXPRESSIONS) && ENABLE(YARR_JIT_UNICODE_CAN_INCREMENT_INDEX_FOR_NON_BMP)
++                            if (m_useFirstNonBMPCharacterOptimization) {
++                                m_jit.add32(m_regs.firstCharacterAdditionalReadSize, m_regs.index);
++                                advancedIndexForNonBMP = true;
++                            }
++#endif
+                             if (delta != 1)
+                                 m_jit.sub32(MacroAssembler::Imm32(delta - 1), m_regs.index);
+-                            m_jit.jump(beginOp->m_reentry);
++                            if (advancedIndexForNonBMP)
++                                checkInput().linkTo(beginOp->m_reentry, &m_jit);
++                            else
++                                m_jit.jump(beginOp->m_reentry);
+                         } else {
+                             // If the first alternative has minimum size 0xFFFFFFFFu, then there cannot
+                             // be sufficent input available to handle this, so just fall through.

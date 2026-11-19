@@ -68,12 +68,12 @@ bool entropy_init(const struct platform_devices *devices) {
     available.flags = 1;
     available.index = 0;
     used.index = 0;
-    reg(0x80, (uintptr_t)&descriptor);
-    reg(0x84, 0);
-    reg(0x90, (uintptr_t)&available);
-    reg(0x94, 0);
-    reg(0xa0, (uintptr_t)&used);
-    reg(0xa4, 0);
+    reg(0x80, (uint32_t)(uintptr_t)&descriptor);
+    reg(0x84, (uint32_t)((uint64_t)(uintptr_t)&descriptor >> 32));
+    reg(0x90, (uint32_t)(uintptr_t)&available);
+    reg(0x94, (uint32_t)((uint64_t)(uintptr_t)&available >> 32));
+    reg(0xa0, (uint32_t)(uintptr_t)&used);
+    reg(0xa4, (uint32_t)((uint64_t)(uintptr_t)&used >> 32));
     reg(0x44, 1);
     reg(0x70, 15);
     offer();

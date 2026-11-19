@@ -4,21 +4,13 @@
 
 /* wt88047 vendor kernel: arch/arm/mach-msm/platsmp.c arm_release_secondary,
  * msm8916_boot_secondary and arm_smp_init_cpus. See docs/architecture.md. */
-static uint32_t midr(void) {
-    uint32_t n;
-    __asm__ volatile("mrc p15, 0, %0, c0, c0, 0" : "=r"(n));
-    return n;
-}
-
 #define read32  mmio_read32
 #define write32 mmio_write32
 #define sync    barrier
 static unsigned cores, released, warm;
 
 unsigned redmi2_smp_prepare(uint32_t boot_mpidr, uintptr_t entry, uintptr_t warm_entry) {
-    /* The phone emulator has an A15 and substituted peripherals. Do not
-     * access ACC or invoke Qualcomm firmware on that CPU. */
-    if ((midr() & 0xff0ffff0) != 0x410fd030 || boot_mpidr) return 1;
+    if (boot_mpidr) return 1;
     unsigned count = read32(0x0b011030) & 15;
     if (count < 2 || count > 4 || !qcom_scm_cpu_boot(entry, (1u << count) - 1)) return 1;
     /* After a standby power-down the firmware enters the shared warm entry

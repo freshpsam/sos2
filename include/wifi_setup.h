@@ -15,19 +15,22 @@ enum wifi_radio_state {
 struct wifi_radio_view {
     enum wifi_radio_state state;
     const char *message;
-    const char *detail; /* Optional backend diagnostics, kept separate from the failure. */
-    struct wifi_network networks[WIFI_NETWORK_MAX], current;
+    struct wifi_network current;
     unsigned count, request_id, scan_generation;
+    bool scan_truncated; /* A distinct network did not fit in the scan list. */
     bool attempt_failed;
     bool startup_pending; /* Includes entropy preparation and failure cleanup. */
+    /* Last, with only the first count entries set. A scan only appends, so
+     * the list changes only with count or scan_generation. */
+    struct wifi_network networks[WIFI_NETWORK_MAX];
 };
 
 struct wifi_setup_view {
-    struct wifi_radio_view radio;
     struct wifi_network saved;
     const char *message;
     /* storage means durable; has_saved also covers a RAM-only session profile. */
     bool available, busy, storage, session, has_saved, saving;
+    struct wifi_radio_view radio; /* Last: the network list ends the view. */
 };
 
 /* All backend methods run on the existing serialized service worker. Only

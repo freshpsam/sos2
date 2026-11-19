@@ -2,12 +2,12 @@
 #include "page_host.h"
 #include "page_alloc.h"
 #include "platform.h"
-#ifndef SOS2_BOARD_REDMI2
+#if !defined(SOS2_BOARD_REDMI2) && !defined(SOS2_BOARD_GTA7LITE)
 #include "virtio_gpu.h"
 #endif
 
-/* SYS_GPU: a page's own virgl context (QEMU only; the phone has no client GPU
- * interface yet). Runs on the serialized service worker with the caller's
+/* SYS_GPU: a page's own virgl context (QEMU only; the devices have no client
+ * GPU interface yet). Runs on the serialized service worker with the caller's
  * threads stopped, so its buffers cannot change while they are copied.
  *
  * Isolation: the kernel picks context and resource ids, creates every resource,
@@ -21,9 +21,9 @@
  * backing bytes per page, 128 MiB in all, and 16 MiB of RAM always left free.
  * Backing is uncached kernel memory, freed only after the device detached it
  * or a confirmed reset; after an unconfirmed reset it stays quarantined. */
-#ifdef SOS2_BOARD_REDMI2
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE)
 int gpu_client_call(struct gpu_client **state, const struct vm_space *space, unsigned slot,
-                    uint32_t op, uint32_t address, uint32_t size) {
+                    uint32_t op, user_ptr address, uint32_t size) {
     (void)state;
     (void)space;
     (void)slot;
@@ -117,7 +117,7 @@ static void release_backing(struct gpu_client *client, struct gpu_resource *r) {
     *r = client->resources[--client->count];
 }
 
-static int create(struct gpu_client *client, const struct vm_space *space, uint32_t address,
+static int create(struct gpu_client *client, const struct vm_space *space, user_ptr address,
                   uint32_t size) {
     struct user_gpu_resource desc;
     if (size != sizeof(desc)) return USER_EINVAL;
@@ -170,7 +170,7 @@ static int create(struct gpu_client *client, const struct vm_space *space, uint3
 
 /* The box must lie inside the level, and every row inside the backing. The
  * device receives the strides used for the copy, never implicit ones. */
-static int transfer(struct gpu_client *client, const struct vm_space *space, uint32_t address,
+static int transfer(struct gpu_client *client, const struct vm_space *space, user_ptr address,
                     uint32_t size, bool upload) {
     struct user_gpu_transfer t;
     if (size != sizeof(t)) return USER_EINVAL;
@@ -192,7 +192,7 @@ static int transfer(struct gpu_client *client, const struct vm_space *space, uin
     if (!t.layer_stride && layer <= UINT32_MAX) t.layer_stride = (uint32_t)layer;
     if (t.stride < row || t.layer_stride < layer) return USER_EINVAL;
     uint64_t span = (uint64_t)(t.height - 1) * t.stride + row;
-    if (t.offset > r->bytes || span > r->bytes - t.offset || t.data > UINT32_MAX - span + 1)
+    if (t.offset > r->bytes || span > r->bytes - t.offset || t.data > (user_ptr)-1 - span + 1)
         return USER_EINVAL;
     if (!vm_accessible(space, t.data, (size_t)span, upload ? VM_READ : VM_WRITE))
         return USER_EFAULT;
@@ -211,7 +211,7 @@ static int transfer(struct gpu_client *client, const struct vm_space *space, uin
     return result;
 }
 
-static int submit(struct gpu_client *client, const struct vm_space *space, uint32_t address,
+static int submit(struct gpu_client *client, const struct vm_space *space, user_ptr address,
                   uint32_t size) {
     struct user_gpu_submit s;
     if (size != sizeof(s)) return USER_EINVAL;
@@ -225,7 +225,7 @@ static int submit(struct gpu_client *client, const struct vm_space *space, uint3
 /* The page's frame goes to its compositor snapshot before page_host learns
  * of it, so the compositor never draws a frame it has not copied. */
 static int present(struct gpu_client *client, const struct vm_space *space, unsigned slot,
-                   uint32_t address, uint32_t size) {
+                   user_ptr address, uint32_t size) {
     struct user_gpu_present g;
     if (size != sizeof(g)) return USER_EINVAL;
     if (!vm_copy_from_user(space, &g, address, sizeof(g))) return USER_EFAULT;
@@ -246,7 +246,7 @@ static int present(struct gpu_client *client, const struct vm_space *space, unsi
     return result;
 }
 
-static int caps(const struct vm_space *space, uint32_t address, uint32_t size) {
+static int caps(const struct vm_space *space, user_ptr address, uint32_t size) {
     struct user_gpu_caps c;
     if (size != sizeof(c)) return USER_EINVAL;
     if (!vm_copy_from_user(space, &c, address, sizeof(c))) return USER_EFAULT;
@@ -259,7 +259,7 @@ static int caps(const struct vm_space *space, uint32_t address, uint32_t size) {
 }
 
 int gpu_client_call(struct gpu_client **state, const struct vm_space *space, unsigned slot,
-                    uint32_t op, uint32_t address, uint32_t size) {
+                    uint32_t op, user_ptr address, uint32_t size) {
     if (op == USER_GPU_INFO) return virtio_gpu_client_available() ? 1 : 0;
     if (!virtio_gpu_client_available()) return USER_ENODEV;
     if (op == USER_GPU_CAPS) return caps(space, address, size);
@@ -281,7 +281,7 @@ int gpu_client_call(struct gpu_client **state, const struct vm_space *space, uns
     if (!result) switch (op) {
             case USER_GPU_CREATE: result = create(client, space, address, size); break;
             case USER_GPU_DESTROY: {
-                struct gpu_resource *r = find(client, address);
+                struct gpu_resource *r = find(client, (uint32_t)address);
                 if (!r || size) {
                     result = USER_EBADF;
                     break;

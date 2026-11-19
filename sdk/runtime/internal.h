@@ -10,9 +10,13 @@
 #define SOS2_KEYS 64
 /* Keep malloc's growing break separate from mmap, stacks and TLS. These are
  * virtual address limits; all allocations still share the process quota. */
+#ifdef __aarch64__
+#define SOS2_BRK_BASE 0x1060000000ul
+#else
 #define SOS2_BRK_BASE 0x28000000u
+#endif
 
-static inline int32_t sos2_map(unsigned pages, unsigned permissions) {
+static inline sos2_status sos2_map(unsigned pages, unsigned permissions) {
     return call4(SYS_VM_ALLOC_RANGE, USER_HEAP_BASE, SOS2_BRK_BASE, pages, permissions);
 }
 
@@ -25,6 +29,13 @@ struct sos2_thread {
     struct _reent reent;
     const void *keys[SOS2_KEYS];
     uint32_t key_generations[SOS2_KEYS];
+#ifdef __aarch64__
+    /* Emulated TLS (threads.c): the table of this thread's variables, the
+     * pages mapped for them, and the free space left to carve them from. */
+    void **emutls;
+    uintptr_t emutls_count, emutls_free, emutls_end;
+    struct emutls_chunk *emutls_chunks;
+#endif
 };
 
 struct sos2_lock {
@@ -39,7 +50,7 @@ int sos2_result(int);
 uint64_t sos2_clock(int);
 int sos2_clock_read(int, uint64_t *);
 
-static inline uint32_t sos2_ptr(const void *p) { return (uint32_t)(uintptr_t)p; }
+static inline sos2_word sos2_ptr(const void *p) { return (sos2_word)(uintptr_t)p; }
 
 static inline uint32_t sos2_load(const uint32_t *p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
 

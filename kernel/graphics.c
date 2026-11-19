@@ -248,10 +248,19 @@ bool gfx_present(struct framebuffer *visible, const struct framebuffer *complete
     return true;
 }
 
+/* The largest scanout: the Redmi 2's 720x1280 panel, or on AArch64 the
+ * Galaxy Tab A7 Lite's 800x1340. */
+#ifdef __aarch64__
+enum { SCANOUT_WIDTH = 800, SCANOUT_HEIGHT = 1340 };
+#else
+enum { SCANOUT_WIDTH = 720, SCANOUT_HEIGHT = 1280 };
+#endif
+
 bool gfx_present_scaled_region(struct framebuffer *visible, const struct framebuffer *source,
                                uint32_t left, uint32_t top, uint32_t width, uint32_t height) {
     if (!gfx_framebuffer_valid(visible) || !gfx_framebuffer_valid(source) ||
-        source->format != PIXEL_XRGB8888 || visible->width > 720 || visible->height > 1280)
+        source->format != PIXEL_XRGB8888 || visible->width > SCANOUT_WIDTH ||
+        visible->height > SCANOUT_HEIGHT)
         return false;
     uintptr_t a = (uintptr_t)visible->pixels, b = (uintptr_t)source->pixels;
     if (a < b + (size_t)source->stride * source->height &&
@@ -278,7 +287,7 @@ bool gfx_present_scaled_region(struct framebuffer *visible, const struct framebu
              x1 = ((uint64_t)(left + width) * vw + sw - 1) / sw;
     unsigned y0 = ((uint64_t)top * vh + sh - 1) / sh,
              y1 = ((uint64_t)(top + height) * vh + sh - 1) / sh;
-    unsigned columns[720];
+    unsigned columns[SCANOUT_WIDTH];
     for (unsigned x = x0; x < x1; ++x) columns[x] = (uint64_t)x * sw / vw;
     for (unsigned y = y0; y < y1; ++y) {
         const uint32_t *row = (const uint32_t *)(src + (size_t)((uint64_t)y * sh / vh) * ss);

@@ -1,0 +1,248 @@
+--- a/Source/WebCore/style/ElementRuleCollector.cpp
++++ b/Source/WebCore/style/ElementRuleCollector.cpp
+@@ -37,6 +37,7 @@
+ #include "CSSValueKeywords.h"
+ #include "ContainerQueryEvaluator.h"
+ #include "DeclarationOrigin.h"
++#include "DocumentFullscreen.h"
+ #include "ElementInlines.h"
+ #include "ElementRareData.h"
+ #include "ElementTextDirection.h"
+@@ -249,10 +250,24 @@
+         collectMatchingRulesForList(matchRequest.ruleSet.focusPseudoClassRules(), matchRequest);
+     if (matchesFocusVisiblePseudoClass(element))
+         collectMatchingRulesForList(matchRequest.ruleSet.focusVisiblePseudoClassRules(), matchRequest);
++#if ENABLE(FULLSCREEN_API)
++    // As in WebKit 2.54: these pseudo-classes only match while the document is fullscreen.
++    if (auto* fullscreen = element.document().fullscreenIfExists(); fullscreen && fullscreen->isFullscreen())
++        collectMatchingRulesForList(matchRequest.ruleSet.fullscreenPseudoClassRules(), matchRequest);
++#endif
+     if (&element == element.document().documentElement())
+         collectMatchingRulesForList(matchRequest.ruleSet.rootElementRules(), matchRequest);
+     collectMatchingRulesForList(matchRequest.ruleSet.tagRules(element.localName(), isHTML), matchRequest);
+     collectMatchingRulesForList(matchRequest.ruleSet.universalRules(), matchRequest);
++
++    // Rules like "::marker" (RuleSet::universalPseudoElementRules): matched for
++    // that pseudo-element; otherwise the element records that it may have it.
++    auto pseudoElementTypes = element.isHTMLElement() ? matchRequest.ruleSet.universalHTMLPseudoElementTypes() : matchRequest.ruleSet.universalPseudoElementTypes();
++    if (m_pseudoElementRequest) {
++        if (pseudoElementTypes.contains(m_pseudoElementRequest->type()))
++            collectMatchingRulesForList(matchRequest.ruleSet.universalPseudoElementRules(), matchRequest);
++    } else
++        m_matchedPseudoElements.add(pseudoElementTypes & allPublicPseudoElementTypes);
+ }
+ 
+ 
+@@ -319,6 +334,10 @@
+ 
+     collectMatchingRules(DeclarationOrigin::Author);
+ 
++    // As in WebKit 2.54: universal pseudo-element rules only mark m_matchedPseudoElements.
++    if (m_mode == SelectorChecker::Mode::StyleInvalidation && m_matchedPseudoElements)
++        return true;
++
+     return !m_matchedRules.isEmpty();
+ }
+ 
+--- a/Source/WebCore/style/RuleSet.cpp
++++ b/Source/WebCore/style/RuleSet.cpp
+@@ -183,12 +183,14 @@
+     const CSSSelector* linkSelector = nullptr;
+     const CSSSelector* focusSelector = nullptr;
+     const CSSSelector* focusVisibleSelector = nullptr;
++    const CSSSelector* fullscreenPseudoClassSelector = nullptr;
+     const CSSSelector* rootElementSelector = nullptr;
+     const CSSSelector* hostPseudoClassSelector = nullptr;
+     const CSSSelector* customPseudoElementSelector = nullptr;
+     const CSSSelector* slottedPseudoElementSelector = nullptr;
+     const CSSSelector* partPseudoElementSelector = nullptr;
+     const CSSSelector* namedPseudoElementSelector = nullptr;
++    const CSSSelector* otherPseudoElementSelector = nullptr;
+ #if ENABLE(VIDEO)
+     const CSSSelector* cuePseudoElementSelector = nullptr;
+ #endif
+@@ -251,6 +253,7 @@
+                     namedPseudoElementSelector = selector;
+                 break;
+             default:
++                otherPseudoElementSelector = selector;
+                 break;
+             }
+             break;
+@@ -273,6 +276,14 @@
+             case CSSSelector::PseudoClass::Root:
+                 rootElementSelector = selector;
+                 break;
++#if ENABLE(FULLSCREEN_API)
++            case CSSSelector::PseudoClass::Fullscreen:
++            case CSSSelector::PseudoClass::InternalInWindowFullscreen:
++            case CSSSelector::PseudoClass::InternalFullscreenDocument:
++            case CSSSelector::PseudoClass::InternalAnimatingFullscreenTransition:
++                fullscreenPseudoClassSelector = selector;
++                break;
++#endif
+             case CSSSelector::PseudoClass::Scope:
+                 m_hasHostOrScopePseudoClassRulesInUniversalBucket = true;
+                 break;
+@@ -394,6 +405,11 @@
+         return;
+     }
+ 
++    if (fullscreenPseudoClassSelector) {
++        m_fullscreenPseudoClassRules.append(ruleData);
++        return;
++    }
++
+     if (namedPseudoElementSelector) {
+         addToRuleSet(namedPseudoElementSelector->argumentList()->first(), m_namedPseudoElementRules, ruleData);
+         return;
+@@ -410,6 +426,40 @@
+         return;
+     }
+ 
++    // A lone pseudo-element like "::marker", with at most a universal type
++    // selector, applies to every element (or every HTML element). As in WebKit
++    // 2.54, such rules are only matched when that pseudo-element is resolved;
++    // other elements just record that they may have it (ElementRuleCollector).
++    auto addUniversalPseudoElement = [&] {
++        if (!otherPseudoElementSelector)
++            return false;
++        auto stylePseudoElement = CSSSelector::stylePseudoElementTypeFor(otherPseudoElementSelector->pseudoElement());
++        if (!stylePseudoElement)
++            return false;
++        bool isHTMLNamespace = false;
++        for (auto* component = &ruleData.selector(); component; component = component->precedingInComplexSelector()) {
++            // One compound only.
++            if (component->precedingInComplexSelector() && component->relation() != CSSSelector::Relation::Subselector)
++                return false;
++            if (component == otherPseudoElementSelector)
++                continue;
++            if (component->match() != CSSSelector::Match::Tag || component->tagQName().localName() != starAtom())
++                return false;
++            auto& namespaceURI = component->tagQName().namespaceURI();
++            isHTMLNamespace = namespaceURI == xhtmlNamespaceURI;
++            if (!isHTMLNamespace && namespaceURI != starAtom())
++                return false;
++        }
++        m_universalPseudoElementRules.append(ruleData);
++        m_universalHTMLPseudoElementTypes.add(*stylePseudoElement);
++        if (!isHTMLNamespace)
++            m_universalPseudoElementTypes.add(*stylePseudoElement);
++        return true;
++    };
++
++    if (addUniversalPseudoElement())
++        return;
++
+     // If we didn't find a specialized map to stick it in, file under universal rules.
+     m_universalRules.append(ruleData);
+ }
+@@ -459,8 +509,10 @@
+     traverseVector(m_partPseudoElementRules);
+     traverseVector(m_focusPseudoClassRules);
+     traverseVector(m_focusVisiblePseudoClassRules);
++    traverseVector(m_fullscreenPseudoClassRules);
+     traverseVector(m_rootElementRules);
+     traverseVector(m_universalRules);
++    traverseVector(m_universalPseudoElementRules);
+ }
+ 
+ template<typename Function> void RuleSet::traverseRuleDatas(Function&& function) const
+@@ -562,8 +614,10 @@
+     m_partPseudoElementRules.shrinkToFit();
+     m_focusPseudoClassRules.shrinkToFit();
+     m_focusVisiblePseudoClassRules.shrinkToFit();
++    m_fullscreenPseudoClassRules.shrinkToFit();
+     m_rootElementRules.shrinkToFit();
+     m_universalRules.shrinkToFit();
++    m_universalPseudoElementRules.shrinkToFit();
+ 
+     m_pageRules.shrinkToFit();
+     m_features.shrinkToFit();
+--- a/Source/WebCore/style/RuleSet.h
++++ b/Source/WebCore/style/RuleSet.h
+@@ -111,8 +111,14 @@
+     const RuleDataVector& partPseudoElementRules() const { return m_partPseudoElementRules; }
+     const RuleDataVector* focusPseudoClassRules() const { return &m_focusPseudoClassRules; }
+     const RuleDataVector* focusVisiblePseudoClassRules() const { return &m_focusVisiblePseudoClassRules; }
++    const RuleDataVector* fullscreenPseudoClassRules() const { return &m_fullscreenPseudoClassRules; }
+     const RuleDataVector* rootElementRules() const { return &m_rootElementRules; }
+     const RuleDataVector* universalRules() const { return &m_universalRules; }
++    // Rules like "::marker" that apply to all elements or to all HTML elements,
++    // and the pseudo-element types they cover (WebKit 2.54's buckets).
++    const RuleDataVector* universalPseudoElementRules() const { return &m_universalPseudoElementRules; }
++    EnumSet<PseudoElementType> universalHTMLPseudoElementTypes() const { return m_universalHTMLPseudoElementTypes; }
++    EnumSet<PseudoElementType> universalPseudoElementTypes() const { return m_universalPseudoElementTypes; }
+ 
+     const Vector<StyleRulePage*>& pageRules() const { return m_pageRules; }
+ 
+@@ -216,8 +222,12 @@
+     RuleDataVector m_partPseudoElementRules;
+     RuleDataVector m_focusPseudoClassRules;
+     RuleDataVector m_focusVisiblePseudoClassRules;
++    RuleDataVector m_fullscreenPseudoClassRules;
+     RuleDataVector m_rootElementRules;
+     RuleDataVector m_universalRules;
++    RuleDataVector m_universalPseudoElementRules;
++    EnumSet<PseudoElementType> m_universalHTMLPseudoElementTypes;
++    EnumSet<PseudoElementType> m_universalPseudoElementTypes;
+     Vector<StyleRulePage*> m_pageRules;
+     RefPtr<StyleRuleViewTransition> m_viewTransitionRule;
+     RuleFeatureSet m_features;
+--- a/Source/WebCore/css/html.css
++++ b/Source/WebCore/css/html.css
+@@ -305,15 +305,24 @@
+     text-align: match-parent;
+ }
+ 
+-:is(dir, dl, menu, ol, ul) :is(dir, dl, menu, ol, ul) {
++/* The rightmost selector is written explicitly rather than with :is() to help with RuleSet bucketing.*/
++:is(dir, dl, menu, ol, ul) dir,
++:is(dir, dl, menu, ol, ul) dl,
++:is(dir, dl, menu, ol, ul) menu,
++:is(dir, dl, menu, ol, ul) ol,
++:is(dir, dl, menu, ol, ul) ul {
+     margin-block: 0;
+ }
+ 
+-:is(dir, menu, ol, ul) :is(dir, menu, ul) {
++:is(dir, menu, ol, ul) dir,
++:is(dir, menu, ol, ul) menu,
++:is(dir, menu, ol, ul) ul {
+     list-style-type: circle;
+ }
+ 
+-:is(dir, menu, ol, ul) :is(dir, menu, ol, ul) :is(dir, menu, ul) {
++:is(dir, menu, ol, ul) :is(dir, menu, ol, ul) dir,
++:is(dir, menu, ol, ul) :is(dir, menu, ol, ul) menu,
++:is(dir, menu, ol, ul) :is(dir, menu, ol, ul) ul {
+     list-style-type: square;
+ }
+ 
+@@ -781,7 +790,7 @@
+     color: #000000 !important;
+ }
+ 
+-:autofill {
++input:autofill {
+     field-sizing: fixed !important;
+ }
+ 
+@@ -904,7 +913,7 @@
+     color: #909090;
+ }
+ 
+-input[type="range"]::-webkit-slider-container, input[type="range"]::-webkit-media-slider-container {
++input[type="range"]::-webkit-slider-container {
+     flex: 1;
+     box-sizing: border-box;
+     display: flex;
+@@ -919,7 +928,7 @@
+     display: block;
+ }
+ 
+-input[type="range"]::-webkit-slider-thumb, input[type="range"]::-webkit-media-slider-thumb {
++input[type="range"]::-webkit-slider-thumb {
+     appearance: auto;
+     box-sizing: border-box;
+     display: block;

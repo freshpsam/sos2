@@ -99,7 +99,9 @@ static struct widget_damage {
 
 static unsigned widget_count;
 static uint64_t keyboard_damage;
-static char entropy_message[73];
+/* device_message: why the touch screen, then the USB link, is unavailable. */
+enum { DEVICE_TOUCH, DEVICE_USB, DEVICES };
+static char entropy_message[73], device_message[DEVICES][73];
 static bool entropy_ready, storage_ready, storage_session;
 static unsigned selected, current_modifiers;
 static int toolbar_press = -1, focused = -1, pointer_owner = -1, soft_owner = -1, key_owners[256];
@@ -128,7 +130,46 @@ static void status_render(struct framebuffer *, unsigned, unsigned);
 static uint64_t status_minute = UINT64_MAX;
 static struct battery_view status_battery;
 
-enum { ACTION_ADDRESS = 100, ACTION_OPEN, ACTION_CLOSE, ACTION_WIFI, ACTION_UPDATES };
+enum {
+    ACTION_ADDRESS = 100,
+    ACTION_OPEN,
+    ACTION_CLOSE,
+    ACTION_WIFI,
+    ACTION_UPDATES,
+    ACTION_HOME,
+    ACTION_BACK
+};
+
+/* The top bar's buttons: CLOSE over a page and, on the Galaxy Tab A7 Lite,
+ * which has no Home or Back key, HOME and BACK over a page or the Wi-Fi
+ * screen, BACK on the right as on Samsung's navigation bar. */
+#ifdef SOS2_BOARD_GTA7LITE
+enum { NAVIGATION_BUTTONS = 1 };
+#else
+enum { NAVIGATION_BUTTONS = 0 };
+#endif
+/* The tablet's three run from the left margin to the clock, 6 pixels apart
+ * like their margins above and below; the phone's lone CLOSE is narrower. */
+enum {
+    HEADER_BUTTON = NAVIGATION_BUTTONS ? 104 : 84,
+    HEADER_GAP = 6,
+    CLOSE_X = NAVIGATION_BUTTONS ? 16 : 12,
+    HOME_X = CLOSE_X + HEADER_BUTTON + HEADER_GAP,
+    BACK_X = HOME_X + HEADER_BUTTON + HEADER_GAP
+};
+
+static bool navigation_buttons(void) {
+    return NAVIGATION_BUTTONS && (!panel || desktop_wifi_visible());
+}
+
+static int header_hit(unsigned x, unsigned y) {
+    if (y < 6 || y >= 42) return -1;
+    if (!panel && x >= CLOSE_X && x < CLOSE_X + HEADER_BUTTON) return ACTION_CLOSE;
+    if (!navigation_buttons()) return -1;
+    if (x >= HOME_X && x < HOME_X + HEADER_BUTTON) return ACTION_HOME;
+    if (x >= BACK_X && x < BACK_X + HEADER_BUTTON) return ACTION_BACK;
+    return -1;
+}
 
 /* Desktop, top to bottom: status lines, the WI-FI and UPDATES buttons, the
  * WEB PAGES label, the address row, an Open error, the page list and, at the
@@ -137,6 +178,7 @@ enum { ACTION_ADDRESS = 100, ACTION_OPEN, ACTION_CLOSE, ACTION_WIFI, ACTION_UPDA
 static unsigned settings_top(void) {
     unsigned lines = 1;
     if (!entropy_ready) lines += 1 + (entropy_message[0] != 0);
+    for (unsigned i = 0; i < DEVICES; ++i) lines += device_message[i][0] != 0;
     return STATUS_TOP + lines * 18 + 8;
 }
 
@@ -379,7 +421,8 @@ void page_host_init(struct framebuffer *screen) {
     composed_view = UINT32_MAX;
     screen_active = true;
     web_damage.right = web_damage.bottom = 0;
-    entropy_message[0] = address[0] = 0;
+    entropy_message[0] = device_message[DEVICE_TOUCH][0] = device_message[DEVICE_USB][0] = 0;
+    address[0] = 0;
     address_length = address_cursor = address_offset = page_offset = 0;
     list_dragging = false;
     toolbar_press = pointer_owner = soft_owner = focused = -1;
@@ -417,15 +460,13 @@ bool page_host_input(const struct pointer_event *event) {
     event = &logical;
     bool release = pressed && !event->down && !event->cancelled,
          press = !pressed && event->down && !event->cancelled;
-    int toolbar = -1;
-    if (!panel && event->y >= 6 && event->y < 42 && event->x >= 12 && event->x < 96)
-        toolbar = ACTION_CLOSE;
+    int toolbar = header_hit(event->x, event->y);
     if (press) {
         toolbar_press = toolbar;
-        if (toolbar >= 0) {
-            set_focus(-1);
-            haptics_tap();
-        }
+        /* CLOSE takes the page's focus at once and HOME on release; BACK
+         * leaves it with the page, as the Back key does. */
+        if (toolbar == ACTION_CLOSE) set_focus(-1);
+        if (toolbar >= 0) haptics_tap();
     }
     pressed = event->down && !event->cancelled;
     if (soft_input(event)) {
@@ -441,6 +482,11 @@ bool page_host_input(const struct pointer_event *event) {
     }
     if (panel) {
         if (desktop_wifi_visible()) {
+            if (toolbar_press >= 0) { /* begun on HOME or BACK: stays in the top bar */
+                if (release && toolbar == toolbar_press) browser_action((unsigned)toolbar);
+                if (!event->down) toolbar_press = -1;
+                return true;
+            }
             desktop_wifi_pointer(event, press, release);
             update_keyboard();
             return true;
@@ -644,7 +690,7 @@ void page_host_keyboard(const struct user_input_event *event) {
     }
 }
 
-int32_t page_host_present(unsigned slot, const struct vm_space *space, uint32_t address,
+int32_t page_host_present(unsigned slot, const struct vm_space *space, user_ptr address,
                           uint32_t bytes) {
     if (bytes != WEB_WIDTH * WEB_HEIGHT * 4) return USER_EINVAL;
     struct user_present_damage damage = {address, 0, 0, WEB_WIDTH, WEB_HEIGHT};
@@ -723,7 +769,7 @@ int32_t page_host_present_frame(unsigned slot, const struct vm_space *space,
     for (unsigned i = 0; i < f->count; ++i) {
         struct user_pixel_rect r = f->damage[i];
         uint32_t end = ((r.y + r.height - 1) * WEB_WIDTH + r.x + r.width) * 4;
-        if (f->pixels > UINT32_MAX - (end - 1)) return USER_EFAULT;
+        if (f->pixels > (user_ptr)-1 - (end - 1)) return USER_EFAULT;
         for (unsigned y = r.y; y < r.y + r.height; ++y)
             if (!vm_accessible(space, f->pixels + (y * WEB_WIDTH + r.x) * 4, r.width * 4, VM_READ))
                 return USER_EFAULT;
@@ -855,18 +901,33 @@ void page_host_redraw_region(unsigned x, unsigned y, unsigned width, unsigned he
 
 void page_host_network_status(const char *message) { desktop_wifi_network_status(message); }
 
-void page_host_device_status(bool clock, bool entropy, bool storage, bool session) {
-    (void)clock;
+void page_host_device_status(bool entropy, bool storage, bool session) {
     entropy_ready = entropy;
     storage_ready = storage;
     storage_session = session;
     dirty = true;
 }
 
-void page_host_clock_status(bool ready) {
-    (void)ready;
-    status_tick();
+void page_host_clock_status(void) { status_tick(); }
+
+static void device_status(unsigned device, const char *prefix, const char *error) {
+    char text[sizeof(device_message[0])] = {0};
+    if (error) {
+        unsigned n = 0;
+        for (; prefix[n]; ++n) text[n] = prefix[n];
+        for (const char *e = error; *e && n < sizeof(text) - 1; ++e) text[n++] = *e;
+    }
+    if (strcmp(text, device_message[device])) {
+        memcpy(device_message[device], text, sizeof(text));
+        dirty = true;
+    }
 }
+
+void page_host_touch_status(const char *error) {
+    device_status(DEVICE_TOUCH, "TOUCH UNAVAILABLE: ", error);
+}
+
+void page_host_usb_status(const char *error) { device_status(DEVICE_USB, "USB UNAVAILABLE: ", error); }
 
 void page_host_entropy_status(bool ready, const char *error) {
     char text[sizeof(entropy_message)] = {0};
@@ -1033,6 +1094,14 @@ static void browser_action(unsigned action) {
         if (!panel && page(selected)) (void)process_web_control(selected, false);
         return;
     }
+    if (action == ACTION_HOME) {
+        page_host_home();
+        return;
+    }
+    if (action == ACTION_BACK) {
+        page_host_back();
+        return;
+    }
     if (action != ACTION_OPEN) return;
     char target[BROWSER_URL_MAX + 1];
     if (!navigate_address(target)) {
@@ -1179,17 +1248,22 @@ static void launcher_render(struct framebuffer *screen) {
     }
 }
 
+static void header_button(struct framebuffer *screen, unsigned x, const char *text) {
+    gfx_rect(screen, (int)x, 6, HEADER_BUTTON, 36, 0x31515c);
+    /* Characters advance 12 pixels at scale 2. */
+    gfx_text(screen, (int)(x + (HEADER_BUTTON - 12 * strlen(text)) / 2), 16, text, 2, 0xf1f5f6);
+}
+
 static void page_header_render(struct framebuffer *screen, unsigned x, unsigned y) {
     (void)x;
     (void)y;
     gfx_rect(screen, 0, 0, 352, WEB_TOP, 0x17232c);
-    if (panel) {
-        gfx_text(screen, 16, 16, "SOS2", 2, 0xf1f5f6);
-        return;
-    }
-    /* No Desktop button: the phone's Home key (Alt+Home in QEMU) is one. */
-    gfx_rect(screen, 12, 6, 84, 36, 0x31515c);
-    gfx_text(screen, 24, 16, "CLOSE", 2, 0xf1f5f6);
+    if (panel) gfx_text(screen, 16, 16, "SOS2", 2, 0xf1f5f6);
+    else header_button(screen, CLOSE_X, "CLOSE");
+    /* Elsewhere Home and Back are keys: the phone's, or Alt+Home and Alt+Left in QEMU. */
+    if (!navigation_buttons()) return;
+    header_button(screen, HOME_X, "HOME");
+    header_button(screen, BACK_X, "BACK");
 }
 
 static void status_render(struct framebuffer *screen, unsigned x, unsigned y) {
@@ -1257,7 +1331,15 @@ static void browser_render(struct framebuffer *screen) {
         gfx_text(screen, 20, y, "SECURE RANDOMNESS UNAVAILABLE", 1, 0x61e0bd);
         y += 18;
     }
-    if (!entropy_ready && entropy_message[0]) gfx_text(screen, 20, y, entropy_message, 1, 0x61e0bd);
+    if (!entropy_ready && entropy_message[0]) {
+        gfx_text(screen, 20, y, entropy_message, 1, 0x61e0bd);
+        y += 18;
+    }
+    for (unsigned i = 0; i < DEVICES; ++i) {
+        if (!device_message[i][0]) continue;
+        gfx_text(screen, 20, y, device_message[i], 1, 0x61e0bd);
+        y += 18;
+    }
     y = settings_top();
     static const char *const buttons[] = {"WI-FI", "UPDATES"};
     for (unsigned i = 0; i < 2; ++i) {

@@ -1,0 +1,783 @@
+WebKitGTK/WPE 2.52 stable branch fixes for SOS2.
+Upstream commits in application order:
+https://github.com/WebKit/WebKit/commit/ebcd65a67f0a5fc951cfa4bd577825d7c2441d88
+https://github.com/WebKit/WebKit/commit/3cf0167134fd56f43be915d20b490bfcb6415873
+https://github.com/WebKit/WebKit/commit/44e73330c3c17c8ed5c6a66ad7f4b9b047b293eb
+https://github.com/WebKit/WebKit/commit/ad76efc28c94b953cd281632e2a31142ce81d106
+https://github.com/WebKit/WebKit/commit/8155dfd9cd0e1860af3b5c51a397b3b0f3f44c5f
+https://github.com/WebKit/WebKit/commit/37c4a0953f4913b0c391311a6c249b871dedd8aa
+
+--- a/Source/WebCore/platform/graphics/ImageBackingStore.h
++++ b/Source/WebCore/platform/graphics/ImageBackingStore.h
+@@ -47,11 +47,16 @@
+ public:
+     static std::unique_ptr<ImageBackingStore> create(const IntSize& size, bool premultiplyAlpha = true)
+     {
+-        return std::unique_ptr<ImageBackingStore>(new ImageBackingStore(size, premultiplyAlpha));
++        auto backingStore = std::unique_ptr<ImageBackingStore>(new ImageBackingStore(size, premultiplyAlpha));
++        if (!backingStore->m_pixels)
++            return nullptr;
++        return backingStore;
+     }
+ 
+     static std::unique_ptr<ImageBackingStore> create(const ImageBackingStore& other)
+     {
++        if (!other.m_pixels)
++            return nullptr;
+         return std::unique_ptr<ImageBackingStore>(new ImageBackingStore(other));
+     }
+ 
+@@ -87,6 +92,12 @@
+     const IntSize& size() const { return m_size; }
+     const IntRect& frameRect() const { return m_frameRect; }
+ 
++    uint32_t& pixelAt(int x, int y)
++    {
++        ASSERT(inBounds(IntPoint(x, y)));
++        return m_pixelsSpan[y * m_size.width() + x];
++    }
++
+     void clear()
+     {
+         zeroSpan(m_pixelsSpan);
+@@ -141,12 +152,6 @@
+         return m_pixelsSpan.subspan(y * m_size.width() + x);
+     }
+ 
+-    uint32_t& pixelAt(int x, int y)
+-    {
+-        ASSERT(inBounds(IntPoint(x, y)));
+-        return m_pixelsSpan[y * m_size.width() + x];
+-    }
+-
+     void setPixel(uint32_t& destination, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+     {
+         destination = pixelValue(r, g, b, a);
+@@ -207,11 +212,12 @@
+         : m_premultiplyAlpha(premultiplyAlpha)
+     {
+         ASSERT(!size.isEmpty() && !isOverSize(size));
+-        setSize(size);
++        RELEASE_ASSERT(setSize(size));
+     }
+ 
+     ImageBackingStore(const ImageBackingStore& other)
+         : m_size(other.m_size)
++        , m_frameRect(other.m_frameRect)
+         , m_premultiplyAlpha(other.m_premultiplyAlpha)
+     {
+         ASSERT(!m_size.isEmpty() && !isOverSize(m_size));
+--- a/Source/WebCore/platform/image-decoders/bmp/BMPImageReader.cpp
++++ b/Source/WebCore/platform/image-decoders/bmp/BMPImageReader.cpp
+@@ -649,8 +649,11 @@
+     if (!inRLE)
+         numPixels = m_parent->size().width();
+ 
++    // An RLE absolute-mode run can start partway into a row.
++    const int startX = m_coord.x();
++
+     // Fail if we're being asked to decode more pixels than remain in the row.
+-    const int endX = m_coord.x() + numPixels;
++    const int endX = startX + numPixels;
+     if (endX > m_parent->size().width())
+         return Failure;
+ 
+@@ -701,8 +704,44 @@
+             }
+         } else {
+             // RGB data.  Decode pixels one at a time, left to right.
++            //
++            // Returns the pixel data for the current X coordinate in a
++            // uint32_t. m_decodedOffset points at the start of the row for
++            // non-RLE data, but at the start of the run for an RLE
++            // absolute-mode run, which can begin mid-row; so index relative
++            // to startX rather than by absolute column, which keeps the reads
++            // within the paddedNumBytes checked above.
++            // NOTE: Only as many bytes of the return value as are needed to
++            // hold the pixel data will actually be set.
++            auto readCurrentPixel = [this, bytesPerPixel, startX]() -> uint32_t {
++                const int offset = (m_coord.x() - startX) * bytesPerPixel;
++                switch (bytesPerPixel) {
++                case 2:
++                    return readUint16(offset);
++
++                case 3: {
++                    // It doesn't matter that we never set the most significant
++                    // byte of the return value here in little-endian mode, the
++                    // caller won't read it.
++                    uint32_t pixel;
++                    memcpySpan(asMutableByteSpan(pixel), m_data->span().subspan(m_decodedOffset + offset, 3));
++#if CPU(BIG_ENDIAN)
++                    pixel = ((pixel & 0xff00) << 8) | ((pixel & 0xff0000) >> 8) | ((pixel & 0xff000000) >> 24);
++#endif
++                    return pixel;
++                }
++
++                case 4:
++                    return readUint32(offset);
++
++                default:
++                    ASSERT_NOT_REACHED();
++                    return 0;
++                }
++            };
++
+             while (m_coord.x() < endX) {
+-                const uint32_t pixel = readCurrentPixel(bytesPerPixel);
++                const uint32_t pixel = readCurrentPixel();
+ 
+                 // Some BMPs specify an alpha channel but don't actually use it
+                 // (it contains all 0s).  To avoid displaying these images as
+--- a/Source/WebCore/platform/image-decoders/bmp/BMPImageReader.h
++++ b/Source/WebCore/platform/image-decoders/bmp/BMPImageReader.h
+@@ -189,39 +189,6 @@
+         return m_isTopDown ? ((m_coord.y() + numRows) >= m_parent->size().height()) : ((m_coord.y() - numRows) < 0);
+     }
+ 
+-    // Returns the pixel data for the current X coordinate in a uint32_t.
+-    // Assumes m_decodedOffset has been set to the beginning of the current
+-    // row.
+-    // NOTE: Only as many bytes of the return value as are needed to hold
+-    // the pixel data will actually be set.
+-    inline uint32_t readCurrentPixel(int bytesPerPixel) const
+-    {
+-        const int offset = m_coord.x() * bytesPerPixel;
+-        switch (bytesPerPixel) {
+-        case 2:
+-            return readUint16(offset);
+-
+-        case 3: {
+-            // It doesn't matter that we never set the most significant byte
+-            // of the return value here in little-endian mode, the caller
+-            // won't read it.
+-            uint32_t pixel;
+-            memcpySpan(asMutableByteSpan(pixel), m_data->span().subspan(m_decodedOffset + offset, 3));
+-#if CPU(BIG_ENDIAN)
+-            pixel = ((pixel & 0xff00) << 8) | ((pixel & 0xff0000) >> 8) | ((pixel & 0xff000000) >> 24);
+-#endif
+-            return pixel;
+-        }
+-
+-        case 4:
+-            return readUint32(offset);
+-
+-        default:
+-            ASSERT_NOT_REACHED();
+-            return 0;
+-        }
+-    }
+-
+     // Returns the value of the desired component (0, 1, 2, 3 == R, G, B, A)
+     // in the given pixel data.
+     inline unsigned getComponent(uint32_t pixel, int component) const
+--- a/Source/WebCore/platform/image-decoders/gif/GIFImageDecoder.cpp
++++ b/Source/WebCore/platform/image-decoders/gif/GIFImageDecoder.cpp
+@@ -306,9 +306,14 @@
+             // The only remaining case is a DisposalMethod::RestoreToBackground frame. If
+             // it had no alpha, and its rect is contained in the current frame's
+             // rect, we know the current frame has no alpha.
+-            IntRect prevRect = prevBuffer->backingStore()->frameRect();
+-            if ((prevBuffer->disposalMethod() == ScalableImageDecoderFrame::DisposalMethod::RestoreToBackground) && !prevBuffer->hasAlpha() && rect.contains(prevRect))
+-                buffer.setHasAlpha(false);
++            //
++            // A frame evicted from the cache has no backing store, so its rect is unknown and
++            // this frame's opacity cannot be established from it.
++            if (prevBuffer->backingStore()) {
++                IntRect prevRect = prevBuffer->backingStore()->frameRect();
++                if ((prevBuffer->disposalMethod() == ScalableImageDecoderFrame::DisposalMethod::RestoreToBackground) && !prevBuffer->hasAlpha() && rect.contains(prevRect))
++                    buffer.setHasAlpha(false);
++            }
+         }
+     }
+ 
+@@ -388,11 +393,12 @@
+             prevMethod = prevBuffer->disposalMethod();
+         }
+ 
+-        ASSERT(prevBuffer->isComplete());
++        if (!prevBuffer->backingStore())
++            return setFailed();
+ 
+         if ((prevMethod == ScalableImageDecoderFrame::DisposalMethod::Unspecified) || (prevMethod == ScalableImageDecoderFrame::DisposalMethod::DoNotDispose)) {
+             // Preserve the last frame as the starting state for this frame.
+-            if (!prevBuffer->backingStore() || !buffer->initialize(*prevBuffer->backingStore()))
++            if (!buffer->initialize(*prevBuffer->backingStore()))
+                 return setFailed();
+         } else {
+             // We want to clear the previous frame to transparent, without
+@@ -406,7 +412,7 @@
+                     return setFailed();
+             } else {
+                 // Copy the whole previous buffer, then clear just its frame.
+-                if (!prevBuffer->backingStore() || !buffer->initialize(*prevBuffer->backingStore()))
++                if (!buffer->initialize(*prevBuffer->backingStore()))
+                     return setFailed();
+                 buffer->backingStore()->clearRect(prevRect);
+                 buffer->setHasAlpha(true);
+@@ -414,11 +420,9 @@
+         }
+     }
+ 
+-    // Make sure the frameRect doesn't extend outside the buffer.
+-    if (frameRect.maxX() > size().width())
+-        frameRect.setWidth(size().width() - frameContext->xOffset);
+-    if (frameRect.maxY() > size().height())
+-        frameRect.setHeight(size().height() - frameContext->yOffset);
++    // A frame offset can exceed the canvas, since the logical screen size is only published for the
++    // first frame. A subtracted extent would be negative there.
++    frameRect.intersect(IntRect(IntPoint(), size()));
+ 
+     buffer->backingStore()->setFrameRect(frameRect);
+ 
+--- a/Source/WebCore/platform/image-decoders/ico/ICOImageDecoder.cpp
++++ b/Source/WebCore/platform/image-decoders/ico/ICOImageDecoder.cpp
+@@ -215,7 +215,14 @@
+     // in the directory.
+     if (m_pngDecoders[index]->encodedDataStatus() >= EncodedDataStatus::SizeAvailable && (m_pngDecoders[index]->size() != dirEntry.m_size))
+         return setFailed();
+-    m_frameBufferCache[index] = *m_pngDecoders[index]->frameBufferAtIndex(0);
++
++    // firstFrameBuffer() is null until the sub-decoder has parsed its own header, which has not
++    // happened yet when only part of the embedded PNG has arrived.
++    auto* frameBuffer = static_cast<PNGImageDecoder*>(m_pngDecoders[index].get())->firstFrameBuffer();
++    if (!frameBuffer)
++        return false;
++
++    m_frameBufferCache[index] = *frameBuffer;
+     return !m_pngDecoders[index]->failed() || setFailed();
+ }
+ 
+--- a/Source/WebCore/platform/image-decoders/png/PNGImageDecoder.cpp
++++ b/Source/WebCore/platform/image-decoders/png/PNGImageDecoder.cpp
+@@ -100,18 +100,31 @@
+     static_cast<PNGImageDecoder*>(png_get_progressive_ptr(png))->headerAvailable();
+ }
+ 
+-// Called when a row is ready.
++// Called when a row of the canvas is ready.
+ static void PNGAPI rowAvailable(png_structp png, png_bytep rowBuffer, png_uint_32 rowIndex, int interlacePass)
+ {
+     static_cast<PNGImageDecoder*>(png_get_progressive_ptr(png))->rowAvailable(rowBuffer, rowIndex, interlacePass);
+ }
+ 
++// Called when a row of an animation frame is ready. A frame's rows are as wide as the frame and are
++// painted at the frame's own offset.
++static void PNGAPI frameRowAvailable(png_structp png, png_bytep rowBuffer, png_uint_32 rowIndex, int interlacePass)
++{
++    static_cast<PNGImageDecoder*>(png_get_progressive_ptr(png))->frameRowAvailable(rowBuffer, rowIndex, interlacePass);
++}
++
+ // Called when we have completely finished decoding the image.
+ static void PNGAPI pngComplete(png_structp png, png_infop)
+ {
+     static_cast<PNGImageDecoder*>(png_get_progressive_ptr(png))->pngComplete();
+ }
+ 
++// Called when an animation frame's stream has delivered every row it is going to.
++static void PNGAPI frameEnd(png_structp png, png_infop)
++{
++    static_cast<PNGImageDecoder*>(png_get_progressive_ptr(png))->paintFrame();
++}
++
+ // Called when we have the frame header.
+ static void PNGAPI frameHeader(png_structp png, png_infop)
+ {
+@@ -255,18 +268,24 @@
+     if (ScalableImageDecoder::encodedDataStatus() < EncodedDataStatus::SizeAvailable)
+         return nullptr;
+ 
+-    if (index >= frameCount())
+-        index = frameCount() - 1;
+-
+     if (m_frameBufferCache.isEmpty())
+         m_frameBufferCache.grow(1);
+ 
++    // A malformed acTL can advertise more frames than there are buffers.
++    index = std::min(index, m_frameBufferCache.size() - 1);
++
+     auto& frame = m_frameBufferCache[index];
+     if (!frame.isComplete())
+         decode(false, index, isAllDataReceived());
+     return &frame;
+ }
+ 
++ScalableImageDecoderFrame* PNGImageDecoder::firstFrameBuffer()
++{
++    Locker locker { m_lock };
++    return frameBufferAtIndex(0);
++}
++
+ void PNGImageDecoder::clear()
+ {
+     m_reader = nullptr;
+@@ -428,40 +447,51 @@
+     }
+ }
+ 
+-void PNGImageDecoder::rowAvailable(unsigned char* rowBuffer, unsigned rowIndex, int)
++// Returns the buffer the frame being decoded is painted into, or null if there is no such frame.
++ScalableImageDecoderFrame* PNGImageDecoder::currentFrameBuffer()
+ {
+-    if (m_frameBufferCache.isEmpty())
+-        return;
++    if (m_frameBufferCache.isEmpty() || m_currentFrame >= frameCount())
++        return nullptr;
+ 
+-    // Initialize the framebuffer if needed.
+-    if (m_currentFrame >= frameCount())
+-        return;
++    RELEASE_ASSERT(m_currentFrame < m_frameBufferCache.size());
+     auto& buffer = m_frameBufferCache[m_currentFrame];
+     if (buffer.isInvalid()) {
+-        png_structp png = m_reader->pngPtr();
+         if (!buffer.initialize(size(), m_premultiplyAlpha)) {
+-            longjmp(JMPBUF(png), 1);
+-            return;
+-        }
+-
+-        unsigned colorChannels = m_reader->hasAlpha() ? 4 : 3;
+-        if (PNG_INTERLACE_ADAM7 == png_get_interlace_type(png, m_reader->infoPtr())
+-            || m_currentFrame) {
+-            if (!m_reader->interlaceBuffer())
+-                m_reader->createInterlaceBuffer(colorChannels * size().width() * size().height());
+-            if (!m_reader->interlaceBuffer()) {
+-                longjmp(JMPBUF(png), 1);
+-                return;
+-            }
++            longjmp(JMPBUF(m_reader->pngPtr()), 1);
++            return nullptr;
+         }
+ 
+         buffer.setDecodingStatus(DecodingStatus::Partial);
+         buffer.setHasAlpha(false);
+-
+-        if (m_currentFrame)
+-            initFrameBuffer(m_currentFrame);
+     }
+ 
++    return &buffer;
++}
++
++// An interlaced pass covers part of a row and an animation frame covers part of the width, so those
++// rows are combined into whole canvas rows here before they are painted.
++void PNGImageDecoder::ensureInterlaceBuffer()
++{
++    if (m_reader->interlaceBuffer())
++        return;
++
++    unsigned colorChannels = m_reader->hasAlpha() ? 4 : 3;
++    m_reader->createInterlaceBuffer(colorChannels * size().width() * size().height());
++    if (!m_reader->interlaceBuffer())
++        longjmp(JMPBUF(m_reader->pngPtr()), 1);
++}
++
++void PNGImageDecoder::rowAvailable(unsigned char* rowBuffer, unsigned rowIndex, int)
++{
++    assertIsHeld(m_lock);
++    auto* frameBuffer = currentFrameBuffer();
++    if (!frameBuffer)
++        return;
++    auto& buffer = *frameBuffer;
++
++    if (PNG_INTERLACE_ADAM7 == png_get_interlace_type(m_reader->pngPtr(), m_reader->infoPtr()))
++        ensureInterlaceBuffer();
++
+     /* libpng comments (here to explain what follows).
+      *
+      * this function is called for every row in the image. If the
+@@ -507,17 +537,14 @@
+     if (png_bytep interlaceBuffer = m_reader->interlaceBuffer()) {
+         unsigned colorChannels = hasAlpha ? 4 : 3;
+         row = interlaceBuffer + (rowIndex * colorChannels * size().width());
+-        if (m_currentFrame) {
+-            png_progressive_combine_row(m_png, row, rowBuffer);
+-            return; // Only do incremental image display for the first frame.
+-        }
+         png_progressive_combine_row(m_reader->pngPtr(), row, rowBuffer);
+     }
+ 
+     // Write the decoded row pixels to the frame buffer.
+     auto destinationRow = buffer.backingStore()->pixelsStartingAt(0, rowIndex);
+     auto address = destinationRow;
+-    int width = size().width();
++    ASSERT(size().width() == static_cast<int>(png_get_image_width(m_reader->pngPtr(), m_reader->infoPtr())));
++    int width = std::min<int>(size().width(), png_get_image_width(m_reader->pngPtr(), m_reader->infoPtr()));
+     unsigned char nonTrivialAlphaMask = 0;
+ 
+     png_bytep pixel = row;
+@@ -541,6 +568,23 @@
+         buffer.setHasAlpha(true);
+ }
+ 
++void PNGImageDecoder::frameRowAvailable(unsigned char* rowBuffer, unsigned rowIndex, int)
++{
++    assertIsHeld(m_lock);
++    // Nothing to do if the row is unchanged, or the row is outside the image bounds: libpng may
++    // send extra rows, ignore them to make our lives easier.
++    if (!rowBuffer || rowIndex >= static_cast<unsigned>(size().height()))
++        return;
++
++    // The frame's rows are combined here and painted at the frame's offset once its stream ends.
++    png_bytep interlaceBuffer = m_reader->interlaceBuffer();
++    if (!interlaceBuffer)
++        return;
++
++    unsigned colorChannels = m_reader->hasAlpha() ? 4 : 3;
++    png_progressive_combine_row(m_png, interlaceBuffer + (rowIndex * colorChannels * size().width()), rowBuffer);
++}
++
+ void PNGImageDecoder::pngComplete()
+ {
+     if (m_isAnimated) {
+@@ -579,14 +623,19 @@
+         if (m_hasInfo || m_isAnimated)
+             return;
+ 
+-        m_frameCount = png_get_uint_32(chunk->data);
+-        m_playCount = png_get_uint_32(chunk->data + 4);
++        // frameCount() reports m_frameCount and callers size per-frame containers from it, so a
++        // rejected count must not be stored.
++        size_t frameCount = png_get_uint_32(chunk->data);
++        unsigned playCount = png_get_uint_32(chunk->data + 4);
+ 
+-        if (!m_frameCount || m_frameCount > cMaxFrameCount || m_playCount > PNG_UINT_31_MAX) {
++        if (!frameCount || frameCount > cMaxFrameCount || playCount > PNG_UINT_31_MAX) {
+             fallbackNotAnimated();
+             return;
+         }
+ 
++        m_frameCount = frameCount;
++        m_playCount = playCount;
++
+         m_isAnimated = true;
+         if (!m_frameInfo)
+             m_frameIsHidden = true;
+@@ -631,8 +680,8 @@
+         const auto pixelCount = checkedSum<size_t>(checkedProduct<size_t>(width, height), m_decodedPixelCount);
+         if (pixelCount.hasOverflowed() || pixelCount > cMaxDecodedPixels
+             || m_xOffset > cMaxPNGSize || m_yOffset > cMaxPNGSize
+-            || m_xOffset + m_width > width
+-            || m_yOffset + m_height > height
++            || static_cast<uint64_t>(m_xOffset) + m_width > width
++            || static_cast<uint64_t>(m_yOffset) + m_height > height
+             || m_dispose > 2 || m_blend > 1) {
+             fallbackNotAnimated();
+             return;
+@@ -690,6 +739,7 @@
+ 
+ void PNGImageDecoder::frameHeader()
+ {
++    assertIsHeld(m_lock);
+     int colorType = png_get_color_type(m_png, m_info);
+ 
+     if (colorType == PNG_COLOR_TYPE_PALETTE)
+@@ -715,6 +765,38 @@
+     png_set_interlace_handling(m_png);
+ 
+     png_read_update_info(m_png, m_info);
++
++    beginFrame();
++}
++
++// libpng calls frameHeader() once per frame, after its header and before its first row, so a
++// frame's buffer is set up exactly once.
++void PNGImageDecoder::beginFrame()
++{
++    assertIsHeld(m_lock);
++    auto* buffer = currentFrameBuffer();
++    if (!buffer)
++        return;
++
++    ensureInterlaceBuffer();
++
++    // The interlace buffer outlives each frame, so anything this frame does not deliver still holds
++    // the pixels of the frame before it, which paintFrame() would paint as this frame's own.
++    ASSERT(m_width <= static_cast<unsigned>(size().width()));
++    ASSERT(m_height <= static_cast<unsigned>(size().height()));
++    unsigned colorChannels = m_reader->hasAlpha() ? 4 : 3;
++    unsigned stride = colorChannels * size().width();
++    unsigned rowBytes = colorChannels * std::min<unsigned>(m_width, size().width());
++    png_bytep row = m_reader->interlaceBuffer();
++    for (unsigned y = std::min<unsigned>(m_height, size().height()); y; --y, row += stride)
++        zeroSpan(unsafeMakeSpan(row, rowBytes));
++
++    // initFrameBuffer() starts a frame from the one before it, which frame 0 does not have: a
++    // hidden default image leaves the first animation frame at 0.
++    if (m_currentFrame)
++        initFrameBuffer(m_currentFrame);
++    else
++        updateFrameRect(*buffer);
+ }
+ 
+ void PNGImageDecoder::init()
+@@ -774,11 +856,13 @@
+     }
+ 
+     png_structp png = m_reader->pngPtr();
+-    ASSERT(prevBuffer->isComplete());
++
++    if (!prevBuffer->backingStore())
++        longjmp(JMPBUF(png), 1);
+ 
+     if (prevMethod == ScalableImageDecoderFrame::DisposalMethod::DoNotDispose) {
+         // Preserve the last frame as the starting state for this frame.
+-        if (!prevBuffer->backingStore() || !buffer.initialize(*prevBuffer->backingStore()))
++        if (!buffer.initialize(*prevBuffer->backingStore()))
+             longjmp(JMPBUF(png), 1);
+     } else {
+         // We want to clear the previous frame to transparent, without
+@@ -791,7 +875,7 @@
+             buffer.setHasAlpha(true);
+         } else {
+             // Copy the whole previous buffer, then clear just its frame.
+-            if (!prevBuffer->backingStore() || !buffer.initialize(*prevBuffer->backingStore())) {
++            if (!buffer.initialize(*prevBuffer->backingStore())) {
+                 longjmp(JMPBUF(png), 1);
+                 return;
+             }
+@@ -800,72 +884,91 @@
+         }
+     }
+     
++    updateFrameRect(buffer);
++}
++
++void PNGImageDecoder::updateFrameRect(ScalableImageDecoderFrame& buffer)
++{
+     IntRect frameRect(m_xOffset, m_yOffset, m_width, m_height);
+ 
+-    // Make sure the frameRect doesn't extend outside the buffer.
+-    if (frameRect.maxX() > size().width())
+-        frameRect.setWidth(size().width() - m_xOffset);
+-    if (frameRect.maxY() > size().height())
+-        frameRect.setHeight(size().height() - m_yOffset);
++    // Painting walks this rect with no further bounds check. readChunks() rejects an fcTL that
++    // reaches past the canvas, in arithmetic wide enough not to wrap.
++    ASSERT(IntRect(IntPoint(), size()).contains(frameRect));
++    frameRect.intersect(IntRect(IntPoint(), size()));
+ 
+     buffer.backingStore()->setFrameRect(frameRect);
+ }
+ 
+-void PNGImageDecoder::frameComplete()
+-{
+-    if (m_frameIsHidden || m_currentFrame >= frameCount())
+-        return;
+-
+-    auto& buffer = m_frameBufferCache[m_currentFrame];
+-    buffer.setDecodingStatus(DecodingStatus::Complete);
+-
++// Paints what a frame's stream delivered, at the frame's own offset. It is registered only on a
++// frame's stream, so the canvas, which is painted a row at a time, never reaches it.
++void PNGImageDecoder::paintFrame()
++{
++    assertIsHeld(m_lock);
++    ASSERT(m_png);
++    auto* frameBuffer = currentFrameBuffer();
+     png_bytep interlaceBuffer = m_reader->interlaceBuffer();
++    if (!frameBuffer || !interlaceBuffer)
++        return;
++    auto& buffer = *frameBuffer;
+ 
+-    if (m_currentFrame && interlaceBuffer) {
+-        IntRect rect = buffer.backingStore()->frameRect();
+-        bool hasAlpha = m_reader->hasAlpha();
+-        bool nonTrivialAlpha = false;
+-        if (m_blend && !hasAlpha)
+-            m_blend = 0;
++    // beginFrame() gave this frame the rect its fcTL asked for, and nothing writes those fields
++    // again until the next fcTL, which paints this frame before it reads them.
++    IntRect rect = buffer.backingStore()->frameRect();
++    ASSERT(rect == IntRect(m_xOffset, m_yOffset, m_width, m_height));
+ 
+-        png_bytep row = interlaceBuffer;
+-        unsigned colorChannels = hasAlpha ? 4 : 3;
+-        for (int y = rect.y(); y < rect.maxY(); ++y, row += colorChannels * size().width()) {
+-            png_bytep pixel = row;
+-            auto destinationRow = buffer.backingStore()->pixelsStartingAt(rect.x(), y);
+-            auto address = destinationRow;
+-            for (int x = rect.x(); x < rect.maxX(); ++x, pixel += colorChannels) {
+-                unsigned alpha = hasAlpha ? pixel[3] : 255;
+-                nonTrivialAlpha |= alpha < 255;
+-                if (!m_blend)
+-                    buffer.backingStore()->setPixel(address[0], pixel[0], pixel[1], pixel[2], alpha);
+-                else
+-                    buffer.backingStore()->blendPixel(address[0], pixel[0], pixel[1], pixel[2], alpha);
+-                address = address.subspan(1);
+-            }
++    bool hasAlpha = m_reader->hasAlpha();
++    bool nonTrivialAlpha = false;
++    if (m_blend && !hasAlpha)
++        m_blend = 0;
++
++    png_bytep row = interlaceBuffer;
++    unsigned colorChannels = hasAlpha ? 4 : 3;
++    for (int y = rect.y(); y < rect.maxY(); ++y, row += colorChannels * size().width()) {
++        png_bytep pixel = row;
++        auto destinationRow = buffer.backingStore()->pixelsStartingAt(rect.x(), y);
++        auto address = destinationRow;
++        for (int x = rect.x(); x < rect.maxX(); ++x, pixel += colorChannels) {
++            unsigned alpha = hasAlpha ? pixel[3] : 255;
++            nonTrivialAlpha |= alpha < 255;
++            if (!m_blend)
++                buffer.backingStore()->setPixel(address[0], pixel[0], pixel[1], pixel[2], alpha);
++            else
++                buffer.backingStore()->blendPixel(address[0], pixel[0], pixel[1], pixel[2], alpha);
++            address = address.subspan(1);
++        }
+ #if USE(LCMS)
+-            if (m_iccTransform)
+-                cmsDoTransform(m_iccTransform.get(), destinationRow.data(), destinationRow.data(), rect.maxX());
++        if (m_iccTransform)
++            cmsDoTransform(m_iccTransform.get(), destinationRow.data(), destinationRow.data(), rect.width());
+ #endif
+-        }
++    }
+ 
+-        if (!nonTrivialAlpha) {
+-            IntRect rect = buffer.backingStore()->frameRect();
+-            if (rect.contains(IntRect(IntPoint(), size())))
+-                buffer.setHasAlpha(false);
+-            else {
+-                size_t frameIndex = m_currentFrame;
+-                const auto* prevBuffer = &m_frameBufferCache[--frameIndex];
+-                while (frameIndex && (prevBuffer->disposalMethod() == ScalableImageDecoderFrame::DisposalMethod::RestoreToPrevious))
+-                    prevBuffer = &m_frameBufferCache[--frameIndex];
++    if (!nonTrivialAlpha) {
++        if (rect.contains(IntRect(IntPoint(), size())))
++            buffer.setHasAlpha(false);
++        // Frame 0 has no previous frame whose disposal could have left the rest of the canvas opaque.
++        else if (m_currentFrame) {
++            size_t frameIndex = m_currentFrame;
++            const auto* prevBuffer = &m_frameBufferCache[--frameIndex];
++            while (frameIndex && (prevBuffer->disposalMethod() == ScalableImageDecoderFrame::DisposalMethod::RestoreToPrevious))
++                prevBuffer = &m_frameBufferCache[--frameIndex];
+ 
++            if (frameIndex && prevBuffer->backingStore()) {
+                 IntRect prevRect = prevBuffer->backingStore()->frameRect();
+                 if ((prevBuffer->disposalMethod() == ScalableImageDecoderFrame::DisposalMethod::RestoreToBackground) && !prevBuffer->hasAlpha() && rect.contains(prevRect))
+                     buffer.setHasAlpha(false);
+             }
+-        } else if (!m_blend && !buffer.hasAlpha())
+-            buffer.setHasAlpha(nonTrivialAlpha);
+-    }
++        }
++    } else if (!m_blend && !buffer.hasAlpha())
++        buffer.setHasAlpha(nonTrivialAlpha);
++}
++
++void PNGImageDecoder::frameComplete()
++{
++    if (m_frameIsHidden || m_currentFrame >= frameCount())
++        return;
++
++    RELEASE_ASSERT(m_currentFrame < m_frameBufferCache.size());
++    m_frameBufferCache[m_currentFrame].setDecodingStatus(DecodingStatus::Complete);
+     m_currentFrame++;
+ }
+ 
+@@ -886,7 +989,7 @@
+ 
+     png_set_crc_action(m_png, PNG_CRC_QUIET_USE, PNG_CRC_QUIET_USE);
+     png_set_progressive_read_fn(m_png, static_cast<png_voidp>(this),
+-        WebCore::frameHeader, WebCore::rowAvailable, 0);
++        WebCore::frameHeader, WebCore::frameRowAvailable, WebCore::frameEnd);
+ 
+     memcpySpan(std::span { m_dataIHDR }.subspan(8), unsafeMakeSpan(chunk->data + 4, 8));
+     png_save_uint_32(datagAMA + 8, m_gamma);
+--- a/Source/WebCore/platform/image-decoders/png/PNGImageDecoder.h
++++ b/Source/WebCore/platform/image-decoders/png/PNGImageDecoder.h
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2006 Apple Inc. All rights reserved.
++ * Copyright (C) 2026 Igalia S.L.
+  *
+  * Redistribution and use in source and binary forms, with or without
+  * modification, are permitted provided that the following conditions
+@@ -57,12 +58,15 @@
+         // PNGImageReader!
+         bool setFailed() override;
+ 
+-        // Callbacks from libpng
++        // Callbacks from libpng. The canvas and each animation frame are decoded by separate
++        // streams, with one set of callbacks registered per stream.
+         void headerAvailable();
+         void rowAvailable(unsigned char* rowBuffer, unsigned rowIndex, int interlacePass);
+         void pngComplete();
+         void readChunks(png_unknown_chunkp);
+         void frameHeader();
++        void frameRowAvailable(unsigned char* rowBuffer, unsigned rowIndex, int interlacePass);
++        void paintFrame();
+ 
+         void init();
+         void clearFrameBufferCache(size_t clearBeforeFrame) override;
+@@ -85,6 +89,8 @@
+             return (index < m_frameBufferCache.size() && m_frameBufferCache[index].isComplete());
+         }
+ 
++        ScalableImageDecoderFrame* firstFrameBuffer();
++
+     private:
+         PNGImageDecoder(AlphaOption, GammaAndColorProfileOption);
+         void tryDecodeSize(bool allDataReceived) override { decode(true, 0, allDataReceived); }
+@@ -93,7 +99,11 @@
+         // calculating the image size.  If decoding fails but there is no more
+         // data coming, sets the "decode failure" flag.
+         void decode(bool onlySize, unsigned haltAtFrame, bool allDataReceived);
++        ScalableImageDecoderFrame* currentFrameBuffer();
++        void ensureInterlaceBuffer();
++        void beginFrame();
+         void initFrameBuffer(size_t frameIndex);
++        void updateFrameRect(ScalableImageDecoderFrame&);
+         void frameComplete();
+         int processingStart(png_unknown_chunkp);
+         int processingFinish();
+--- a/Source/WebCore/platform/image-decoders/webp/WEBPImageDecoder.cpp
++++ b/Source/WebCore/platform/image-decoders/webp/WEBPImageDecoder.cpp
+@@ -81,6 +81,11 @@
+ 
+     decode(index, isAllDataReceived());
+ 
++    // decode() leaves the cache untouched when it bails out early, and m_frameCount comes from a
++    // demuxer that may since have rejected the file.
++    if (index >= m_frameBufferCache.size())
++        return nullptr;
++
+     return &m_frameBufferCache[index];
+ }
+ 
+@@ -260,25 +265,26 @@
+ {
+     auto& buffer = m_frameBufferCache[frameIndex];
+     int decodedWidth = 0;
+-    int decodedHeight = 0;
+-    if (!WebPIDecGetRGB(decoder, &decodedHeight, &decodedWidth, 0, 0))
++    int decodedRows = 0;
++    if (!WebPIDecGetRGB(decoder, &decodedRows, &decodedWidth, 0, 0))
+         return; // See also https://bugs.webkit.org/show_bug.cgi?id=74062
+-    if (decodedHeight <= 0)
++    if (decodedRows <= 0)
+         return;
+ 
+     const IntRect& frameRect = buffer.backingStore()->frameRect();
+-    ASSERT_WITH_SECURITY_IMPLICATION(decodedWidth == frameRect.width());
+-    ASSERT_WITH_SECURITY_IMPLICATION(decodedHeight <= frameRect.height());
+     const int left = frameRect.x();
+     const int top = frameRect.y();
+ 
+-    for (int y = 0; y < decodedHeight; y++) {
++    const int copyWidth = std::min(decodedWidth, frameRect.width());
++    const int copyRows = std::min(decodedRows, frameRect.height());
++
++    for (int y = 0; y < copyRows; y++) {
+         const int canvasY = top + y;
+-        for (int x = 0; x < decodedWidth; x++) {
++        for (int x = 0; x < copyWidth; x++) {
+             const int canvasX = left + x;
+             auto& destinationPixel = buffer.backingStore()->pixelAt(canvasX, canvasY);
+             WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN // non-Apple ports
+-            uint8_t* sourcePixels = decoderBuffer.u.RGBA.rgba + (y * frameRect.width() + x) * sizeof(uint32_t);
++            uint8_t* sourcePixels = decoderBuffer.u.RGBA.rgba + y * decoderBuffer.u.RGBA.stride + x * sizeof(uint32_t);
+             if (blend && (sourcePixels[3] < 255))
+                 buffer.backingStore()->blendPixel(destinationPixel, sourcePixels[0], sourcePixels[1], sourcePixels[2], sourcePixels[3]);
+             else

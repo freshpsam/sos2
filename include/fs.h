@@ -44,6 +44,6 @@ void fs_space_close(struct fs_space *space);
 bool fs_profile_remove(const char *profile);
 /* Answered directly on the syscall path; no littlefs access. */
 int32_t fs_seek(struct fs_space *files, uint32_t handle, uint32_t offset);
-int32_t fs_call(struct fs_space *files, struct vm_space *vm, uint32_t number, uint32_t a,
-                uint32_t b, uint32_t c, uint32_t d);
+int32_t fs_call(struct fs_space *files, struct vm_space *vm, uint32_t number, user_ptr a,
+                user_ptr b, user_ptr c, user_ptr d);
 #endif

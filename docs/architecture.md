@@ -1,6 +1,8 @@
 # Architecture
 
-SOS2 is a native ARM32 kernel with the desktop and drivers built in. Apps are
+SOS2 is a native ARM kernel with the desktop and drivers built in, for ARM32
+(QEMU and the Redmi 2) or AArch64 (QEMU, and the
+[Galaxy Tab A7 Lite](gta7lite.md) in progress), chosen at build time. Apps are
 web pages, plus [native apps](#native-apps). The system's own programs are the
 engine, `/bin/sos2-web`, which runs once per open page, and the
 [updater](#updates), `/bin/sos2-updater`.
@@ -10,22 +12,39 @@ engine, `/bin/sos2-web`, which runs once per open page, and the
 - Each page or app is a static ARM ELF process in its own address space. The
   kernel preempts user code every 5 ms; a fault ends only that process, and
   **Close** reclaims even a hung page.
-- Free RAM and, per process, a 192 MiB quota and 16 threads limit what runs.
-  When the last page closes, free memory must be back at its post-boot
-  baseline, or the kernel panics.
-- Up to four CPUs run. CPU 0 owns the desktop, scheduler, syscalls and
-  drivers; the others run page threads. On the Redmi 2 the secondary cores
-  start as the vendor kernel starts them, and a core that misses a bounded
-  wait is skipped.
+- Free RAM and, per process, a 192 MiB quota (384 MiB on AArch64) and 16
+  threads limit what runs. When the last page closes, free memory must be
+  back at its post-boot baseline, or the kernel panics.
+- Up to four CPUs run, eight on AArch64. CPU 0 owns the desktop, scheduler,
+  syscalls and drivers; the others run page threads. On the Redmi 2 the
+  secondary cores start as the vendor kernel starts them, and a core that
+  misses a bounded wait is skipped.
 
 ## Memory
 
-Page permissions protect kernel and device memory, keep code read-only and
-never allow writable executable mappings; stacks have guard pages, syscalls
-validate every user buffer, and JIT is disabled. Devices never DMA into user
-memory. Read-only ELF segments (the engine's code and constants) are loaded
-once and shared by every page. The engine's allocator is mimalloc, configured
-for SOS2, which backs every mapping with RAM when it is created.
+Page permissions protect kernel and device memory and keep code read-only.
+Writable memory is never executable, except in the engine's JIT window (32 MiB
+on ARM32, 64 MiB on AArch64), which only page processes may map. JavaScriptCore
+maps its whole JIT pool there when a page starts (4 MiB on ARM32, 16 MiB on
+AArch64), writes its code into it and then synchronizes the instruction cache
+(`sos2_icache_sync`). AArch64 user code does that itself; ARM32 user code can't,
+so a system call does it on the calling CPU, which already has the page's
+mappings, and returns straight to the page.
+Stacks have guard pages, and kernel faults run on stacks of their own, so a
+kernel stack overflow is still reported. Syscalls validate every user buffer,
+and devices never DMA into user memory. AArch64 user space lies above 4 GiB.
+Read-only ELF segments (the engine's code and constants) are loaded once and
+shared by every page. The engine's allocator is mimalloc, configured for SOS2,
+which backs every mapping with RAM when it is created. JavaScriptCore's 16 KiB
+heap blocks are mapped one by one at that size instead, since mimalloc would
+spend 32 KiB on each aligned block.
+
+On AArch64 the device tree places everything: the kernel's page pool is the
+largest stretch of RAM below 4 GiB that no reservation, framebuffer, device
+tree or resource uses, and the resources arrive as the initrd. A compressed
+(SORZ) one, as on the tablet, expands at boot into the smallest free stretch
+that holds it, through a temporary cached mapping (`arch/arm64/boot_cache.c`),
+since the data cache is still off.
 
 ## Services and SDK
 
@@ -58,14 +77,14 @@ changes within 250 ms.
 - **RAM mode** (`sos2.storage=ram`, the default for `make run` and
   `make phone`) keeps a 32 MiB data volume in RAM until reboot.
 - **Persistent mode** (`sos2.storage=disk`) uses one littlefs volume over the
-  whole disk: `build/native-arm32/data.img` in QEMU, a
+  whole disk: `build/native-arm32/data.img` (or `native-arm64`) in QEMU, a
   [dedicated partition](redmi2.md#persistent-storage) on the phone. The kernel
   never formats it. While QEMU is stopped, `build/host/fs-image` reads and
   writes a profile's files, and `tools/web_content.py` installs the local
   website.
 - **Installed mode** (`sos2.storage=installed`) is persistent mode on an
-  [installed](redmi2.md#installing) phone, whose volume follows its app store
-  in the cache partition. The kernel formats it when it does not mount, and
+  installed [phone](redmi2.md#installing) or [tablet](gta7lite.md#updates-and-apps),
+  whose volume follows its app store in the cache partition. The kernel formats it when it does not mount, and
   runs as a RAM session when the eMMC fails. Removing an app deletes its
   files.
 
@@ -75,31 +94,46 @@ limits: 5 MiB per origin and a 12 MiB database.
 
 ## Updates
 
-The updater downloads `sos2-redmi2.update` and app packages from GitHub Pages
+The updater downloads the device's update (`sos2-redmi2.update` or
+`sos2-gta7lite.update`) and app packages from GitHub Pages
 and hands them to the kernel's update service
 (`kernel/protection/system_update.c`) with `SYS_UPDATE`, which only it may
 call. Like the browser it is part of the system: the desktop's **UPDATES**
-button opens it, and no launcher lists it. On a phone started from its
-installed system, the kernel checks each file, writes a system update into
-the cache slot the boot image does not use and the boot image last, and an
+button opens it, and no launcher lists it. On a device started from its
+installed system, the kernel checks each file, writes a system update, a
+whole boot image, into the boot partition with its first sector last, and an
 app into the half of its app store position not in use, so an interrupted
-install leaves what ran before ([details](redmi2.md#updates)). QEMU and RAM
+download leaves what ran before ([details](redmi2.md#updates)). QEMU and RAM
 sessions show updates but install none.
 
 ## Networking
 
 lwIP provides IPv4, DHCP, DNS and TCP over virtio Ethernet (QEMU) or the
-native Wi-Fi driver (Redmi 2). HTTPS (Mbed TLS 1.2/1.3) checks hostname,
+devices' native Wi-Fi drivers. HTTPS (Mbed TLS 1.2/1.3) checks hostname,
 chain and date with no fallback to HTTP; WebKit enforces CORS, CSP, mixed
 content and credentials. HTTP/1.1 and HTTP/2 are supported; bodies are
 limited to 8 MiB.
 
 ## Web platform and rendering
 
-JavaScriptCore runs its interpreter without a JIT; dedicated workers are
-supported. Not available: IPv6, WebSocket, file uploads, IndexedDB, service
-workers, media and WebGL/WebGPU. Text uses FreeType, HarfBuzz and ICU with
-DejaVu, Noto Sans CJK and Noto Color Emoji.
+JavaScriptCore compiles page scripts with its baseline and DFG JIT tiers on
+both architectures. SOS2 pins WPE WebKit 2.52.6 to retain the ARMv7 JIT and
+backports selected upstream security fixes. Each security patch in
+`tools/browser/patches/` identifies its upstream commit. The
+`sos2.jsc=` boot argument (`RUN_ARGS='--jsc ...'` in QEMU, `REDMI2_JSC` and
+`GTA7LITE_JSC` for the devices) passes JavaScriptCore options to every page, such as `useJIT=false` to
+compare the tiers. Dedicated workers are supported.
+Not available: IPv6, WebSocket, file uploads, IndexedDB, service workers,
+media and WebGL/WebGPU. Text uses FreeType, HarfBuzz and ICU with DejaVu, Noto
+Sans CJK and Noto Color Emoji. SOS2's languages are English and Chinese: ICU's
+data keeps theirs alone (tools/build_native_runtime.py), and the CJK font is
+cut down to GB2312's Simplified Chinese (tools/browser_fonts.py), so that the
+system, engine included, fits a 32 MiB boot partition on both devices:
+about 28 MB compressed on each, with the engine built at -O2 and its code
+through branch filters (include/boot_bundle.h), which make call targets
+absolute: xz's ARM64 one on AArch64, and on ARM32, whose engine is mostly
+Thumb-2 with ARM-mode libraries, an ARM and a Thumb-2 one, each over its
+instruction set's ranges.
 
 WebKit draws with Skia on the CPU into a retained backing store per page, or
 with Skia's GL backend under QEMU [virgl](gpu.md). Scrolling moves pixels and
@@ -141,7 +175,7 @@ The **Calculator** gives multiplication and division precedence, shows
 
 ## Power and standby
 
-The power button toggles standby (QMP `system_powerdown` in QEMU). Standby
+The power button toggles standby (Machine > Power Down in QEMU's window). Standby
 turns the screen off and freezes every page; kernel services and the network
 keep running. On the phone each device powers down as Linux and the vendor
 kernel do it: the display pipeline and panel, the touch controller, Wi-Fi's
@@ -152,7 +186,6 @@ through the RPM. Standby draws 6.0 mA, about two weeks on the battery.
 ## Time
 
 A small SNTP client sets UTC after DHCP and hourly, from Cloudflare's time
-service or `sos2.ntp=host[:port]`. Replies must match a random cookie, but
-SNTP is not authenticated. Monotonic timers never jump, and there are no time
+service. Replies must match a random cookie, but SNTP is not authenticated. Monotonic timers never jump, and there are no time
 zones. With persistent storage, an RTC calibration keeps the time across
 reboots.

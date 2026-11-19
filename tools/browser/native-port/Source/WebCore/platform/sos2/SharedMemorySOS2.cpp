@@ -1,6 +1,7 @@
 #include "config.h"
 #include "SharedMemory.h"
 #include <sys/mman.h>
+#include <wtf/RefPtr.h>
 
 namespace WebCore {
 // Raster buffers can live in the renderer's private address space. No kernel

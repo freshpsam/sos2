@@ -3,15 +3,24 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-
-static inline void barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
+#include "arch/cpu.h"
 
 static inline uint32_t mmio_read32(uintptr_t p) { return *(volatile uint32_t *)p; }
 
 static inline void mmio_write32(uintptr_t p, uint32_t v) { *(volatile uint32_t *)p = v; }
+static inline uint16_t mmio_read16(uintptr_t p) { return *(volatile uint16_t *)p; }
+static inline void mmio_write16(uintptr_t p, uint16_t v) { *(volatile uint16_t *)p = v; }
+static inline uint8_t mmio_read8(uintptr_t p) { return *(volatile uint8_t *)p; }
+static inline void mmio_write8(uintptr_t p, uint8_t v) { *(volatile uint8_t *)p = v; }
 struct framebuffer;
 void platform_set_framebuffer(struct framebuffer *fb);
 uint64_t time_us(void);
+/* Spins for at least us microseconds. */
+void delay_us(uint64_t us);
+/* A PSCI or SiP call into the firmware with arguments a and b (and 0 after
+ * them), through HVC for CPU_BOOT_HVC (include/fdt.h), else SMC: in
+ * arch/arm/psci.S and arch/arm64/psci.S. */
+int32_t arm_psci_call(unsigned method, uint32_t function, uintptr_t a, uintptr_t b);
 _Noreturn void panic(const char *message);
 void *memset(void *dst, int value, size_t n);
 void *memcpy(void *dst, const void *src, size_t n);

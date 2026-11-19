@@ -11,6 +11,9 @@
 #ifdef SOS2_BOARD_REDMI2
 #include "redmi2_wifi.h"
 #define network_entropy_read redmi2_wifi_random
+#elif defined(SOS2_BOARD_GTA7LITE)
+#include "gta7lite.h"
+#define network_entropy_read gta7lite_wifi_random
 #else
 #define network_entropy_read entropy_read
 #endif
@@ -66,10 +69,6 @@ static uint8_t random_partial[sizeof(uint32_t)];
 static unsigned random_partial_bytes;
 static uint8_t io_buffer[USER_NET_IO_MAX];
 static bool broadcast_replies;
-static unsigned rx_ipv4, rx_dhcp, detail_slot;
-static char detail_text[2][144];
-static uint64_t detail_updated;
-static const char *detail_message, *detail_tx_status;
 
 void network_dhcp_prepare(struct dhcp *d, struct dhcp_msg *msg, unsigned type) {
     /* Try ordinary unicast delivery first. After an unanswered DISCOVER,
@@ -239,15 +238,6 @@ static err_t configure(struct netif *netif) {
 
 static void receive_frame(const void *bytes, unsigned length) {
     if (!started || !previous_link) return;
-    const unsigned char *frame = bytes;
-    if (length >= 34 && frame[12] == 8 && frame[13] == 0) {
-        ++rx_ipv4;
-        unsigned header = (frame[14] & 15) * 4;
-        if ((frame[14] >> 4) == 4 && header >= 20 && length >= 14 + header + 8 && frame[23] == 17) {
-            const unsigned char *udp = frame + 14 + header;
-            if (!udp[0] && udp[1] == 67 && !udp[2] && udp[3] == 68) ++rx_dhcp;
-        }
-    }
     struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)length, PBUF_POOL);
     if (!p) return;
     if (pbuf_take(p, bytes, (u16_t)length) != ERR_OK || interface.input(p, &interface) != ERR_OK)
@@ -259,81 +249,18 @@ static bool addressed(void) {
            !ip4_addr_isany_val(*netif_ip4_addr(&interface));
 }
 
-static const char *waiting_detail(const char *message) {
-    uint64_t now = time_us();
-    /* Packet counts can change every radio poll. Refresh them at most four
-     * times a second; connection/OTA status changes still publish immediately. */
-    if (message == detail_message && device.tx_status == detail_tx_status &&
-        now >= detail_updated && now - detail_updated < 250000)
-        return detail_text[detail_slot];
-    detail_updated = now;
-    detail_message = message;
-    detail_tx_status = device.tx_status;
-    unsigned next = detail_slot ^ 1, at = (unsigned)strlen(message);
-    char *text = detail_text[next];
-    memcpy(text, message, at);
-    const char *labels[] = {"; TX ", " RX ", " IPv4 ", " DHCP ", " filtered "};
-    const unsigned counts[] = {device.tx_packets, device.rx_packets, rx_ipv4, rx_dhcp,
-                               device.rx_discarded};
-    for (unsigned i = 0; i < 5; ++i) {
-        unsigned n = (unsigned)strlen(labels[i]);
-        memcpy(text + at, labels[i], n);
-        at += n;
-        unsigned value = counts[i];
-        if (value > 999999) value = 999999;
-        char digits[6];
-        n = 0;
-        do {
-            digits[n++] = '0' + value % 10;
-            value /= 10;
-        } while (value);
-        while (n) text[at++] = digits[--n];
-    }
-    if (device.tx_status) {
-        const char *label = "; IP TX ";
-        unsigned n = (unsigned)strlen(label);
-        memcpy(text + at, label, n);
-        at += n;
-        for (const char *p = device.tx_status; *p && at < sizeof(detail_text[0]) - 1; ++p)
-            text[at++] = *p;
-    }
-    text[at] = 0;
-    /* A stable pointer for unchanged text, a changed pointer for a changed
-     * snapshot: Wi-Fi setup's redraw detection compares snapshot fields. */
-    if (strcmp(text, detail_text[detail_slot])) detail_slot = next;
-    return detail_text[detail_slot];
-}
-
-const char *network_status_detail(void) {
-    if (!device.link || !device.link()) return 0;
-    if (!started) return "Waiting for network random data";
-    if (addressed()) return "IP address assigned";
-    const struct dhcp *d = netif_dhcp_data(&interface);
-    if (!d) return "IP setup has not started";
-    if (d->state == DHCP_STATE_REQUESTING) return "IP offer received; waiting for confirmation";
-    if (d->state == DHCP_STATE_SELECTING) {
-        if (!device.tx_packets) return waiting_detail("IP request has not reached the radio");
-        if (!device.rx_packets) return waiting_detail("IP request sent; no network data received");
-        return waiting_detail(broadcast_replies ? "Waiting for broadcast IP offer"
-                                                : "Waiting for an IP offer");
-    }
-    return "Waiting for IP configuration";
-}
-
 void network_init(const struct platform_devices *devices) {
-    network_time_init(devices->bootargs);
+    network_time_init();
     started = previous_link = random_failed = false;
     generation = random_head = random_count = random_partial_bytes = 0;
     broadcast_replies = false;
-    rx_ipv4 = rx_dhcp = detail_slot = 0;
-    memset(detail_text, 0, sizeof(detail_text));
-    detail_message = detail_tx_status = 0;
-    detail_updated = 0;
     memset(connections, 0, sizeof(connections));
     memset(dns_jobs, 0, sizeof(dns_jobs));
     memset(&interface, 0, sizeof(interface));
 #ifdef SOS2_BOARD_REDMI2
     (void)redmi2_wifi_init(devices, &device);
+#elif defined(SOS2_BOARD_GTA7LITE)
+    (void)gta7lite_wifi_init(devices, &device);
 #else
     (void)virtio_net_init(devices, &device);
     wifi_setup_init(0, 0);
@@ -378,9 +305,8 @@ void network_poll(void) {
     if (link != previous_link) {
         previous_link = link;
         if (link) {
-            device.rx_packets = device.tx_packets = device.rx_discarded = rx_ipv4 = rx_dhcp = 0;
+            device.rx_packets = device.tx_packets = 0;
             broadcast_replies = false;
-            detail_message = 0;
             netif_set_up(&interface);
             netif_set_link_up(&interface);
             if (dhcp_start(&interface) != ERR_OK) {
@@ -460,12 +386,12 @@ void network_close_process(unsigned pid) {
         }
 }
 
-static int connect_to(unsigned pid, struct vm_space *space, uint32_t address, unsigned port) {
+static int connect_to(unsigned pid, struct vm_space *space, user_ptr address, unsigned port) {
     if (!port || port > 65535) return USER_EINVAL;
     char host[USER_NET_HOST_MAX + 1];
     unsigned length = 0, label = 0;
     for (; length < sizeof(host); ++length) {
-        if (address > UINT32_MAX - length ||
+        if (address > (user_ptr)-1 - length ||
             !vm_copy_from_user(space, host + length, address + length, 1))
             return USER_EFAULT;
         char ch = host[length];
@@ -526,8 +452,8 @@ static int connect_to(unsigned pid, struct vm_space *space, uint32_t address, un
     return USER_ENOMEM;
 }
 
-int32_t network_call(unsigned pid, struct vm_space *space, unsigned call, uint32_t a, uint32_t b,
-                     uint32_t bytes) {
+int32_t network_call(unsigned pid, struct vm_space *space, unsigned call, user_ptr a, user_ptr b,
+                     user_ptr bytes) {
     if (call == SYS_NET_INFO) {
         if (b != sizeof(struct user_net_info)) return USER_EINVAL;
         struct user_net_info info = {
@@ -544,8 +470,8 @@ int32_t network_call(unsigned pid, struct vm_space *space, unsigned call, uint32
         }
         return vm_copy_to_user(space, a, &info, sizeof(info)) ? 0 : USER_EFAULT;
     }
-    if (call == SYS_NET_CONNECT) return connect_to(pid, space, a, b);
-    struct connection *c = lookup(pid, a);
+    if (call == SYS_NET_CONNECT) return connect_to(pid, space, a, (unsigned)b);
+    struct connection *c = lookup(pid, (uint32_t)a);
     if (!c) return USER_EBADF;
     if (call == SYS_NET_CLOSE) {
         close_connection(c);
@@ -568,7 +494,7 @@ int32_t network_call(unsigned pid, struct vm_space *space, unsigned call, uint32
     if (call == SYS_NET_RECV && c->count) {
         if (bytes > c->count) bytes = c->count;
         unsigned first = RECEIVE_BYTES - c->head;
-        if (first > bytes) first = bytes;
+        if (first > bytes) first = (unsigned)bytes;
         memcpy(io_buffer, c->received + c->head, first);
         memcpy(io_buffer + first, c->received, bytes - first);
         if (!vm_copy_to_user(space, b, io_buffer, bytes)) return USER_EFAULT;

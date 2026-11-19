@@ -266,7 +266,7 @@ static bool bus_speed(bool fast) {
         if (time_us() - start >= 10000) return fail(); /* internal clock unstable */
     wr(HC + 0x2c, rd(HC + 0x2c, 2) | 4, 2);
     /* The card's 74 clock cycles before a command, generously. */
-    for (uint64_t start = time_us(); time_us() - start < 1000;) { }
+    delay_us(1000);
     return true;
 }
 
@@ -350,7 +350,7 @@ static bool adopt(const struct platform_devices *devices) {
     if (!(clock & 4)) {
         wr(HC + 0x2c, clock | 4, 2);
         /* The card's 74 clock cycles before a command, generously. */
-        for (uint64_t start = time_us(); time_us() - start < 1000;) { }
+        delay_us(1000);
     }
     if (!wake() || !transfer(8, 0, bounce, false)) return false;
     unsigned timing = bounce[185] & 15, signaling = rd(HC + 0x3e, 2) & 7;
@@ -431,15 +431,15 @@ static bool flush(void) {
 bool block_sync(void) { return ready && controller && flush(); }
 
 /* lk2nd's boot partition after its own 512 KiB, and the cache partition. The
- * boot partition must take a whole boot image there, the cache partition
- * both slots. */
+ * boot partition must take a whole boot image there, the cache partition the
+ * app store. */
 bool system_store_init(const struct platform_devices *devices) {
     if (store_ready) return true;
     struct disk_partition boot, cache;
     if (!adopt(devices) || !disk_partition_named(raw_read, 0, raw_sectors, "boot", &boot) ||
         !disk_partition_named(raw_read, 0, raw_sectors, "cache", &cache) ||
         boot.sectors < SYSTEM_LK2ND_SECTORS + SYSTEM_BOOT_LIMIT / 512 ||
-        cache.sectors < SYSTEM_SLOT_START + 2u * SYSTEM_SLOT_SECTORS)
+        cache.sectors < SYSTEM_DATA_START)
         return false;
     regions[SYSTEM_BOOT] = (struct disk_partition){boot.start + SYSTEM_LK2ND_SECTORS,
                                                    boot.sectors - SYSTEM_LK2ND_SECTORS};

@@ -29,23 +29,22 @@ def resources(directory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('fetch', 'check'))
+    parser.add_argument('action', choices=('fetch',))
     parser.add_argument('directory', type=Path)
     args = parser.parse_args()
-    if args.action == 'fetch':
-        # Fetch/validate all bytes before publishing. Never replace an existing
-        # mismatching backup. Packaging itself never downloads anything.
-        data = {}
-        for name, (path, _, _) in FILES.items():
-            target = args.directory/name
-            content = target.read_bytes() if target.exists() else urlopen(BASE+path, timeout=30).read()
-            data[name] = validate(name, content)
-        args.directory.mkdir(parents=True, exist_ok=True)
-        for name, content in data.items():
-            target = args.directory/name
-            if not target.exists():
-                with target.open('xb') as f:
-                    f.write(content)
+    # Fetch/validate all bytes before publishing. Never replace an existing
+    # mismatching backup. Packaging itself never downloads anything.
+    data = {}
+    for name, (path, _, _) in FILES.items():
+        target = args.directory/name
+        content = target.read_bytes() if target.exists() else urlopen(BASE+path, timeout=30).read()
+        data[name] = validate(name, content)
+    args.directory.mkdir(parents=True, exist_ok=True)
+    for name, content in data.items():
+        target = args.directory/name
+        if not target.exists():
+            with target.open('xb') as f:
+                f.write(content)
     resources(args.directory)
     print('Verified pinned A306 firmware and redistribution notices')
 

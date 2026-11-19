@@ -449,7 +449,8 @@ void desktop_wifi_render(struct framebuffer *s) {
     const struct wifi_setup_view *v = wifi_setup_view();
     gfx_rect(s, 0, 48, 480, 752, 0x17232c);
     gfx_text(s, 20, 68, "WI-FI", 2, 0xf1f5f6);
-    /* No Back buttons: the phone's Back key (Alt+Left in QEMU) is one. */
+    /* No Back buttons here: the phone's Back key (Alt+Left in QEMU) is one,
+     * and the tablet's top bar has BACK. */
     if (!detail) {
         button(s, 16, 104, 448, "SCAN NETWORKS", false);
         if (v->has_saved) row(s, 164, &v->saved, true);
@@ -459,6 +460,8 @@ void desktop_wifi_render(struct framebuffer *s) {
         if (no_networks(v)) gfx_text(s, 20, list_top() + 22, "NO NETWORKS FOUND", 1, 0xf1f5f6);
         if (page) button(s, 16, paging_y(), 216, "PREVIOUS", false);
         if ((page + 1) * ROWS < v->radio.count) button(s, 248, paging_y(), 216, "NEXT", false);
+        if (v->radio.scan_truncated)
+            gfx_text(s, 20, paging_y() + 56, "SOME NETWORKS COULD NOT BE LISTED", 1, 0xf1f5f6);
         drawn = (struct drawn_screen){.valid = true,
                                       .saved = v->has_saved,
                                       .saved_network = v->saved,

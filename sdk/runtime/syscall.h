@@ -3,7 +3,33 @@
 #include <stdint.h>
 #include "user_abi.h"
 
-static inline int32_t call4(unsigned number, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+/* Syscall arguments and results are register-wide: a result is a value, an
+ * address or a negative USER_E* error (include/user_abi.h). */
+#ifdef __aarch64__
+typedef uintptr_t sos2_word;
+typedef intptr_t sos2_status;
+
+/* svc #0: the number in x8, arguments in x0-x3, the result in x0. */
+static inline sos2_status call4(unsigned number, sos2_word a, sos2_word b, sos2_word c,
+                                sos2_word d) {
+    register sos2_word x0 __asm__("x0") = a;
+    register sos2_word x1 __asm__("x1") = b;
+    register sos2_word x2 __asm__("x2") = c;
+    register sos2_word x3 __asm__("x3") = d;
+    register sos2_word x8 __asm__("x8") = number;
+    __asm__ volatile("svc #0"
+                     : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x8)
+                     :
+                     : "memory", "cc");
+    return (sos2_status)x0;
+}
+#else
+typedef uint32_t sos2_word;
+typedef int32_t sos2_status;
+
+/* svc #0: the number in r7, arguments in r0-r3, the result in r0. */
+static inline sos2_status call4(unsigned number, sos2_word a, sos2_word b, sos2_word c,
+                                sos2_word d) {
     register uint32_t r0 __asm__("r0") = a;
     register uint32_t r1 __asm__("r1") = b;
     register uint32_t r2 __asm__("r2") = c;
@@ -15,12 +41,13 @@ static inline int32_t call4(unsigned number, uint32_t a, uint32_t b, uint32_t c,
                      : "memory", "cc");
     return (int32_t)r0;
 }
+#endif
 
-static inline int32_t call3(unsigned number, uint32_t a, uint32_t b, uint32_t c) {
+static inline sos2_status call3(unsigned number, sos2_word a, sos2_word b, sos2_word c) {
     return call4(number, a, b, c, 0);
 }
 
-static inline int32_t call(unsigned number, uint32_t a, uint32_t b) {
+static inline sos2_status call(unsigned number, sos2_word a, sos2_word b) {
     return call3(number, a, b, 0);
 }
 

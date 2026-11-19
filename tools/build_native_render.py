@@ -7,21 +7,24 @@ import os
 from pathlib import Path
 import tarfile
 import zipfile
+import arch
 from build_native_runtime import ROOT,SYSROOT,sdk_flags,preserve_headers
 from native_sources import apply_patch,copy_if_changed,digest,download,run_logged
 
-BASE=ROOT/'build/native-webkit'
+BASE=ROOT/('build/native-webkit'+arch.SUFFIX)
+# Pinned archives are the same for every architecture: make fetch fills ARM32's.
+DOWNLOADS=ROOT/'build/native-webkit/downloads'
 RECORDS=json.loads((ROOT/'tools/browser/native-render.lock.json').read_text())['sources']
 
 
 def fetch():
-    for record in RECORDS:download(record['url'],BASE/'downloads'/record['archive'],record['sha256'])
+    for record in RECORDS:download(record['url'],DOWNLOADS/record['archive'],record['sha256'])
     from browser_fonts import fetch as fetch_fonts
     fetch_fonts()
 
 
 def prepare(record):
-    archive=BASE/'downloads'/record['archive']
+    archive=DOWNLOADS/record['archive']
     directory=record['archive'].removesuffix('.tar.bz2') if record['name']=='mbedtls' else record['name']
     destination=BASE/'dependencies/src'/directory
     stamp=destination/'.sos2-source'
@@ -51,9 +54,9 @@ def static_library(name,sources,includes=(),definitions=()):
     build=BASE/'dependencies'/name;build.mkdir(parents=True,exist_ok=True);objects=[]
     for source in sources:
         output=build/(source.name+'.o');objects.append(str(output))
-        run(['arm-none-eabi-gcc',*sdk_flags(),*['-I'+str(x) for x in includes],*['-D'+x for x in definitions],
+        run([arch.tool('gcc'),*sdk_flags(),*['-I'+str(x) for x in includes],*['-D'+x for x in definitions],
              '-c',str(source),'-o',str(output)],name+'-'+source.name)
-    run(['arm-none-eabi-ar','rcs',str(SYSROOT/'lib'/('lib'+name+'.a')),*objects],name+'-archive')
+    run([arch.tool('ar'),'rcs',str(SYSROOT/'lib'/('lib'+name+'.a')),*objects],name+'-archive')
 
 
 def patch_xml_encoding(source):
@@ -66,7 +69,7 @@ def patch_xml_encoding(source):
 def build(record,jobs):
     name=record['name'];source=prepare(record)
     output=BASE/'dependencies'/((source.name if name=='mbedtls' else name)+'-build')
-    if name=='xml2':patch_xml_encoding(source)
+    if name=='xml2' and arch.SHORT_ENUMS:patch_xml_encoding(source)
     if name=='fonts':return
     if name=='zlib':
         files='adler32 compress crc32 deflate gzclose gzlib gzread gzwrite infback inffast inflate inftrees trees uncompr zutil'.split()
@@ -97,12 +100,13 @@ def build(record,jobs):
                    'ENABLE_DOC':'OFF','BUILD_TESTING':'OFF','ENABLE_HTTP3':'OFF'},
     }[name]
     configure=['-S',str(source),'-B',str(output),'-G','Ninja',
-         '-DCMAKE_TOOLCHAIN_FILE='+str(ROOT/'sdk/sos2-arm32.cmake'),'-DCMAKE_BUILD_TYPE=Release',
+         '-DCMAKE_TOOLCHAIN_FILE='+str(arch.CMAKE_TOOLCHAIN),'-DCMAKE_BUILD_TYPE=Release',
          '-DCMAKE_INSTALL_PREFIX='+str(SYSROOT),'-DCMAKE_INSTALL_LIBDIR=lib','-DBUILD_SHARED_LIBS=OFF',
          *['-D'+key+'='+value for key,value in options.items()]]
     # CMake keeps the first configure's toolchain flags in its cache. Start
-    # fresh whenever these options or the SDK toolchain file change.
-    signature=hashlib.sha256((json.dumps(configure)+digest(ROOT/'sdk/sos2-arm32.cmake')).encode()).hexdigest()
+    # fresh whenever these options, the compiler prefix or the SDK toolchain
+    # file change.
+    signature=hashlib.sha256((json.dumps([configure,arch.prefix()])+digest(arch.CMAKE_TOOLCHAIN)).encode()).hexdigest()
     stamp=output/'.sos2-config'
     fresh=[] if stamp.exists() and stamp.read_text().strip()==signature else ['--fresh']
     run(['cmake',*fresh,*configure],name+'-configure')
@@ -123,16 +127,13 @@ def build(record,jobs):
 
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('command',choices=('fetch','prepare','build'))
-    parser.add_argument('name',nargs='?',choices=[x['name'] for x in RECORDS]);parser.add_argument('-j','--jobs',type=int,default=6)
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('command',choices=('fetch','build'))
+    parser.add_argument('-j','--jobs',type=int,default=6)
     args=parser.parse_args()
     try:
         if args.command=='fetch':fetch()
         else:
-            for record in RECORDS:
-                if args.name and record['name']!=args.name:continue
-                if args.command=='prepare':prepare(record)
-                else:build(record,args.jobs)
+            for record in RECORDS:build(record,args.jobs)
     except (OSError,RuntimeError) as error:parser.exit(1,str(error)+'\n')
 
 

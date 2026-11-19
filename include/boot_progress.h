@@ -5,7 +5,6 @@
 /* In startup order; the phone's loading screen fills one bar across them. */
 enum boot_phase {
     BOOT_CONTROLS,
-    BOOT_READ_ENGINE, /* the installed system's, from the eMMC */
     BOOT_CHECK_ENGINE,
     BOOT_LOAD_ENGINE,
     BOOT_VERIFY_ENGINE,

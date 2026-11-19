@@ -4,10 +4,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "graphics.h"
+#include "arch/smp.h"
 #define MAX_VIRTIO           32
 #define MAX_RAM_REGIONS      16
 #define MAX_RESERVED_REGIONS 64
-#define MAX_BOOT_CPUS        4
+#define MAX_BOOT_CPUS        ARCH_CPU_MAX
 
 enum cpu_boot_method { CPU_BOOT_NONE, CPU_BOOT_SMC, CPU_BOOT_HVC };
 
@@ -18,13 +19,11 @@ struct memory_region {
 struct platform_devices {
     uintptr_t fwcfg, virtio[MAX_VIRTIO];
     size_t virtio_count;
-    uint64_t ram_start, ram_size;
     uint32_t dtb_size;
     uint64_t initrd_start, initrd_end;
     bool has_initrd_start, has_initrd_end;
-    char model[128], root_compatible[128];
-    char bootargs[256];
-    bool redmi2, redmi2_wt88047;
+    char bootargs[256]; /* the sos2.* arguments alone (kernel/fdt.c) */
+    bool redmi2_wt88047;
     struct memory_region ram_regions[MAX_RAM_REGIONS];
     size_t ram_region_count;
     struct memory_region reserved_regions[MAX_RESERVED_REGIONS];
@@ -41,8 +40,24 @@ struct platform_devices {
     uintptr_t gpio;
     uint32_t gpio_phandle, power_key_phandle, power_key_pin;
     bool power_key;
+#ifdef SOS2_BOARD_GTA7LITE
+    /* The Galaxy Tab A7 Lite: its MT8768's arm,gic-v3 interrupt controller. */
+    bool gicv3;
+    /* MediaTek LK's framebuffer handoff (/chosen atag,videolfb): its base and
+     * size, and the panel driver LK found. */
+    uint64_t videolfb_base;
+    uint32_t videolfb_vram;
+    char lcm_name[64];
+    bool has_videolfb;
+    /* MediaTek's boot-params buffer in SRAM (/chosen ram_console), which keeps
+     * the reboot reason across a restart (boards/gta7lite/board.c): taken only
+     * as a small SRAM buffer. */
+    uint32_t ram_console_start, ram_console_size;
+    bool has_ram_console;
+#endif
 };
 
+/* Fills devices from a flattened device tree. */
 bool fdt_discover(const void *blob, struct platform_devices *devices);
 
 /* True when [start, start+size) lies inside one reported RAM region. Firmware may
