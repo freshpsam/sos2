@@ -8,7 +8,8 @@
 
 namespace SOS2::HTTP {
 using Headers = std::vector<std::pair<std::string, std::string>>;
-constexpr size_t maximumBody = 8 * 1024 * 1024;
+// A response body, decoded: modern sites ship scripts past 8 MiB.
+constexpr size_t maximumBody = 32 * 1024 * 1024;
 constexpr size_t maximumHeaders = 32 * 1024;
 
 struct Request {

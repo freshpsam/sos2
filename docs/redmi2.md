@@ -33,7 +33,8 @@ data last until reboot.
    right-hand key below the screen is Back.
 
 If Wi-Fi fails the desktop says why ([details](redmi2-wifi.md)). Randomness
-comes from CPU jitter; if its self-test fails, pages, Wi-Fi and HTTPS stay
+comes from CPU jitter, which seeds a generator (as on the
+[tablet](gta7lite.md)); if its self-test fails, pages, Wi-Fi and HTTPS stay
 unavailable. Power toggles standby, which lasts about two weeks.
 
 ## Installing

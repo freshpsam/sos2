@@ -26,7 +26,7 @@ which `zstd -d` unpacks); with it the target also writes:
   addresses, command line and device tree table (Android's DT table format,
   holding one device tree), which LK completes at boot. It holds the kernel,
   gzip-compressed; the resources, engine included, as a SORZ ramdisk (about
-  28 MB), which the kernel expands into free RAM at boot; and Samsung's
+  30 MB), which the kernel expands into free RAM at boot; and Samsung's
   `SEANDROIDENFORCE` trailer. The packager refuses an image larger than the
   boot partition, which the stock image fills up to its AVB footer.
 - `boot.tar`: that image as odin4 flashes it.
@@ -210,8 +210,20 @@ without writing anything.
   Samsung's navigation bar.
 - **Randomness:** as on the phone, jitterentropy's CPU timing jitter,
   measured with the generic timer, with its startup and continuous health
-  tests (kernel/protection/jitter_entropy.c). Its startup tests feed the
-  watchdog.
+  tests (kernel/protection/jitter_entropy.c), seeds an HMAC_DRBG with SHA-256
+  (NIST SP 800-90A) that answers every request: 48 bytes of jitter at the
+  first request and every 10 minutes or 1 MiB after. A jitter collection takes
+  about 55 ms per 32 bytes, which pages used to wait for on every TLS
+  connection. Its startup tests feed the watchdog.
+- **CPU clocks:** LK leaves cluster 0 (CPUs 0-3) at 1500 MHz, cluster 1
+  (CPUs 4-7) at 920 MHz and their interconnect at 600 MHz, on VPROC 0.8 V.
+  boards/gta7lite/cpu_clock.c raises them to MediaTek's top operating point
+  for this chip's 2.3 GHz bin (2301, 1800 and 1051 MHz on 1.11875 V, VSRAM_PROC
+  1.125 V), as the stock kernel's cpufreq_v1 sequences it: the supplies first
+  going up, the clocks first going down. The main loop raises them once pages
+  use a tenth of a CPU over 20 ms and lowers them after a second below that
+  and in standby: at the top point the tablet draws about 66 mA more even
+  idle (316 against 250 mA, screen on). There is no thermal throttling.
 - **PMIC:** the MT6357, through MT6765's PMIC wrapper (0x1000D000), which LK
   leaves running (boards/gta7lite/pmic.c). Its RTC, which Android keeps in
   UTC, is the clock. Its power key turns the screen off and on: standby
@@ -222,7 +234,7 @@ without writing anything.
   charges.
 - **Backlight and charger:** the MT6370 at address 0x34 on I2C5
   (0x11016000), driven in FIFO mode with LK's timing
-  (boards/gta7lite/mt6370.c). Its backlight driver lights the panel at the
+  (boards/gta7lite/mt6370.c and i2c.c). Its backlight driver lights the panel at the
   brightness the panel's own PWM output sets, and standby clears its enable;
   its charger charges the battery, as LK set it up: the kernel does not
   supervise charging.
@@ -257,17 +269,45 @@ without writing anything.
   0xBE000000) as MediaTek's gen4m driver runs it (boards/gta7lite/
   wifi_radio.c): its firmware download, 2.4 GHz scans of channels 1-11,
   joins, the hardware's CCMP, and frames converted between the hardware's
-  Ethernet form and the 802.11 frames of the station the phone shares
-  (kernel/wifi). Both memory regions stay out of every allocation. Tried: one
+  Ethernet form and the 802.11 frames of the station and network device
+  the phone shares (kernel/wifi). Both memory regions stay out of every allocation. Tried: one
   WPA2-PSK router, its key exchange, DHCP and pages; open and WPA3 networks
   are not. The subsystem starts once per boot, so a failure stays until the
   next restart. In standby the station leaves its network and the chip goes
   back to its firmware, which sleeps it (gen4m's FW own); waking takes it
   back, and the station rejoins.
+- **Sound:** the two speakers, played as the stock kernel plays music
+  through them (boards/gta7lite/audio.c). MT6765's audio front end
+  (0x11220000) plays a 144 ms ring in its own SRAM through its DL1 memory
+  interface and downlink, which sends the samples over the MTKAIF pins
+  (GPIO 136-139) to the MT6357's DAC; the MT6357's headphone drivers feed two
+  Awinic AW87359 amplifiers at 0x58 and 0x59 on I2C3, set to the stock
+  `aw87xxx_acf.bin`'s Music profile (the stock speaker path, `int_hp_buf`).
+  I2C3's registers for the AP are a channel 0x100 in, which keeps the bus
+  after a failed transfer until its arbitration is resumed. Headphones in
+  the jack turn the amplifiers off: the MT6357's ACCDET senses the plug
+  through its EINT0 comparator, polled every 100 ms. Both outputs run at
+  Android's analog level (the headphone drivers at +2 dB), and the volume
+  scales the samples: 15 steps of 3 dB and silence, kept apart for the
+  speakers (12, -9 dB, at each start) and the headphones (7, -24 dB). The
+  clocks, codec and amplifiers power up when a stream has frames, in about
+  30 ms, and down 3 s after the last; the main loop's polls keep the ring
+  filled up to 133 ms ahead of the DMA, with silence behind the audio, so a
+  volume change is heard within that. Tried by hand: the speakers play and
+  the volume keys step them; also the DMA at 48 kHz, both amplifiers on and
+  off, the clocks gated while silent, and the jack read as empty. Headphones
+  are not yet tried.
+- **Volume keys:** Volume Up is the keypad's KPCOL0 (GPIO 93; key 1 of the
+  keypad controller at 0x10010000, which LK leaves scanning), Volume Down
+  the MT6357's home key (boards/gta7lite/keys.c). The main loop samples
+  them every 20 ms; a press steps the volume of the output in use, a held
+  key repeats after half a second, and the header shows the level for 2 s
+  in place of the clock, as a bar: white for the speakers, green for
+  headphones, which it also shows when a plug goes in or out.
 - **No vibrator:** the stock vendor partition has no vibrator HAL, and
   pulses of the PMIC's VIBR supply, which MediaTek's reference device tree
   names, are not felt.
-- **Not yet:** internet time over Wi-Fi, untried; the volume keys; whole-chip
+- **Not yet:** internet time over Wi-Fi, untried; whole-chip
   sleep through the SPM, MediaTek's power manager, on which the phone's
   standby rests. LK loads the SPM's firmware for the tablet's LPDDR3-1866 and
   starts the SSPM, which answers the kernel's suspend messages; but PSCI's

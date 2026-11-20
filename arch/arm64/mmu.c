@@ -63,6 +63,9 @@ static pte_t *next_table(pte_t *entry, bool allocate, pte_t flags) {
         if (!allocate) return 0;
         pte_t *table = pages_alloc(1, 1);
         if (!table) return 0;
+        /* Zeroed before it is linked: a mapping may add tables while the
+         * process's other threads run (kernel/protection/process.c). */
+        __asm__ volatile("dsb ishst" ::: "memory");
         *entry = (uintptr_t)table | DESCRIPTOR | flags;
     }
     return (pte_t *)(uintptr_t)(*entry & ADDRESS);
@@ -235,51 +238,72 @@ static bool enable_translation(bool secondary) {
 
 bool vm_secondary_init(void) { return enable_translation(true); }
 
+static bool overlap(uint64_t start, uint64_t end, uint64_t other_start, uint64_t other_end) {
+    return start < other_end && other_start < end;
+}
+
 bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
     const struct arm_machine *machine = arm_machine_get();
     uintptr_t start = (uintptr_t)__image_start, end = (uintptr_t)__image_end;
-    /* The page pool is the largest free stretch of RAM the DTB reports. */
-    uintptr_t pool_start;
-    size_t pool_size;
-    if (!boot_memory_pool(d, dtb, start, end, runtime_files_base(), runtime_files_size(),
-                          (uint64_t)PAGE_POOL_PAGES * PAGE_SIZE, &pool_start, &pool_size) ||
-        pool_size < (256u << 20))
+    uintptr_t resources = runtime_files_base();
+    uint32_t resource_size = runtime_files_size();
+    /* The page pool is every large free stretch of RAM the DTB reports, the
+     * reservations between them withheld: most of the tablet's 3 GB, which
+     * the firmware's reservations split. */
+    struct memory_region pool[BOOT_POOL_REGIONS];
+    unsigned regions = boot_memory_pool(d, dtb, start, end, resources, resource_size,
+                                        (uint64_t)PAGE_POOL_PAGES * PAGE_SIZE, pool);
+    if (!regions || !machine->device_count || end <= start ||
+        !fdt_range_in_ram(d, start, end - start) || dtb > UINT32_MAX - d->dtb_size ||
+        overlap(start, end, USER_BASE, USER_END) || overlap(dtb, dtb + d->dtb_size, start, end))
         return false;
-    uintptr_t pool_end = pool_start + pool_size;
-    if (!machine->device_count || end <= start || !fdt_range_in_ram(d, start, end - start) ||
-        dtb > UINT32_MAX - d->dtb_size || (start < USER_END && end > USER_BASE))
-        return false;
-    if (pool_end <= pool_start || !fdt_range_in_ram(d, pool_start, pool_end - pool_start))
-        return false;
-    if (pool_start < USER_END && pool_end > USER_BASE) return false;
-    for (size_t i = 0; i < d->reserved_region_count; ++i) {
-        const struct memory_region *r = &d->reserved_regions[i];
-        if (r->size > UINT64_MAX - r->start || (start < r->start + r->size && r->start < end) ||
-            (pool_start < r->start + r->size && r->start < pool_end))
-            return false;
-    }
-    if (dtb < end && start < dtb + d->dtb_size) return false;
-    if (dtb < pool_end && pool_start < dtb + d->dtb_size) return false;
-    for (unsigned i = 0; i < machine->device_count; ++i) {
-        const struct arm_mapping *r = &machine->devices[i];
-        uint64_t finish = (uint64_t)r->start + r->size;
-        if ((r->start < end && start < finish) || (r->start < pool_end && pool_start < finish))
-            return false;
-    }
     /* An inherited scanout (LK's on the tablet) stays mapped non-cacheable. */
     uintptr_t fb = (uintptr_t)d->framebuffer.pixels;
     uint64_t fb_size = d->has_framebuffer ? d->framebuffer_size : 0;
     if (fb_size &&
-        (!fdt_range_in_ram(d, fb, fb_size) || (fb < USER_END && fb + fb_size > USER_BASE) ||
-         (fb < end && start < fb + fb_size) || (fb < pool_end && pool_start < fb + fb_size) ||
-         (fb < dtb + d->dtb_size && dtb < fb + fb_size)))
+        (!fdt_range_in_ram(d, fb, fb_size) || overlap(fb, fb + fb_size, USER_BASE, USER_END) ||
+         overlap(fb, fb + fb_size, start, end) ||
+         overlap(fb, fb + fb_size, dtb, dtb + d->dtb_size)))
         return false;
-    uintptr_t resources = runtime_files_base();
-    uint32_t resource_size = runtime_files_size();
-    if (resource_size && ((resources < end && start < resources + resource_size) ||
-                          (resources < pool_end && pool_start < resources + resource_size)))
+    if (resource_size && overlap(resources, resources + resource_size, start, end)) return false;
+    for (size_t i = 0; i < d->reserved_region_count; ++i) {
+        const struct memory_region *r = &d->reserved_regions[i];
+        if (r->size > UINT64_MAX - r->start || overlap(start, end, r->start, r->start + r->size))
+            return false;
+    }
+    for (unsigned i = 0; i < machine->device_count; ++i) {
+        const struct arm_mapping *r = &machine->devices[i];
+        if (overlap(start, end, r->start, (uint64_t)r->start + r->size)) return false;
+    }
+    uint64_t total = 0;
+    for (unsigned n = 0; n < regions; ++n) {
+        uint64_t lower = pool[n].start, upper = lower + pool[n].size;
+        if ((lower | upper) & (PAGE_SIZE - 1) || upper <= lower ||
+            (n && lower < pool[n - 1].start + pool[n - 1].size) ||
+            !fdt_range_in_ram(d, lower, upper - lower) ||
+            overlap(lower, upper, USER_BASE, USER_END) || overlap(lower, upper, start, end) ||
+            overlap(lower, upper, dtb, dtb + d->dtb_size) ||
+            (fb_size && overlap(lower, upper, fb, fb + fb_size)) ||
+            (resource_size && overlap(lower, upper, resources, resources + resource_size)))
+            return false;
+        for (size_t i = 0; i < d->reserved_region_count; ++i) {
+            const struct memory_region *r = &d->reserved_regions[i];
+            if (overlap(lower, upper, r->start, r->start + r->size)) return false;
+        }
+        for (unsigned i = 0; i < machine->device_count; ++i) {
+            const struct arm_mapping *r = &machine->devices[i];
+            if (overlap(lower, upper, r->start, (uint64_t)r->start + r->size)) return false;
+        }
+        total += upper - lower;
+    }
+    uintptr_t pool_start = pool[0].start;
+    uintptr_t pool_end = pool[regions - 1].start + pool[regions - 1].size;
+    if (total < (256u << 20) || !pages_init((void *)pool_start, pool_end - pool_start))
         return false;
-    if (!pages_init((void *)pool_start, pool_end - pool_start)) return false;
+    for (unsigned n = 1; n < regions; ++n) {
+        uintptr_t gap = pool[n - 1].start + pool[n - 1].size;
+        if (pool[n].start > gap && !pages_withhold((void *)gap, pool[n].start - gap)) return false;
+    }
     memset(kernel_root, 0, sizeof(kernel_root));
     if (!kernel_map(start, (uintptr_t)__text_end - start, CACHED | KERNEL_RO | UXN) ||
         !kernel_map((uintptr_t)__text_end, (uintptr_t)(__rodata_end - __text_end),
@@ -293,7 +317,8 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
         !kernel_map((uintptr_t)__stack_guard, (uintptr_t)(__exception_stack_top - __stack_guard),
                     CACHED | KERNEL_RW | XN))
         return false;
-    if (!kernel_map(pool_start, pool_end - pool_start, NORMAL | KERNEL_RW | XN)) return false;
+    for (unsigned n = 0; n < regions; ++n)
+        if (!kernel_map(pool[n].start, pool[n].size, NORMAL | KERNEL_RW | XN)) return false;
     /* Cached: the resources are immutable from here. They arrived cleaned to
      * the point of coherency (loaded with the MMU off, or decoded through
      * boot_cache.c), nothing writes them again and no device reads them, and
@@ -389,8 +414,11 @@ static void release_empty_table(struct vm_space *s, user_ptr address) {
     if (!pages_free(table, 1)) panic("user table ownership corrupt");
 }
 
+/* On the service worker: a page of a gigabyte frees for a second or more, so
+ * the desktop runs every 16 pages, as in vm_shared_trim. */
 void vm_destroy(struct vm_space *s) {
     if (s->root) {
+        unsigned freed = 0;
         for (unsigned i = index_at(USER_BASE, 1); i < index_at(USER_END - 1, 1) + 1; ++i) {
             pte_t *level2 = next_table(&s->root[i], false, 0);
             if (!level2) continue;
@@ -402,6 +430,7 @@ void vm_destroy(struct vm_space *s) {
                         uintptr_t physical = table[k] & ADDRESS;
                         table[k] = 0;
                         if (!shared_page(physical)) free_user_page(physical);
+                        if ((++freed & 15) == 0) kernel_io_wait();
                     }
                 if (!pages_free(table, 1)) panic("user table ownership corrupt");
             }
@@ -580,18 +609,22 @@ bool vm_release(struct vm_space *s, user_ptr address, unsigned count) {
     return true;
 }
 
-user_ptr vm_allocate_range(struct vm_space *s, unsigned count, user_ptr lower, user_ptr upper,
-                           unsigned permissions) {
+user_ptr vm_allocate_range(struct vm_space *s, unsigned count, unsigned alignment, user_ptr lower,
+                           user_ptr upper, unsigned permissions) {
     if (!allocation_range(lower, upper) || ((lower | upper) & (PAGE_SIZE - 1)) ||
-        count > (upper - lower) / PAGE_SIZE)
+        count > (upper - lower) / PAGE_SIZE || !alignment || (alignment & (alignment - 1)) ||
+        alignment > (upper - lower) / PAGE_SIZE)
         return 0;
     if (!s->root || !count || count > USER_PAGE_QUOTA - s->mapped_pages) return 0;
-    user_ptr start = lower;
+    user_ptr step = (user_ptr)alignment * PAGE_SIZE;
+    user_ptr start = (lower + step - 1) & ~(step - 1);
     unsigned free_run = 0;
-    for (user_ptr at = lower; at < upper; at += PAGE_SIZE) {
+    for (user_ptr at = start; at < upper; at += PAGE_SIZE) {
         if (vm_mapped(s, at)) {
+            /* The next run may start only at the next multiple of step. */
             free_run = 0;
-            start = at + PAGE_SIZE;
+            start = (at + step) & ~(step - 1);
+            at = start - PAGE_SIZE;
             continue;
         }
         if (++free_run < count) continue;

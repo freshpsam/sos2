@@ -56,10 +56,11 @@ static inline bool vm_accessible(const struct vm_space *space, user_ptr address,
 bool vm_copy_from_user(const struct vm_space *space, void *out, user_ptr address, size_t size);
 bool vm_copy_to_user(const struct vm_space *space, user_ptr address, const void *data, size_t size);
 /* Anonymous, zero-filled pages in the heap or the JIT window, with permissions
- * (0: none, kernel-only). vm_release unmaps count pages there, all mapped and
- * the process's own, and advances the epoch once. */
-user_ptr vm_allocate_range(struct vm_space *space, unsigned count, user_ptr lower, user_ptr upper,
-                           unsigned permissions);
+ * (0: none, kernel-only), starting at a multiple of alignment pages (a power
+ * of two): the first such run in [lower, upper). vm_release unmaps count pages
+ * there, all mapped and the process's own, and advances the epoch once. */
+user_ptr vm_allocate_range(struct vm_space *space, unsigned count, unsigned alignment,
+                           user_ptr lower, user_ptr upper, unsigned permissions);
 bool vm_release(struct vm_space *space, user_ptr address, unsigned count);
 /* User slices: enter flushes only when asked; leave never flushes. */
 uint64_t vm_epoch(void);

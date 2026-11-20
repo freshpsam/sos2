@@ -53,6 +53,6 @@ SECTIONS
     __image_end = .;
     ASSERT(__image_end < 0x48000000, "ARM32 kernel overlaps QEMU's DTB area")
     __page_pool_start = 0x60000000;
-    __page_pool_end = 0x78000000;
+    __page_pool_end = 0x88000000;
     /DISCARD/ : { *(.comment .note* .eh_frame* .ARM.exidx* .ARM.extab*) }
 }

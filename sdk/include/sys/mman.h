@@ -11,6 +11,10 @@
 #define MAP_ANONYMOUS   32
 #define MAP_ANON        MAP_ANONYMOUS
 #define MAP_FILE        0
+/* Anonymous memory at a multiple of 2^n bytes (12 <= n <= 30), as on NetBSD. */
+#define MAP_ALIGNMENT_SHIFT 24
+#define MAP_ALIGNED(n)      ((int)((unsigned)(n) << MAP_ALIGNMENT_SHIFT))
+#define MAP_ALIGNMENT_MASK  MAP_ALIGNED(0xff)
 #define MAP_FAILED      ((void *)-1)
 #define MADV_NORMAL     0
 #define MADV_RANDOM     1

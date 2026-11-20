@@ -22,6 +22,7 @@
 #include "redmi2_idle_devices.h"
 #include "kernel_io.h"
 #include "wifi_setup.h"
+#include "wifi_device.h"
 #include "handoff.h"
 #endif
 #ifdef SOS2_BOARD_GTA7LITE
@@ -29,6 +30,7 @@
 #include "arm_smp.h"
 #include "boot_progress.h"
 #include "wifi_setup.h"
+#include "wifi_device.h"
 #endif
 extern char __image_start[], __image_end[];
 static struct framebuffer screen;
@@ -103,15 +105,16 @@ static void enter_standby(struct pointer_event *cancel) {
     process_freeze(true);
     battery_standby(true);
 #ifdef SOS2_BOARD_GTA7LITE
+    (void)gta7lite_cpu_clock(false);
     arm_smp_sleep();
     wifi_setup_standby(true);
-    gta7lite_wifi_standby(true);
+    wifi_device_standby(true);
 #endif
 #ifdef SOS2_BOARD_REDMI2
     chip_slept = false;
     arm_smp_sleep();
     wifi_setup_standby(true);
-    redmi2_wifi_standby(true);
+    wifi_device_standby(true);
     redmi2_adreno_standby(true);
     redmi2_cpu_clock_standby(true);
     redmi2_chip_sleep_standby(true);
@@ -123,14 +126,14 @@ static void leave_standby(void) {
     standby = false;
 #ifdef SOS2_BOARD_GTA7LITE
     arm_smp_wake();
-    gta7lite_wifi_standby(false);
+    wifi_device_standby(false);
     wifi_setup_standby(false);
 #endif
 #ifdef SOS2_BOARD_REDMI2
     redmi2_cpu_clock_standby(false);
     arm_smp_wake();
     redmi2_adreno_standby(false);
-    redmi2_wifi_standby(false);
+    wifi_device_standby(false);
     wifi_setup_standby(false);
 #endif
     battery_standby(false);
@@ -150,6 +153,17 @@ static void leave_standby(void) {
 }
 
 #ifdef SOS2_BOARD_GTA7LITE
+/* The volume keys step the level of the output in use, which the header
+ * shows, as it shows the output's level when a plug goes in or out. */
+static void volume_poll(void) {
+    static bool headphones;
+    int step = gta7lite_volume_key();
+    bool plugged = gta7lite_audio_headphones();
+    if (!step && plugged == headphones) return;
+    headphones = plugged;
+    page_host_volume(gta7lite_audio_volume(step), GTA7LITE_VOLUME_STEPS, plugged);
+}
+
 /* Long boot work (expanding the ramdisk, page tables, zeroing pages) reports
  * progress every 64 KiB to 1 MiB; each report feeds the watchdog. */
 static void boot_feed(enum boot_phase phase, uint32_t done, uint32_t total) {
@@ -321,6 +335,8 @@ void kernel_main(const void *dtb) {
         }
 #elif defined(SOS2_BOARD_GTA7LITE)
         if (gta7lite_touch_poll(&event)) page_host_input(&event);
+        volume_poll();
+        gta7lite_cpu_clock_poll(process_user_us());
 #else
         /* Drain queued virtio tablet reports. Taking one per pass lets the
          * 64-event ring fill while the loop is slow, and the device then drops

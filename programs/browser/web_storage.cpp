@@ -58,10 +58,14 @@ State::Address address(const URL &url) {
     return result;
 }
 
+State::Store *opened;
+
 State::Store &store() {
     static auto *instance = [] {
         mkdir("/data/browser", 0700);
-        return new State::Store("/data/browser/state.sqlite3");
+        mkdir("/tmp/browser", 0700);
+        return opened =
+                   new State::Store("/tmp/browser/state.sqlite3", "/data/browser/state.sqlite3");
     }();
     return *instance;
 }
@@ -379,6 +383,10 @@ public:
         return space;
     }
 };
+}
+
+void saveStorage() {
+    if (opened) opened->save();
 }
 
 void configureStorage(PageConfiguration &configuration) {

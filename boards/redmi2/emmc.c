@@ -1,5 +1,4 @@
-#include "block.h"
-#include "disk_partition.h"
+#include "emmc_store.h"
 #include "kernel_io.h"
 #include "platform.h"
 #include "system_store.h"
@@ -10,10 +9,9 @@
  * 400 kHz, then in high-speed timing at 50 MHz), and reselect the eMMC user
  * area. No regulator, bus-width, boot-partition, RPMB, erase or tuning
  * commands.
- * See docs/redmi2.md for the pinned handoff and register references. Two
- * users share the adopted card: the data volume's sos2-data partition
- * (block_*) and the installed system's boot and cache regions
- * (system_store_*, include/system_store.h). */
+ * See docs/redmi2.md for the pinned handoff and register references. The
+ * eMMC store (kernel/protection/emmc_store.c) moves the data volume's and
+ * the installed system's sectors through it. */
 enum {
     CORE = 0x07824000,
     HC = 0x07824900,
@@ -63,17 +61,13 @@ static void wr(uintptr_t address, uint32_t value, unsigned width) {
     barrier();
 }
 
-static bool controller, failed, ready, store_ready, cache_enabled;
+static bool controller, failed, cache_enabled;
 static uint32_t raw_sectors;
-static struct disk_partition partition, regions[SYSTEM_REGIONS];
-static unsigned char bounce[4096];
+static unsigned char bounce[512];
 
 /* Any failure stops the device for the boot, for both of its users. */
 static bool fail(void) {
     failed = true;
-    ready = store_ready = false;
-    partition = (struct disk_partition){0};
-    memset(regions, 0, sizeof(regions));
     if (controller) {
         /* No DMA is ever submitted. Stop command/data engines without changing
          * the inherited bus voltage or power. Never retry uncertain writes. */
@@ -371,55 +365,6 @@ static bool adopt(const struct platform_devices *devices) {
     return true;
 }
 
-bool block_init(const struct platform_devices *devices) {
-    ready = false;
-    partition = (struct disk_partition){0};
-    /* An installed phone keeps its data volume in the cache partition after
-     * the app store (include/system_store.h), whatever other partitions say. */
-    if (store_ready) {
-        uint64_t sectors = regions[SYSTEM_CACHE].sectors;
-        if (sectors <= SYSTEM_DATA_START) return false;
-        sectors -= SYSTEM_DATA_START;
-        if (sectors > SYSTEM_DATA_MAX) sectors = SYSTEM_DATA_MAX;
-        partition = (struct disk_partition){regions[SYSTEM_CACHE].start + SYSTEM_DATA_START,
-                                            sectors & ~(uint64_t)7};
-        ready = true;
-        return true;
-    }
-    /* A GPT without a valid dedicated SOS2 partition leaves the card for the
-     * installed system; a failed read has stopped it already. */
-    if (!adopt(devices) || !disk_partition_find(raw_read, 0, raw_sectors, &partition)) return false;
-    ready = true;
-    return true;
-}
-
-uint64_t block_sectors(void) { return ready ? partition.sectors : 0; }
-
-static bool valid(uint64_t sector, const void *data, unsigned count) {
-    return ready && controller && data && count && count <= 8 && sector < partition.sectors &&
-           count <= partition.sectors - sector;
-}
-
-bool block_read(uint64_t sector, void *data, unsigned count) {
-    if (!valid(sector, data, count)) return false;
-    for (unsigned i = 0; i < count; ++i)
-        if (!raw_read(0, partition.start + sector + i, bounce + i * 512)) return false;
-    memcpy(data, bounce, count * 512);
-    return true;
-}
-
-bool block_write(uint64_t sector, const void *data, unsigned count) {
-    if (!valid(sector, data, count)) return false;
-    memcpy(bounce, data, count * 512);
-    for (unsigned i = 0; i < count; ++i) {
-        if (!transfer(24, (uint32_t)(partition.start + sector + i), bounce + i * 512, true) ||
-            !card_ready())
-            return false;
-        kernel_io_wait();
-    }
-    return true;
-}
-
 static bool flush(void) {
     /* EXT_CSD FLUSH_CACHE=1 is the driver's only CMD6 besides wake's
      * HS_TIMING. */
@@ -428,55 +373,26 @@ static bool flush(void) {
     return card_ready();
 }
 
-bool block_sync(void) { return ready && controller && flush(); }
-
-/* lk2nd's boot partition after its own 512 KiB, and the cache partition. The
- * boot partition must take a whole boot image there, the cache partition the
- * app store. */
-bool system_store_init(const struct platform_devices *devices) {
-    if (store_ready) return true;
-    struct disk_partition boot, cache;
-    if (!adopt(devices) || !disk_partition_named(raw_read, 0, raw_sectors, "boot", &boot) ||
-        !disk_partition_named(raw_read, 0, raw_sectors, "cache", &cache) ||
-        boot.sectors < SYSTEM_LK2ND_SECTORS + SYSTEM_BOOT_LIMIT / 512 ||
-        cache.sectors < SYSTEM_DATA_START)
-        return false;
-    regions[SYSTEM_BOOT] = (struct disk_partition){boot.start + SYSTEM_LK2ND_SECTORS,
-                                                   boot.sectors - SYSTEM_LK2ND_SECTORS};
-    regions[SYSTEM_CACHE] = cache;
-    store_ready = true;
+static bool take(const struct platform_devices *devices, uint64_t *sectors) {
+    if (!adopt(devices)) return false;
+    *sectors = raw_sectors;
     return true;
 }
 
-uint64_t system_store_sectors(enum system_region region) {
-    return store_ready && (unsigned)region < SYSTEM_REGIONS ? regions[region].sectors : 0;
+static bool serving(void) { return controller; }
+
+static bool read_sector(uint64_t sector, void *data) { return raw_read(0, sector, data); }
+
+static bool write_sector(uint64_t sector, const void *data) {
+    return transfer(24, (uint32_t)sector, (unsigned char *)(uintptr_t)data, true) && card_ready();
 }
 
-static bool in_region(enum system_region region, uint64_t sector, const void *data,
-                      unsigned count) {
-    return store_ready && controller && (unsigned)region < SYSTEM_REGIONS && data && count &&
-           sector < regions[region].sectors && count <= regions[region].sectors - sector;
-}
-
-bool system_store_read(enum system_region region, uint64_t sector, void *data, unsigned count) {
-    if (!in_region(region, sector, data, count)) return false;
-    unsigned char *out = data;
-    for (unsigned i = 0; i < count; ++i)
-        if (!raw_read(0, regions[region].start + sector + i, out + (size_t)i * 512)) return false;
-    return true;
-}
-
-bool system_store_write(enum system_region region, uint64_t sector, const void *data,
-                        unsigned count) {
-    if (!in_region(region, sector, data, count)) return false;
-    const unsigned char *in = data;
-    for (unsigned i = 0; i < count; ++i) {
-        memcpy(bounce, in + (size_t)i * 512, 512);
-        if (!transfer(24, (uint32_t)(regions[region].start + sector + i), bounce, true) ||
-            !card_ready())
-            return false;
-    }
-    return true;
-}
-
-bool system_store_sync(void) { return store_ready && controller && flush(); }
+/* The data volume, without an installed system, is the dedicated sos2-data
+ * partition; the installed system's boot image follows lk2nd's 512 KiB. */
+const struct emmc_card emmc_card = {.adopt = take,
+                                    .serving = serving,
+                                    .read = read_sector,
+                                    .write = write_sector,
+                                    .flush = flush,
+                                    .loader_sectors = SYSTEM_LK2ND_SECTORS,
+                                    .dedicated_partition = true};

@@ -9,24 +9,23 @@
  
 +#if OS(SOS2)
 +#include "MarkedBlock.h"
++#include <bit>
 +#include <sys/mman.h>
 +#include <wtf/Lock.h>
-+#include <wtf/PageBlock.h>
 +#endif
 +
  namespace JSC { 
  
  AlignedMemoryAllocator::AlignedMemoryAllocator() = default;
-@@ -55,6 +63,52 @@ void AlignedMemoryAllocator::registerSubspace(Subspace* subspace)
+@@ -55,6 +63,42 @@ void AlignedMemoryAllocator::registerSubspace(Subspace* subspace)
      m_subspaces.append(std::mem_fn(&Subspace::setNextSubspaceInAlignedMemoryAllocator), subspace);
  }
  
 +#if OS(SOS2)
 +
-+// Each block is mapped on its own, with mmap's page-aligned slack unmapped
-+// around it, and up to 16 freed blocks are kept for reuse: SOS2 frees memory
-+// only when it is unmapped, and each mapping change pauses the process's other
-+// threads.
++// Each block is a mapping of its own, which the kernel aligns (MAP_ALIGNED),
++// and up to 16 freed blocks are kept for reuse: SOS2 frees memory only when it
++// is unmapped, and unmapping pauses the process's other threads.
 +static constexpr unsigned sos2CachedBlocks = 16;
 +static Lock sos2BlockLock;
 +static void* sos2FreeBlocks[sos2CachedBlocks];
@@ -39,18 +38,9 @@
 +        if (sos2FreeBlockCount)
 +            return sos2FreeBlocks[--sos2FreeBlockCount];
 +    }
-+    size_t mapped = 2 * MarkedBlock::blockSize - pageSize();
-+    void* memory = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-+    if (memory == MAP_FAILED)
-+        return nullptr;
-+    uintptr_t start = reinterpret_cast<uintptr_t>(memory);
-+    uintptr_t block = roundUpToMultipleOf<MarkedBlock::blockSize>(start);
-+    uintptr_t end = block + MarkedBlock::blockSize;
-+    if (block != start)
-+        munmap(memory, block - start);
-+    if (start + mapped != end)
-+        munmap(reinterpret_cast<void*>(end), start + mapped - end);
-+    return reinterpret_cast<void*>(block);
++    void* memory = mmap(nullptr, MarkedBlock::blockSize, PROT_READ | PROT_WRITE,
++        MAP_PRIVATE | MAP_ANON | MAP_ALIGNED(std::countr_zero(MarkedBlock::blockSize)), -1, 0);
++    return memory == MAP_FAILED ? nullptr : memory;
 +}
 +
 +void freeSOS2Block(void* block)
@@ -181,3 +171,54 @@
  }
  
  #endif // CPU(ADDRESS64)
+--- a/Source/JavaScriptCore/runtime/ButterflyInlines.h
++++ b/Source/JavaScriptCore/runtime/ButterflyInlines.h
+@@ -128,6 +128,14 @@
+ 
+ inline void* Butterfly::base(Structure* structure)
+ {
++#if OS(SOS2)
++    // Without array storage there is no pre-capacity. Only an indexed butterfly
++    // has its header word in its allocation: elsewhere the word lies past it,
++    // possibly past the end of the MarkedBlock, which SOS2 maps on its own, and
++    // a compiler may load it early. Never form the access then.
++    if (!hasAnyArrayStorage(structure->indexingType()))
++        return base(0, structure->outOfLineCapacity());
++#endif
+     return base(indexingHeader()->preCapacity(structure), structure->outOfLineCapacity());
+ }
+ 
+@@ -138,8 +146,18 @@
+     if (!oldButterfly)
+         return create(vm, intendedOwner, 0, newPropertyCapacity, false, IndexingHeader(), 0);
+ 
++#if OS(SOS2)
++    // As in base(Structure*): read the header only where it exists.
++    size_t preCapacity = 0;
++    size_t indexingPayloadSizeInBytes = 0;
++    if (hasIndexedProperties(structure->indexingType())) {
++        preCapacity = oldButterfly->indexingHeader()->preCapacity(structure);
++        indexingPayloadSizeInBytes = oldButterfly->indexingHeader()->indexingPayloadSizeInBytes(structure);
++    }
++#else
+     size_t preCapacity = oldButterfly->indexingHeader()->preCapacity(structure);
+     size_t indexingPayloadSizeInBytes = oldButterfly->indexingHeader()->indexingPayloadSizeInBytes(structure);
++#endif
+     bool hasIndexingHeader = structure->hasIndexingHeader(intendedOwner);
+     Butterfly* result = createUninitialized(vm, intendedOwner, preCapacity, newPropertyCapacity, hasIndexingHeader, indexingPayloadSizeInBytes);
+     // Use memcpy since this butterfly is not tied to any object yet.
+--- a/Source/JavaScriptCore/runtime/Structure.cpp
++++ b/Source/JavaScriptCore/runtime/Structure.cpp
+@@ -1037,7 +1037,12 @@
+             (inlineCapacity() - inlineSize()) * sizeof(EncodedJSValue));
+ 
+         if (Butterfly* butterfly = object->butterfly()) {
++#if OS(SOS2)
++            // As in Butterfly::base(Structure*) (ButterflyInlines.h).
++            size_t preCapacity = hasAnyArrayStorage(indexingType()) ? butterfly->indexingHeader()->preCapacity(this) : 0;
++#else
+             size_t preCapacity = butterfly->indexingHeader()->preCapacity(this);
++#endif
+             void* base = butterfly->base(preCapacity, beforeOutOfLineCapacity);
+             void* startOfPropertyStorageSlots = reinterpret_cast<EncodedJSValue*>(base) + preCapacity;
+             gcSafeZeroMemory(static_cast<JSValue*>(startOfPropertyStorageSlots), (beforeOutOfLineCapacity - outOfLineSize()) * sizeof(EncodedJSValue));

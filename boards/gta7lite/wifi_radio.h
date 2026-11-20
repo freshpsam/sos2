@@ -18,8 +18,6 @@ void gta7lite_wifi_radio_poll(void (*deliver)(const unsigned char *, unsigned, c
 bool gta7lite_wifi_radio_drained(void);
 /* The firmware's beacon-timeout report since the last call. */
 bool gta7lite_wifi_radio_beacon_lost(void);
-/* The station whose rates EAPOL frames go at. */
-void gta7lite_wifi_radio_station(const struct wifi_station *);
 /* The chip handed to its firmware, which sleeps it, or taken back: 1 asleep,
  * 0 awake, -1 when it did not come back within 2 s. Nothing else touches the
  * chip while it sleeps. */

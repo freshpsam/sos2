@@ -9,11 +9,14 @@
 #include "syscall.h"
 #define SOS2_KEYS 64
 /* Keep malloc's growing break separate from mmap, stacks and TLS. These are
- * virtual address limits; all allocations still share the process quota. */
+ * virtual address limits; all allocations still share the process quota. The
+ * engine maps everything (programs/browser/web_malloc.c), so mmap's range
+ * spans the quota: 2 GiB of the heap window on AArch64, 544 MiB on ARM32,
+ * which leaves programs' malloc a 48 MiB break. */
 #ifdef __aarch64__
-#define SOS2_BRK_BASE 0x1060000000ul
+#define SOS2_BRK_BASE 0x10c0000000ul
 #else
-#define SOS2_BRK_BASE 0x28000000u
+#define SOS2_BRK_BASE 0x3c000000u
 #endif
 
 static inline sos2_status sos2_map(unsigned pages, unsigned permissions) {

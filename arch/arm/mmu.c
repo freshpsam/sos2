@@ -400,8 +400,11 @@ static void release_empty_table(struct vm_space *s, uint32_t address) {
     if (!pages_free(table, 1)) panic("user table ownership corrupt");
 }
 
+/* On the service worker: a page of hundreds of megabytes frees for a second
+ * or more, so the desktop runs every 16 pages, as in vm_shared_trim. */
 void vm_destroy(struct vm_space *s) {
     if (s->root) {
+        unsigned freed = 0;
         for (uint32_t address = USER_BASE; address < USER_END; address += 0x100000) {
             uint32_t *table = user_table(s, address);
             if (!table) continue;
@@ -410,6 +413,7 @@ void vm_destroy(struct vm_space *s) {
                     uintptr_t address = table[i] & ~4095u;
                     table[i] = 0;
                     if (!shared_page(address)) free_user_page(address);
+                    if ((++freed & 15) == 0) kernel_io_wait();
                 }
             if (!pages_free(table, 1)) panic("user table ownership corrupt");
         }
@@ -433,7 +437,10 @@ bool vm_map(struct vm_space *s, user_ptr address, unsigned permissions) {
     if (!table) {
         table = pages_alloc(1, 1);
         if (!table) return false;
-        /* PXN prevents privileged instruction fetches from user mappings. */
+        /* Zeroed before it is linked: a mapping may add tables while the
+         * process's other threads run (kernel/protection/process.c). PXN
+         * prevents privileged instruction fetches from user mappings. */
+        __asm__ volatile("dsb ishst" ::: "memory");
         s->root[address >> 20] = (uintptr_t)table | 1 | 4;
     }
     uint32_t *pte = &table[(address >> 12) & 255];
@@ -608,24 +615,28 @@ bool vm_release(struct vm_space *s, user_ptr address, unsigned count) {
     return true;
 }
 
-user_ptr vm_allocate_range(struct vm_space *s, unsigned count, user_ptr lower, user_ptr upper,
-                           unsigned permissions) {
+user_ptr vm_allocate_range(struct vm_space *s, unsigned count, unsigned alignment, user_ptr lower,
+                           user_ptr upper, unsigned permissions) {
     if (!allocation_range(lower, upper) || ((lower | upper) & (PAGE_SIZE - 1)) ||
-        count > (upper - lower) / PAGE_SIZE)
+        count > (upper - lower) / PAGE_SIZE || !alignment || (alignment & (alignment - 1)) ||
+        alignment > (upper - lower) / PAGE_SIZE)
         return 0;
     if (!s->root || !count || count > USER_PAGE_QUOTA - s->mapped_pages) return 0;
-    uint32_t start = lower;
+    uint32_t step = (uint32_t)alignment * PAGE_SIZE;
+    uint32_t start = (lower + step - 1) & ~(step - 1);
     unsigned free_run = 0;
-    for (uint32_t at = lower; at < upper; at += PAGE_SIZE) {
+    for (uint32_t at = start; at < upper; at += PAGE_SIZE) {
         if (vm_mapped(s, at)) {
+            /* The next run may start only at the next multiple of step. */
             free_run = 0;
-            start = at + PAGE_SIZE;
+            start = (at + step) & ~(step - 1);
+            at = start - PAGE_SIZE;
             continue;
         }
         if (++free_run < count) continue;
         unsigned mapped = 0;
         for (; mapped < count; ++mapped)
-            if (!vm_map(s, start + mapped * PAGE_SIZE, permissions)) break;
+            if (!vm_map(s, start + (uint32_t)mapped * PAGE_SIZE, permissions)) break;
         if (mapped == count) return start;
         if (mapped && !vm_release(s, start, mapped)) panic("heap rollback failed");
         return 0;

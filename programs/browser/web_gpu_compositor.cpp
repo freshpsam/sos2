@@ -161,16 +161,18 @@ void GPUCompositor::resetSkiaState() {
     }
 }
 
-std::optional<Region> GPUCompositor::composite(SkCanvas &canvas) {
-    if (m_lost) return std::nullopt;
+Composition GPUCompositor::composite(SkCanvas &canvas) {
+    // Without the surface's texture, the caller paints the whole view flattened.
+    Composition flattened{Region(IntRect(IntPoint(), m_viewport)), true};
+    if (m_lost) return flattened;
     auto *surface = canvas.getSurface();
     auto *skia = PlatformDisplay::sharedDisplay().skiaGrContext();
     GrGLTextureInfo texture;
-    if (!surface || !skia) return std::nullopt;
+    if (!surface || !skia) return flattened;
     auto backend =
         SkSurfaces::GetBackendTexture(surface, SkSurfaces::BackendHandleAccess::kFlushWrite);
     if (!backend.isValid() || !GrBackendTextures::GetGLTextureInfo(backend, &texture))
-        return std::nullopt;
+        return flattened;
     // WPE's ThreadedCompositor::paintToCurrentGLContext: TextureMapper's GL
     // work, from the layer flush's tile uploads on, follows Skia's pending
     // work, and Skia then relearns the GL state it changed.
@@ -187,7 +189,7 @@ std::optional<Region> GPUCompositor::composite(SkCanvas &canvas) {
     if (!m_textureMapper) m_textureMapper = TextureMapper::create();
     if (!bindTarget(texture.fTarget, texture.fID)) {
         skia->resetContext();
-        return std::nullopt;
+        return flattened;
     }
     resetSkiaState();
     glViewport(0, 0, m_viewport.width(), m_viewport.height());
@@ -206,7 +208,7 @@ std::optional<Region> GPUCompositor::composite(SkCanvas &canvas) {
     m_textureMapper->endClip();
     m_textureMapper->endPainting();
     skia->resetContext();
-    return Region(IntRect(IntPoint(), m_viewport));
+    return {Region(IntRect(IntPoint(), m_viewport))};
 }
 
 void GPUCompositor::lose() {

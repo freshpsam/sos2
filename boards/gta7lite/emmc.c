@@ -1,9 +1,7 @@
-#include "block.h"
-#include "disk_partition.h"
+#include "emmc_store.h"
 #include "gta7lite.h"
 #include "kernel_io.h"
 #include "platform.h"
-#include "system_store.h"
 
 /* MT6765's MSDC0 and its eMMC, in PIO, as LK leaves them after reading the
  * boot image: clock, bus width and timing stay LK's. The registers and the
@@ -12,9 +10,8 @@
  * answer at RCA 1, 2 or 0 (LK's is undocumented) in the user area; a
  * deselected card is selected again. Longer data and busy timeouts than LK's
  * are set; no tuning, bus, partition-switch, erase or RPMB commands, and no
- * DMA. Two users share the adopted card: the installed system's boot and
- * cache partitions (system_store_*, include/system_store.h) and its data
- * volume, in the cache partition after the app store (block_*). */
+ * DMA. The eMMC store (kernel/protection/emmc_store.c) moves the installed
+ * system's sectors and its data volume's through it. */
 enum {
     MSDC = 0x11230000,
     MSDC_CFG = 0x00,
@@ -84,10 +81,9 @@ static void wr(unsigned offset, uint32_t value) {
     mmio_write32(MSDC + offset, value);
 }
 
-static bool controller, failed, ready, store_ready, cache_enabled;
+static bool controller, failed, cache_enabled;
 static uint32_t rca, raw_sectors;
-static struct disk_partition partition, regions[SYSTEM_REGIONS];
-static unsigned char bounce[4096] __attribute__((aligned(4)));
+static unsigned char bounce[512] __attribute__((aligned(4)));
 
 /* msdc_reset_hw: the controller's state machines, then its FIFO, then its
  * status; the configuration stays. Bounded spins: both bits clear
@@ -105,9 +101,6 @@ static void reset(void) {
  * flight is retried. */
 static bool fail(void) {
     failed = true;
-    ready = store_ready = false;
-    partition = (struct disk_partition){0};
-    memset(regions, 0, sizeof(regions));
     if (controller) reset();
     controller = false;
     return false;
@@ -290,51 +283,6 @@ static bool adopt(void) {
     return true;
 }
 
-bool block_init(const struct platform_devices *devices) {
-    (void)devices;
-    ready = false;
-    partition = (struct disk_partition){0};
-    /* Only the installed system has a data volume: in the cache partition
-     * after the app store (include/system_store.h), as on the phone. */
-    if (!store_ready || regions[SYSTEM_CACHE].sectors <= SYSTEM_DATA_START) return false;
-    uint64_t sectors = regions[SYSTEM_CACHE].sectors - SYSTEM_DATA_START;
-    if (sectors > SYSTEM_DATA_MAX) sectors = SYSTEM_DATA_MAX;
-    partition = (struct disk_partition){regions[SYSTEM_CACHE].start + SYSTEM_DATA_START,
-                                        sectors & ~(uint64_t)7};
-    ready = partition.sectors != 0;
-    return ready;
-}
-
-uint64_t block_sectors(void) { return ready ? partition.sectors : 0; }
-
-static bool valid(uint64_t sector, const void *data, unsigned count) {
-    return ready && controller && data && count && count <= 8 && sector < partition.sectors &&
-           count <= partition.sectors - sector;
-}
-
-bool block_read(uint64_t sector, void *data, unsigned count) {
-    if (!valid(sector, data, count)) return false;
-    for (unsigned i = 0; i < count; ++i)
-        if (!transfer(17, (uint32_t)(partition.start + sector + i),
-                      (uint32_t *)(void *)(bounce + i * 512), false))
-            return false;
-    memcpy(data, bounce, count * 512);
-    return true;
-}
-
-bool block_write(uint64_t sector, const void *data, unsigned count) {
-    if (!valid(sector, data, count)) return false;
-    memcpy(bounce, data, count * 512);
-    for (unsigned i = 0; i < count; ++i) {
-        if (!transfer(24, (uint32_t)(partition.start + sector + i),
-                      (uint32_t *)(void *)(bounce + i * 512), true) ||
-            !card_ready())
-            return false;
-        kernel_io_wait();
-    }
-    return true;
-}
-
 static bool flush(void) {
     /* EXT_CSD FLUSH_CACHE=1 is the driver's only CMD6. */
     uint32_t status;
@@ -343,55 +291,20 @@ static bool flush(void) {
     return card_ready();
 }
 
-bool block_sync(void) { return ready && controller && flush(); }
-
-/* The boot and cache partitions, found by their GPT names. The boot
- * partition must take a whole boot image, the cache partition the app
- * store. */
-bool system_store_init(const struct platform_devices *devices) {
+static bool take(const struct platform_devices *devices, uint64_t *sectors) {
     (void)devices;
-    if (store_ready) return true;
-    struct disk_partition boot, cache;
-    if (!adopt() || !disk_partition_named(raw_read, 0, raw_sectors, "boot", &boot) ||
-        !disk_partition_named(raw_read, 0, raw_sectors, "cache", &cache) ||
-        boot.sectors < SYSTEM_BOOT_LIMIT / 512 || cache.sectors < SYSTEM_DATA_START)
-        return false;
-    regions[SYSTEM_BOOT] = boot;
-    regions[SYSTEM_CACHE] = cache;
-    store_ready = true;
+    if (!adopt()) return false;
+    *sectors = raw_sectors;
     return true;
 }
 
-uint64_t system_store_sectors(enum system_region region) {
-    return store_ready && (unsigned)region < SYSTEM_REGIONS ? regions[region].sectors : 0;
+static bool serving(void) { return controller; }
+
+static bool read_sector(uint64_t sector, void *data) { return raw_read(0, sector, data); }
+
+static bool write_sector(uint64_t sector, const void *data) {
+    return transfer(24, (uint32_t)sector, (uint32_t *)(uintptr_t)data, true) && card_ready();
 }
 
-static bool in_region(enum system_region region, uint64_t sector, const void *data,
-                      unsigned count) {
-    return store_ready && controller && (unsigned)region < SYSTEM_REGIONS && data && count &&
-           sector < regions[region].sectors && count <= regions[region].sectors - sector;
-}
-
-bool system_store_read(enum system_region region, uint64_t sector, void *data, unsigned count) {
-    if (!in_region(region, sector, data, count)) return false;
-    unsigned char *out = data;
-    for (unsigned i = 0; i < count; ++i)
-        if (!raw_read(0, regions[region].start + sector + i, out + (size_t)i * 512)) return false;
-    return true;
-}
-
-bool system_store_write(enum system_region region, uint64_t sector, const void *data,
-                        unsigned count) {
-    if (!in_region(region, sector, data, count)) return false;
-    const unsigned char *in = data;
-    for (unsigned i = 0; i < count; ++i) {
-        memcpy(bounce, in + (size_t)i * 512, 512);
-        if (!transfer(24, (uint32_t)(regions[region].start + sector + i),
-                      (uint32_t *)(void *)bounce, true) ||
-            !card_ready())
-            return false;
-    }
-    return true;
-}
-
-bool system_store_sync(void) { return store_ready && controller && flush(); }
+const struct emmc_card emmc_card = {
+    .adopt = take, .serving = serving, .read = read_sector, .write = write_sector, .flush = flush};

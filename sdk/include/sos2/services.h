@@ -58,6 +58,10 @@ int sos2_file_lock(const char *path, int locked);
 /* SYS_UPDATE (include/user_abi.h), for the system's updater alone; INFO fills data.
  * Returns 0, or a negative USER_E* value: USER_EAGAIN while FINISH has more to do. */
 int sos2_update(unsigned op, void *data, uint32_t size);
+/* SYS_AUDIO (include/user_abi.h): op is USER_AUDIO_*; argument is the frames
+ * for WRITE (count of them), 1 or 0 for PAUSE, a struct user_audio_status for
+ * STATUS. Returns frames taken for WRITE, otherwise 0, or a negative USER_E*. */
+int sos2_audio(unsigned op, uintptr_t argument, uint32_t count);
 int sos2_browser_command(struct user_browser_command *);
 int sos2_browser_state(const struct user_browser_state *);
 #ifdef __cplusplus

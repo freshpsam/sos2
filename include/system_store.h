@@ -46,11 +46,11 @@ struct system_update_header {
 
 _Static_assert(sizeof(struct system_update_header) == 128, "update header layout");
 
-/* The eMMC driver's view of the two regions (boards/redmi2/emmc.c,
- * boards/gta7lite/emmc.c): the boot partition (on the phone after lk2nd)
- * and the cache partition, found by their GPT names.
- * Reads and writes go straight between the card and the caller's kernel
- * buffer; any failure stops the card for the boot. */
+/* The two regions on the devices' eMMC (kernel/protection/emmc_store.c,
+ * over boards/redmi2/emmc.c and boards/gta7lite/emmc.c): the boot partition
+ * (on the phone after lk2nd) and the cache partition, found by their GPT
+ * names. Reads go straight to the caller's kernel buffer; any failure stops
+ * the card for the boot. */
 bool system_store_init(const struct platform_devices *);
 uint64_t system_store_sectors(enum system_region);
 bool system_store_read(enum system_region, uint64_t sector, void *data, unsigned count);

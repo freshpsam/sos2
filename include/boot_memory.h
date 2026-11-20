@@ -10,12 +10,14 @@ bool redmi2_browser_arena(const struct platform_devices *, uintptr_t dtb, uintpt
 bool redmi2_resource_arena(const struct platform_devices *, uintptr_t dtb, uintptr_t kernel_start,
                            uintptr_t kernel_end, size_t size, uintptr_t *start);
 #ifdef __aarch64__
-/* arm64's page pool: the largest free stretch of RAM below 4 GiB, at most
- * `maximum` bytes, clear of the resources as well (QEMU's loader may place
- * them outside any initrd). */
-bool boot_memory_pool(const struct platform_devices *, uintptr_t dtb, uintptr_t kernel_start,
-                      uintptr_t kernel_end, uintptr_t resources, size_t resource_size,
-                      uint64_t maximum, uintptr_t *start, size_t *size);
+/* arm64's page pool: up to BOOT_POOL_REGIONS free stretches of RAM below
+ * 4 GiB, the largest of at least 1 MiB, in address order and within `span`
+ * bytes from the first's start to the last's end; clear of the resources as
+ * well (QEMU's loader may place them outside any initrd). How many, or 0. */
+#define BOOT_POOL_REGIONS 16
+unsigned boot_memory_pool(const struct platform_devices *, uintptr_t dtb, uintptr_t kernel_start,
+                          uintptr_t kernel_end, uintptr_t resources, size_t resource_size,
+                          uint64_t span, struct memory_region regions[BOOT_POOL_REGIONS]);
 /* Where the resources a SORZ ramdisk expands to go: the start of the smallest
  * free stretch that holds them, clear of the ramdisk, so the largest stays
  * whole for the page pool whenever another fits. */

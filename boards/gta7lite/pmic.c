@@ -7,8 +7,10 @@
  * MT6357's registers are Linux's (include/linux/mfd/mt6357/registers.h,
  * mt6397-core.c, rtc-mt6397.c, mtk-pmic-keys.c, mt6359-auxadc.c) and
  * MediaTek's own mt6357 drivers'. The only writes are the battery voltage's
- * measurement requests and the supplies' enables. The battery's charger is
- * the MT6370 (mt6370.c), left as LK configured it: its software supervision
+ * measurement requests, the supplies' enables, audio.c's (the audio codec
+ * and its clock buffer) and cpu_clock.c's (the CPUs' VPROC and VSRAM_PROC
+ * levels). The battery's charger is the MT6370
+ * (mt6370.c), left as LK configured it: its software supervision
  * (temperature, full charge, its watchdog) is not done here, so the kernel
  * only reports whether a charger is connected and the MT6370 charging. */
 enum {
@@ -125,6 +127,16 @@ bool gta7lite_pmic_init(void) {
     key.candidate = key.steady = !(status & PWRKEY_DEB);
     key.sampled = key.since = time_us();
     return true;
+}
+
+bool gta7lite_pmic_read(uint16_t address, uint16_t *value) {
+    return gta7lite_pmic_init() && pmic_read(address, value);
+}
+
+bool gta7lite_pmic_update(uint16_t address, uint16_t value, uint16_t mask) {
+    uint16_t old = 0;
+    if (!gta7lite_pmic_init() || (mask != 0xffff && !pmic_read(address, &old))) return false;
+    return pmic_write(address, (uint16_t)((old & ~mask) | (value & mask)));
 }
 
 /* An LDO on, its output confirmed within the ramp. */

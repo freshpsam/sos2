@@ -1,4 +1,5 @@
 #include "web_state.h"
+#include <sos2/services.h>
 #include <sqlite3.h>
 #include <algorithm>
 #include <array>
@@ -349,22 +350,35 @@ bool sameSite(const Address &a, const Address &b) {
 // version ("" for cookies, else the origin), so other pages reload only that.
 // Session cookies are shared too, tagged with this boot's session, which the
 // first page after boot names in the profile's /tmp: every boot empties it.
+// The database pages use lives in /tmp, in RAM. On the eMMC, littlefs copies
+// a file's whole tail for each write inside it, and sites that store as they
+// load (YouTube) spent half their load in SQLite's writes. The first page
+// after boot copies the durable database from /data. A copy goes back 3 s
+// after the last change, or 30 s after the first unsaved one, as one
+// front-to-back write and a rename, by one page at a time: the one that
+// changed it, or any open page once SQLite's change counter in the working
+// copy's header differs from the one the last copy recorded. A power loss or
+// restart loses at most those last seconds, unless the page that made a
+// change closed before saving it and no page stayed open.
 struct Store::Impl {
     enum class Status { Retry, Ready, Broken };
     using Clock = std::chrono::steady_clock;
     using Versions = std::map<std::string, int64_t, std::less<>>;
-    std::string path;
+    std::string path, durable;
     sqlite3 *db = nullptr;
     Status status = Status::Retry;
-    bool checked = false;
-    Clock::time_point attempted, refreshed;
+    bool checked = false, stamped = false, unsaved = false;
+    Clock::time_point attempted, refreshed, firstUnsaved, lastChange, retryAt, looked;
+    std::chrono::seconds retryDelay{3};
     std::string session;
     std::vector<Cookie> jar;
     int64_t sequence = 0;
     int64_t dataVersion = 0;
     Versions versions;
 
-    explicit Impl(std::string file) : path(std::move(file)) { open(); }
+    Impl(std::string file, std::string copy) : path(std::move(file)), durable(std::move(copy)) {
+        open();
+    }
 
     ~Impl() { sqlite3_close(db); }
 
@@ -392,9 +406,149 @@ struct Store::Impl {
 
     Status failed() const { return busy() ? Status::Retry : Status::Broken; }
 
+    void changed() {
+        lastChange = Clock::now();
+        if (!unsaved) firstUnsaved = lastChange;
+        unsaved = true;
+    }
+
+    // SQLite's file change counter in the working copy's header (bytes
+    // 24-27), which every commit raises; 0 when it cannot be read. Read
+    // without the database's lock, so that it never waits for a saving page.
+    uint32_t changes() const {
+        unsigned char bytes[4];
+        int fd = ::open(path.c_str(), O_RDONLY);
+        bool good = fd >= 0 && ::pread(fd, bytes, 4, 24) == 4;
+        if (fd >= 0) ::close(fd);
+        return good ? uint32_t(bytes[0]) << 24 | uint32_t(bytes[1]) << 16 |
+                          uint32_t(bytes[2]) << 8 | bytes[3]
+                    : 0;
+    }
+
+    // The change counter the last durable copy had, beside the working copy.
+    uint32_t saved() const {
+        uint32_t value = 0;
+        int fd = ::open((path + ".saved").c_str(), O_RDONLY);
+        if (fd >= 0) {
+            if (::read(fd, &value, sizeof value) != sizeof value) value = 0;
+            ::close(fd);
+        }
+        return value;
+    }
+
+    void recordSaved(uint32_t value) const {
+        int fd = ::open((path + ".saved").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) return;
+        if (::write(fd, &value, sizeof value) != sizeof value) value = 0;
+        ::close(fd);
+    }
+
+    // Writes path's database to target in one pass, as VACUUM INTO does,
+    // then syncs it: the step that moves it between /data and /tmp.
+    static bool copy(sqlite3 *source, const std::string &target) {
+        ::unlink(target.c_str());
+        std::string sql = "VACUUM INTO '" + target + "'";
+        bool good = sqlite3_exec(source, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK;
+        if (good) {
+            int fd = ::open(target.c_str(), O_RDWR);
+            good = fd >= 0 && ::fsync(fd) == 0;
+            if (fd >= 0) ::close(fd);
+        }
+        if (!good) ::unlink(target.c_str());
+        return good;
+    }
+
+    // The durable database copied to part, then renamed into place.
+    Status restore(const std::string &part) {
+        sqlite3 *source = nullptr;
+        Status result = Status::Broken;
+        if (sqlite3_open_v2(durable.c_str(), &source, SQLITE_OPEN_READWRITE, nullptr) ==
+            SQLITE_OK) {
+            sqlite3_busy_timeout(source, 5000);
+            if (copy(source, part))
+                result = ::rename(part.c_str(), path.c_str()) ? Status::Retry : Status::Ready;
+            else if ((sqlite3_extended_errcode(source) & 0xff) == SQLITE_BUSY)
+                result = Status::Retry;
+        }
+        sqlite3_close(source);
+        return result;
+    }
+
+    // The first page after boot copies the durable database into /tmp under
+    // a lock that ends with its process. Opening it read-write first rolls
+    // back a journal that a crash left. A page that finds the copy already
+    // there saves it soon if it holds changes the durable copy lacks.
+    Status seed() {
+        if (!::access(path.c_str(), F_OK)) {
+            if (changes() != saved()) changed();
+            return Status::Ready;
+        }
+        bool absent = errno == ENOENT;
+        std::string lock = path + ".seed", part = path + ".part";
+        if (!absent || sos2_file_lock(lock.c_str(), 1)) return Status::Retry;
+        // Another page may have seeded meanwhile. Only a durable database
+        // that is surely absent starts an empty one: an empty copy saved back
+        // would replace it.
+        Status result = Status::Ready;
+        if (::access(path.c_str(), F_OK)) {
+            if (errno != ENOENT) result = Status::Retry;
+            else if (!::access(durable.c_str(), F_OK)) {
+                result = restore(part);
+                if (result == Status::Ready) recordSaved(changes());
+            } else if (errno != ENOENT) result = Status::Retry;
+        }
+        sos2_file_lock(lock.c_str(), 0);
+        return result;
+    }
+
+    // The durable copy, written beside it and renamed over it, under a lock
+    // that ends with its process, so that two pages never write one copy.
+    // Failures retry later and later, up to a minute apart.
+    void save() {
+        if (status != Status::Ready) return;
+        auto now = Clock::now();
+        if (now < retryAt) return;
+        if (!unsaved) {
+            // Changes another page made and closed without saving.
+            if (now - looked < std::chrono::seconds(2)) return;
+            looked = now;
+            if (uint32_t current = changes(); current && current != saved()) changed();
+            return;
+        }
+        if (now - lastChange < std::chrono::seconds(3) &&
+            now - firstUnsaved < std::chrono::seconds(30))
+            return;
+        std::string lock = durable + ".save";
+        if (sos2_file_lock(lock.c_str(), 1)) {
+            retryAt = now + std::chrono::seconds(1); // another page is saving
+            return;
+        }
+        // Read before the copy: a later commit only makes another one due.
+        uint32_t current = changes();
+        bool good = current && current == saved();
+        if (!good) {
+            std::string part = durable + ".part";
+            good = copy(db, part) && !::rename(part.c_str(), durable.c_str());
+            if (good) recordSaved(current);
+            else ::unlink(part.c_str());
+        }
+        sos2_file_lock(lock.c_str(), 0);
+        if (good) {
+            unsaved = false;
+            retryDelay = std::chrono::seconds(3);
+        } else {
+            retryAt = Clock::now() + retryDelay;
+            retryDelay = std::min(retryDelay * 2, std::chrono::seconds(60));
+        }
+    }
+
     void open() {
         attempted = Clock::now();
         if (!db) {
+            if (auto seeded = seed(); seeded != Status::Ready) {
+                status = seeded;
+                return;
+            }
             if (sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
                                 nullptr) != SQLITE_OK) {
                 sqlite3_close(db);
@@ -426,10 +580,14 @@ struct Store::Impl {
                 if (tables.number(0)) return Status::Broken;
             } else if (version.number(0) != 2 || application.number(0) != 0x534f5332)
                 return Status::Broken;
+            else stamped = true;
             checked = true;
         }
+        // A rollback journal still keeps a page that stops mid-write from
+        // breaking the database; syncs would only cost turns in RAM. 6 MiB
+        // leaves /tmp room for the copies littlefs makes while rewriting it.
         if (!exec(
-                "PRAGMA journal_mode=DELETE;PRAGMA synchronous=FULL;PRAGMA max_page_count=3072;") ||
+                "PRAGMA journal_mode=DELETE;PRAGMA synchronous=OFF;PRAGMA max_page_count=1536;") ||
             !exec("BEGIN IMMEDIATE"))
             return failed();
         if (!exec(
@@ -438,8 +596,9 @@ struct Store::Impl {
                 "CREATE TABLE IF NOT EXISTS versions(version INTEGER PRIMARY KEY AUTOINCREMENT,scope TEXT NOT NULL UNIQUE);"
                 // An origin without items needs no version: a page that saw one
                 // reloads, and AUTOINCREMENT never hands that version out again.
-                "DELETE FROM versions WHERE scope<>'' AND scope NOT IN (SELECT origin FROM local_items);"
-                "PRAGMA application_id=1397707570;PRAGMA user_version=2;")) {
+                "DELETE FROM versions WHERE scope<>'' AND scope NOT IN (SELECT origin FROM local_items);") ||
+            // Once only: a page that opens and changes nothing writes nothing.
+            (!stamped && !exec("PRAGMA application_id=1397707570;PRAGMA user_version=2;"))) {
             auto result = failed();
             exec("ROLLBACK");
             return result;
@@ -448,7 +607,9 @@ struct Store::Impl {
             exec("ROLLBACK");
             return Status::Retry;
         }
-        return commit(true) ? Status::Ready : failed();
+        if (!commit(true)) return failed();
+        stamped = true;
+        return Status::Ready;
     }
 
     // Inside the write transaction, so exactly one page starts the session.
@@ -583,6 +744,7 @@ struct Store::Impl {
             next = sqlite3_last_insert_rowid(db);
         }
         if (!commit(good)) return false;
+        changed();
         if (lookup(versions, scope) == previous)
             versions.insert_or_assign(std::string(scope), next);
         return true;
@@ -625,11 +787,14 @@ struct Store::Impl {
     }
 };
 
-Store::Store(const std::string &path) : impl(std::make_unique<Impl>(path)) { }
+Store::Store(const std::string &path, const std::string &durable)
+    : impl(std::make_unique<Impl>(path, durable)) { }
 
 Store::~Store() = default;
 
 bool Store::available() { return impl->available(); }
+
+void Store::save() { impl->save(); }
 
 int64_t Store::version(std::string_view origin, Look look) {
     if (look != Look::Cached) impl->refresh(look == Look::Now);

@@ -1,0 +1,16 @@
+--- a/Source/WebCore/rendering/RenderLayerCompositor.cpp
++++ b/Source/WebCore/rendering/RenderLayerCompositor.cpp
+@@ -1093,7 +1093,13 @@
+ 
+     if (updateType == CompositingUpdateType::OnScroll || updateType == CompositingUpdateType::OnCompositedScroll) {
+         // We only get here if we didn't scroll on the scrolling thread, so this update needs to re-position viewport-constrained layers.
++#if OS(SOS2)
++        // Without acceleratedCompositingForFixedPositionEnabled, fixed
++        // elements still get layers when they overlap composited content.
++        if (isPageScroll) {
++#else
+         if (m_renderView.settings().acceleratedCompositingForFixedPositionEnabled() && isPageScroll) {
++#endif
+             if (auto* viewportConstrainedObjects = m_renderView.frameView().viewportConstrainedObjects()) {
+                 for (auto& renderer : *viewportConstrainedObjects) {
+                     if (auto* layer = renderer.layer())

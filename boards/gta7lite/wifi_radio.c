@@ -13,6 +13,7 @@
 #include "gta7lite.h"
 #include "platform.h"
 #include "wire.h"
+#include "wifi_device.h"
 #include "runtime_files.h"
 #include <string.h>
 
@@ -719,13 +720,12 @@ static bool send_data(const uint8_t *f, unsigned n, unsigned rate) {
     return true;
 }
 
-static struct wifi_station const *current; /* for the lowest rate of EAPOL */
-
 bool gta7lite_wifi_radio_send(const void *frame, unsigned size, bool data) {
     const uint8_t *f = frame;
     if (!started || asleep || !f) return false;
     if (!data) return send_management(f, size);
-    return send_data(f, size, current ? lowest_rate(current) : 0);
+    /* EAPOL goes at the network's lowest rate. */
+    return send_data(f, size, lowest_rate(wifi_device_station()));
 }
 
 /* A received data frame, header-translated: [DA][SA][EtherType] with the
@@ -829,8 +829,6 @@ bool gta7lite_wifi_radio_beacon_lost(void) {
     beacon_lost = false;
     return lost;
 }
-
-void gta7lite_wifi_radio_station(const struct wifi_station *s) { current = s; }
 
 /* Ownership of the chip (CONN_HIF_ON_LPCTL): its firmware's lets it sleep, as
  * gen4m returns it when idle (halSetFWOwn); the driver's again within 2 s

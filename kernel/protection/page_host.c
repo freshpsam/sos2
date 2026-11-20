@@ -61,7 +61,8 @@ enum {
     APP_BUTTON = 80,
     APP_GAP = 12,
     TAP_WINDOW_US = 250000,
-    TAP_CREDITS = 4
+    TAP_CREDITS = 4,
+    VOLUME_SHOWN_US = 2000000
 };
 
 static unsigned list_top(void), list_bottom(void), list_rows(void);
@@ -129,6 +130,10 @@ static void status_tick(void);
 static void status_render(struct framebuffer *, unsigned, unsigned);
 static uint64_t status_minute = UINT64_MAX;
 static struct battery_view status_battery;
+/* The volume shown until volume_until (0: the clock is). */
+static unsigned volume_level, volume_steps;
+static bool volume_headphones;
+static uint64_t volume_until;
 
 enum {
     ACTION_ADDRESS = 100,
@@ -1266,10 +1271,20 @@ static void page_header_render(struct framebuffer *screen, unsigned x, unsigned 
     header_button(screen, BACK_X, "BACK");
 }
 
+/* A bar, filled to the level: white for the speakers, green for
+ * headphones. */
+static void volume_render(struct framebuffer *screen) {
+    unsigned color = volume_headphones ? 0x61e0bd : 0xf1f5f6;
+    gfx_rect(screen, 360, 18, 62, 14, color);
+    gfx_rect(screen, 362, 20, 58, 10, 0x17232c);
+    if (volume_level) gfx_rect(screen, 363, 21, 56 * volume_level / volume_steps, 8, color);
+}
+
 static void status_render(struct framebuffer *screen, unsigned x, unsigned y) {
     (void)x;
     (void)y;
     gfx_rect(screen, 352, 0, 128, WEB_TOP, 0x17232c);
+    if (volume_until) volume_render(screen);
     char time[6] = "--:--";
     if (status_minute != UINT64_MAX) {
         unsigned hour = (unsigned)(status_minute / 60 % 24),
@@ -1279,7 +1294,7 @@ static void status_render(struct framebuffer *screen, unsigned x, unsigned y) {
         time[3] = '0' + minute / 10;
         time[4] = '0' + minute % 10;
     }
-    gfx_text(screen, 360, 16, time, 2, 0xf1f5f6);
+    if (!volume_until) gfx_text(screen, 360, 16, time, 2, 0xf1f5f6);
     /* Green on a charger, with a plus while it charges; without a gauge an
      * empty outline. */
     unsigned color = !status_battery.available      ? 0xb9c9d0
@@ -1311,6 +1326,18 @@ static void status_tick(void) {
         status_battery = battery;
         page_host_redraw_region(352, 0, 128, WEB_TOP, status_render);
     }
+    if (volume_until && time_us() >= volume_until) {
+        volume_until = 0;
+        page_host_redraw_region(352, 0, 128, WEB_TOP, status_render);
+    }
+}
+
+void page_host_volume(unsigned level, unsigned steps, bool headphones) {
+    volume_level = level;
+    volume_steps = steps ? steps : 1;
+    volume_headphones = headphones;
+    volume_until = time_us() + VOLUME_SHOWN_US;
+    page_host_redraw_region(352, 0, 128, WEB_TOP, status_render);
 }
 
 static void browser_render(struct framebuffer *screen) {

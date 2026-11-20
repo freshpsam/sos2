@@ -48,7 +48,7 @@ public:
 
     void commit() final;
     // Draws the whole tree: there is no damage tracking yet.
-    std::optional<WebCore::Region> composite(SkCanvas &) final;
+    Composition composite(SkCanvas &) final;
     // The GPU is lost: draw nothing more. web_main.cpp then turns layer
     // compositing off, so WebCore drops the layers and paints the view directly.
     void lose();

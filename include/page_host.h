@@ -53,6 +53,9 @@ void page_host_network_status(const char *);
 void page_host_device_status(bool random_ready, bool storage_ready, bool session_only);
 /* The wall time was set or lost: the header's clock follows. */
 void page_host_clock_status(void);
+/* A volume key or a plug in the jack (the tablet's): the header shows the
+ * level of the output in use, 0 to steps, in place of its clock for 2 s. */
+void page_host_volume(unsigned level, unsigned steps, bool headphones);
 void page_host_entropy_status(bool ready, const char *error);
 /* A touch screen or USB link that failed to start (the tablet's) says why
  * in the status lines; NULL when it works. */

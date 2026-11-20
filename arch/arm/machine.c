@@ -106,6 +106,13 @@ bool arm_machine_init(const struct platform_devices *d) {
      * MT6370 charger and backlight driver answer; OVL0, OVL0_2L and DSI0. */
     if (!device(0x11016000, 0x1000) || !device(0x1400b000, 0x2000) || !device(0x14014000, 0x1000))
         return false;
+    /* The speakers (boards/gta7lite/audio.c): the audio front end with the
+     * part of its SRAM it plays from, and I2C3 for the amplifiers; the
+     * keypad, whose Volume Up keys.c reads. */
+    if (!device(0x11220000, 0x8000) || !device(0x1100f000, 0x1000) || !device(0x10010000, 0x1000))
+        return false;
+    /* The CPU clocks' PLLs in APMIXEDSYS (boards/gta7lite/cpu_clock.c). */
+    if (!device(0x1000c000, 0x1000)) return false;
     /* MediaTek's boot-params buffer in SRAM, for restarting into download
      * mode (boards/gta7lite/board.c). */
     if (d->has_ram_console) {

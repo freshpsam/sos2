@@ -24,13 +24,16 @@ REDMI2_PROTECTED_CFLAGS += $(WIFI_CRYPTO_FLAGS)
 LIBRARIES := third_party/littlefs/lfs.c third_party/lzma/LzmaDec.c \
     $(wildcard third_party/lwip/src/core/*.c third_party/lwip/src/core/ipv4/*.c) third_party/lwip/src/netif/ethernet.c
 ARM_SOURCES := arch/arm/mmu.c arch/arm/machine.c arch/arm/timer.c arch/arm/boot_cache.c arch/arm/smp.c
-# QEMU's randomness is virtio's (entropy.c); the devices measure CPU jitter.
+# QEMU's randomness is virtio's (entropy.c), its disk virtio's (block.c) and
+# its sound virtio's (virtio_snd.c); the devices measure CPU jitter and keep
+# their data on the eMMC (emmc_store.c), and the phone has no audio driver yet
+# (audio.c alone).
 QEMU_SOURCES := $(wildcard kernel/*.c) \
-    $(filter-out kernel/protection/jitter_entropy.c,$(wildcard kernel/protection/*.c kernel/net/*.c)) \
-    $(ARM_SOURCES) $(LIBRARIES)
+    $(filter-out kernel/protection/jitter_entropy.c kernel/protection/emmc_store.c,$(wildcard kernel/protection/*.c kernel/net/*.c)) \
+    kernel/audio/audio.c kernel/audio/virtio_snd.c $(ARM_SOURCES) $(LIBRARIES)
 PHONE_SOURCES := $(filter-out kernel/ramfb.c kernel/input.c kernel/virtio_gpu.c,$(wildcard kernel/*.c)) \
     $(filter-out kernel/protection/block.c kernel/protection/entropy.c,$(wildcard kernel/protection/*.c)) \
-    $(wildcard boards/redmi2/*.c) kernel/net/network.c kernel/net/network_time.c kernel/net/strings.c \
+    $(wildcard boards/redmi2/*.c) kernel/net/network.c kernel/net/network_time.c kernel/net/strings.c kernel/audio/audio.c \
     $(ARM_SOURCES) $(LIBRARIES) $(wildcard third_party/jitterentropy/src/*.c) $(WIFI_SOURCES) \
     $(HOSTAP_SOURCES) $(WIFI_MBEDTLS_SOURCES)
 QEMU_OBJECTS := $(patsubst %.c,build/resources-arm32/%.o,$(QEMU_SOURCES)) \
@@ -86,8 +89,9 @@ build/resources-arm64/kernel.img: build/resources-arm64/kernel.elf
 GTA7LITE_FLAGS := $(ARM64_FLAGS) -DSOS2_BOARD_GTA7LITE=1 -Iboards/gta7lite -Ithird_party/jitterentropy \
     $(WIFI_CRYPTO_FLAGS)
 GTA7LITE_SOURCES := $(filter-out kernel/ramfb.c kernel/input.c kernel/virtio_gpu.c \
-    kernel/protection/entropy.c kernel/protection/block.c kernel/net/virtio_net.c,$(ARM64_SOURCES)) \
-    kernel/protection/jitter_entropy.c \
+    kernel/protection/entropy.c kernel/protection/block.c kernel/net/virtio_net.c \
+    kernel/audio/virtio_snd.c,$(ARM64_SOURCES)) \
+    kernel/protection/jitter_entropy.c kernel/protection/emmc_store.c \
     $(wildcard boards/gta7lite/*.c third_party/jitterentropy/src/*.c) $(WIFI_SOURCES) \
     $(HOSTAP_SOURCES) $(WIFI_MBEDTLS_SOURCES)
 GTA7LITE_OBJECTS := $(patsubst %.c,build/gta7lite-arm64/%.o,$(GTA7LITE_SOURCES)) \

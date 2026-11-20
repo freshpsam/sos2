@@ -10,10 +10,12 @@
 #include "page_alloc.h"
 #ifdef SOS2_BOARD_REDMI2
 #include "redmi2_wifi.h"
-#define network_entropy_read redmi2_wifi_random
+#include "wifi_device.h"
+#define network_entropy_read wifi_device_random
 #elif defined(SOS2_BOARD_GTA7LITE)
 #include "gta7lite.h"
-#define network_entropy_read gta7lite_wifi_random
+#include "wifi_device.h"
+#define network_entropy_read wifi_device_random
 #else
 #define network_entropy_read entropy_read
 #endif
@@ -258,9 +260,11 @@ void network_init(const struct platform_devices *devices) {
     memset(dns_jobs, 0, sizeof(dns_jobs));
     memset(&interface, 0, sizeof(interface));
 #ifdef SOS2_BOARD_REDMI2
-    (void)redmi2_wifi_init(devices, &device);
+    (void)devices;
+    redmi2_wifi_init(&device);
 #elif defined(SOS2_BOARD_GTA7LITE)
-    (void)gta7lite_wifi_init(devices, &device);
+    (void)devices;
+    gta7lite_wifi_init(&device);
 #else
     (void)virtio_net_init(devices, &device);
     wifi_setup_init(0, 0);

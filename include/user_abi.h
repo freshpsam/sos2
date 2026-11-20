@@ -14,30 +14,35 @@
 #define WEB_STACK_BOTTOM 0x10ffb80000
 #define WEB_STACK_TOP    0x10fff80000
 #define USER_HEAP_BASE   0x1040000000
-#define USER_HEAP_END    0x1080000000
+#define USER_HEAP_END    0x10e0000000
 #else
+/* ARM32 maps the kernel and RAM where they lie, so the window ends where
+ * QEMU's RAM starts (the Redmi 2's starts at 0x80000000). */
 #define USER_BASE        0x10000000u
-#define USER_END         0x30000000u
+#define USER_END         0x40000000u
 #define WEB_IMAGE_BASE   0x11000000u
 #define WEB_IMAGE_END    0x18000000u
 #define USER_JIT_BASE    0x18000000u
 #define USER_JIT_END     0x1a000000u
-#define WEB_STACK_BOTTOM 0x2fd80000u
-#define WEB_STACK_TOP    0x2ff80000u
-#define USER_HEAP_BASE   0x20000000u
-#define USER_HEAP_END    0x2f000000u
+#define WEB_STACK_BOTTOM 0x3fd80000u
+#define WEB_STACK_TOP    0x3ff80000u
+#define USER_HEAP_BASE   0x1a000000u
+#define USER_HEAP_END    0x3f000000u
 #endif
 /* A web page process starts with x2 (r2 on ARM32) pointing to the sos2.jsc=
  * boot argument's value above its initial stack (NUL-terminated, at most this
  * many bytes with the NUL), or 0 without one. */
 #define USER_ENGINE_OPTIONS_MAX 128u
-/* Each process's memory: 192 MiB, or 384 MiB for the 64-bit engine, whose
- * pages take 1.6-1.8 times as much (wider objects, a committed JIT pool and
- * structure heap). */
+/* Each process's memory: 544 MiB on ARM32, its whole mapping window, or 1 GiB
+ * for the 64-bit engine, whose pages take more (wider objects, a committed JIT
+ * pool and structure heap). Heavy sites need most of it: Reddit's page passes
+ * 135 MiB on ARM32 and 340 MiB on AArch64 within two minutes, and YouTube
+ * playing a video holds 475 MiB on ARM32 (481 MiB at its peak) and 581 MiB on
+ * AArch64. */
 #ifdef __aarch64__
-#define USER_PAGE_QUOTA      98304u
+#define USER_PAGE_QUOTA      262144u
 #else
-#define USER_PAGE_QUOTA      49152u
+#define USER_PAGE_QUOTA      139264u
 #endif
 #define SYS_EXIT             0
 #define SYS_YIELD            1
@@ -102,13 +107,17 @@
  * visible to instruction fetch, which AArch32 user mode cannot do itself.
  * Handled on the calling CPU without ending its slice; 0 or USER_EINVAL. */
 #define SYS_ICACHE_SYNC      72
-#define SYS_COUNT            73
+/* Audio output: sos2_audio (sdk/include/sos2/services.h). */
+#define SYS_AUDIO            73
+#define SYS_COUNT            74
 #define USER_FRAME_RECTS     12u
 #define USER_SURFACE_VISIBLE 1u
 /* The display shows the page's GPU frames (USER_GPU_PRESENT). Once clear, a
  * failed GPU, it stays clear: the page must present CPU frames. */
 #define USER_SURFACE_GPU_FRAMES 2u
-#define USER_THREAD_LIMIT       16u
+/* Threads per process: a page's GC markers, compiler threads, image decoders
+ * and its sites' workers. */
+#define USER_THREAD_LIMIT       64u
 /* A thread's stack pointer and stack size alignment. */
 #ifdef __aarch64__
 #define USER_STACK_ALIGN 16u
@@ -119,6 +128,10 @@
 #define USER_PROT_READ          1u
 #define USER_PROT_WRITE         2u
 #define USER_PROT_EXEC          4u
+/* SYS_VM_ALLOC_RANGE's flags: USER_PROT_* and, from this bit, log2 of the
+ * mapping's alignment in pages, up to USER_MAP_ALIGN_MAX (1 GiB). */
+#define USER_MAP_ALIGN_SHIFT    8u
+#define USER_MAP_ALIGN_MAX      18u
 #define USER_FILE_HANDLES       64u
 #define USER_PATH_MAX           127u
 #define USER_FILE_READ_MAX      65536u
@@ -159,6 +172,30 @@ struct user_fs_info {
 
 struct user_memory_info {
     uint32_t page_size, current_pages, peak_pages, quota_pages, available_pages;
+};
+
+/* SYS_AUDIO: one output stream per process, of interleaved signed 16-bit
+ * stereo frames at USER_AUDIO_RATE; the kernel mixes the open streams. OPEN
+ * starts the stream empty; WRITE queues up to count frames from argument and
+ * returns how many it took, never blocking (0 while the queue is full); FLUSH
+ * drops the queued frames; PAUSE holds the stream (argument 1) or resumes it
+ * (0); STATUS fills a struct user_audio_status at argument. Without an audio
+ * device a stream still plays, silently, at the same rate. */
+#define USER_AUDIO_RATE     48000u
+#define USER_AUDIO_CHANNELS 2u
+#define USER_AUDIO_OPEN     0u
+#define USER_AUDIO_WRITE    1u
+#define USER_AUDIO_FLUSH    2u
+#define USER_AUDIO_PAUSE    3u
+#define USER_AUDIO_STATUS   4u
+#define USER_AUDIO_CLOSE    5u
+#define USER_AUDIO_DEVICE   1u /* user_audio_status.flags: a device plays the streams */
+struct user_audio_status {
+    uint64_t played;   /* frames of this stream played since OPEN */
+    uint32_t queued;   /* frames waiting to play */
+    uint32_t capacity; /* the queue's size in frames */
+    uint32_t latency;  /* frames between leaving the queue and being heard */
+    uint32_t flags;
 };
 
 struct user_dir_entry {

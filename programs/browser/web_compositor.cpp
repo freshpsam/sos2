@@ -8,7 +8,12 @@
 #include <WebCore/FontRenderOptions.h>
 #include <WebCore/GraphicsContextSkia.h>
 #include <WebCore/GraphicsLayerClient.h>
+#include <WebCore/HTMLVideoElement.h>
 #include <WebCore/LayoutRect.h>
+#include <WebCore/MediaPlayer.h>
+#include <WebCore/RenderLayer.h>
+#include <WebCore/RenderLayerBacking.h>
+#include <WebCore/RenderVideo.h>
 #include <skia/core/SkCanvas.h>
 #include <skia/core/SkImage.h>
 #include <skia/core/SkM44.h>
@@ -20,8 +25,10 @@ namespace SOS2 {
 using namespace WebCore;
 
 namespace {
-// Every backing is RAM the page keeps; beyond this the view is painted flattened.
+// Every backing is RAM the page keeps; beyond this the layers are painted
+// flattened. A backing the page cannot get lowers the budget for a while.
 constexpr uint64_t backingBudgetBytes = 24 * 1024 * 1024;
+constexpr uint64_t budgetRetryUs = 5000000;
 constexpr uint64_t refineDelayUs = 150000;
 }
 
@@ -36,6 +43,7 @@ CompositingLayer::CompositingLayer(Type type, GraphicsLayerClient &client,
 
 CompositingLayer::~CompositingLayer() {
     willBeDestroyed();
+    m_compositor.m_videoLayers.remove(this);
     m_compositor.releaseBacking(*this);
     m_compositor.addDamage(m_drawnBounds);
     m_compositor.changed();
@@ -170,6 +178,27 @@ void CompositingLayer::setContentsToSolidColor(const Color &color) {
     noteChange();
 }
 
+void CompositingLayer::setContentsToPlatformLayer(PlatformLayer *, ContentsLayerPurpose purpose) {
+    bool video = purpose == ContentsLayerPurpose::Media;
+    if (video == m_showsVideo) return;
+    m_showsVideo = video;
+    m_videoFrame = nullptr;
+    if (video) m_compositor.m_videoLayers.add(this);
+    else m_compositor.m_videoLayers.remove(this);
+    noteChange();
+}
+
+// Only RenderLayerBacking gives a layer a video, and a video showing its
+// poster paints it instead.
+RefPtr<NativeImage> CompositingLayer::currentVideoFrame() const {
+    if (!m_showsVideo) return nullptr;
+    auto &backing = static_cast<RenderLayerBacking &>(client());
+    auto *video = dynamicDowncast<RenderVideo>(backing.owningLayer().renderer());
+    if (!video || !video->shouldDisplayVideo()) return nullptr;
+    RefPtr player = video->videoElement().player();
+    return player ? player->nativeImageForCurrentTime() : nullptr;
+}
+
 void CompositingLayer::flushCompositingState(const FloatRect &visibleRect) {
     // WebCore flushes the root of each frame's tree. Subframe roots are children
     // of the main tree, so updating from the attached root covers every layer.
@@ -179,12 +208,34 @@ void CompositingLayer::flushCompositingState(const FloatRect &visibleRect) {
 double CompositingLayer::backingStoreMemoryEstimate() const { return m_backing.computeByteSize(); }
 
 LayerCompositor::LayerCompositor(unsigned width, unsigned height)
-    : m_viewport(width, height), m_fullCoverPixels(2ull * width * height) { }
+    : m_viewport(width, height), m_fullCoverPixels(2ull * width * height),
+      m_budget(backingBudgetBytes) { }
 
 void LayerCompositor::setRoot(GraphicsLayer *root) {
     m_root = root;
     m_changed = true;
     m_damage = Region(IntRect(IntPoint(), m_viewport));
+    m_budget = backingBudgetBytes;
+    m_budgetRetryAt = 0;
+}
+
+// New video frames come from the player, not from WebCore's layer changes;
+// videos outside the tree (a hidden frame's) show none.
+bool LayerCompositor::needsComposite() const {
+    if (m_changed) return true;
+    for (auto *layer : m_videoLayers)
+        if (layer->m_reached && layer->currentVideoFrame() != layer->m_videoFrame) return true;
+    return false;
+}
+
+// A new frame: its contents rectangle is drawn again. The layer keeps the
+// frame it drew, so a new one can never reuse its address.
+bool LayerCompositor::takeVideoFrame(CompositingLayer &layer) {
+    auto frame = layer.currentVideoFrame();
+    if (frame == layer.m_videoFrame) return false;
+    layer.m_videoFrame = WTF::move(frame);
+    addDamage(layer.m_videoBounds);
+    return true;
 }
 
 void LayerCompositor::addDamage(const FloatRect &rect) {
@@ -201,20 +252,37 @@ void LayerCompositor::releaseBacking(CompositingLayer &layer) {
     layer.m_cover = {};
 }
 
+// First the layers' places and covers, then their backings: only once all
+// covers fit the budget is any painted.
 void LayerCompositor::update(CompositingLayer &root, const FloatRect &viewport) {
     uint64_t now = microseconds();
     bool refine = refinementDue(now);
     if (refine) m_refineAfter = 0;
+    if (m_budgetRetryAt && now >= m_budgetRetryAt) {
+        m_budget = backingBudgetBytes;
+        m_budgetRetryAt = 0;
+    }
     m_unsupported = false;
-    m_overBudget = false;
-    updateLayer(root, TransformationMatrix(), viewport, refine);
+    m_wantedBytes = 0;
+    for (auto *layer : m_videoLayers) layer->m_reached = false;
+    updateLayer(root, TransformationMatrix(), viewport);
+    // Without a feature or the memory to draw the layers, the caller paints
+    // them flattened, where they changed: no layer keeps a backing, and what
+    // WebCore repaints becomes damage. Switching either way redraws all once.
+    bool flatten = m_unsupported || m_wantedBytes > m_budget;
+    if (flatten != m_flatten) {
+        m_flatten = flatten;
+        m_damage = Region(IntRect(IntPoint(), m_viewport));
+        m_changed = true;
+    }
+    updateBackings(root, refine);
 }
 
 // Transforms follow WebCore's Skia compositor
 // (SkiaCompositingLayer::computeTransformsAndAnimations).
 void LayerCompositor::updateLayer(CompositingLayer &layer,
                                   const TransformationMatrix &parentForChildren,
-                                  const FloatRect &clip, bool refine) {
+                                  const FloatRect &clip) {
     if (layer.maskLayer() || layer.replicaLayer() || layer.blendMode() != BlendMode::Normal)
         m_unsupported = true;
 
@@ -233,12 +301,23 @@ void LayerCompositor::updateLayer(CompositingLayer &layer,
     layer.m_combined = combined;
 
     FloatRect bounds(FloatPoint(), size);
-    FloatRect visible;
-    if (auto inverse = combined.inverse())
-        visible =
-            intersection(FloatRect(inverse->clampedBoundsOfProjectedQuad(FloatQuad(clip))), bounds);
-    if (layer.drawsContent()) updateBacking(layer, visible, refine);
-    else releaseBacking(layer);
+    // Small layers keep all their pixels while any shows, so movement never
+    // repaints them. Larger ones keep only what the viewport shows.
+    IntRect cover;
+    if (layer.drawsContent() && !intersection(combined.mapRect(bounds), clip).isEmpty()) {
+        IntRect whole(IntPoint(), expandedIntSize(size));
+        if (uint64_t(whole.width()) * whole.height() <= m_fullCoverPixels) cover = whole;
+        else if (auto inverse = combined.inverse())
+            cover = intersection(
+                enclosingIntRect(inverse->clampedBoundsOfProjectedQuad(FloatQuad(clip))), whole);
+    }
+    layer.m_wantedCover = cover;
+    m_wantedBytes += uint64_t(cover.width()) * cover.height() * 4;
+    if (layer.m_showsVideo) {
+        layer.m_reached = true;
+        layer.m_videoBounds = intersection(combined.mapRect(layer.contentsRect()), clip);
+        if (takeVideoFrame(layer)) m_changed = true;
+    }
 
     FloatRect childClip = clip;
     if (layer.masksToBounds() && !layer.preserves3D()) {
@@ -249,7 +328,7 @@ void LayerCompositor::updateLayer(CompositingLayer &layer,
     layer.m_subtreeBounds = intersection(combined.mapRect(bounds), clip);
     for (auto &child : layer.children()) {
         auto &childLayer = static_cast<CompositingLayer &>(child.get());
-        updateLayer(childLayer, forChildren, childClip, refine);
+        updateLayer(childLayer, forChildren, childClip);
         layer.m_subtreeBounds.unite(childLayer.m_subtreeBounds);
     }
     // A change can move, reveal or hide anything in the subtree: redraw where
@@ -262,24 +341,25 @@ void LayerCompositor::updateLayer(CompositingLayer &layer,
     layer.m_drawnBounds = layer.m_subtreeBounds;
 }
 
-void LayerCompositor::updateBacking(CompositingLayer &layer, const FloatRect &visible,
-                                    bool refine) {
-    IntRect bounds(IntPoint(), expandedIntSize(layer.size()));
-    // Small layers keep all their pixels, so movement never repaints them.
-    // Larger ones keep only what the viewport shows.
-    IntRect cover = uint64_t(bounds.width()) * bounds.height() <= m_fullCoverPixels
-                        ? bounds
-                        : intersection(enclosingIntRect(visible), bounds);
+void LayerCompositor::updateBackings(CompositingLayer &layer, bool refine) {
+    IntRect cover = m_flatten ? IntRect() : layer.m_wantedCover;
     if (cover.isEmpty()) {
         releaseBacking(layer);
-        return;
+        // Flattened, what WebCore repainted is the caller's to paint. A layer
+        // out of view paints whole once it shows again.
+        if (m_flatten)
+            for (auto &rect : layer.m_dirty.rects())
+                addDamage(layer.m_combined.mapRect(FloatRect(rect)));
+        layer.m_dirty = Region();
+    } else if ((cover == layer.m_cover && !layer.m_backing.isNull()) || moveCover(layer, cover)) {
+        if (refine && layer.m_coverMoved) {
+            layer.m_dirty = Region(layer.m_cover);
+            layer.m_coverMoved = false;
+        }
+        paintDirty(layer);
     }
-    if ((cover != layer.m_cover || layer.m_backing.isNull()) && !moveCover(layer, cover)) return;
-    if (refine && layer.m_coverMoved) {
-        layer.m_dirty = Region(layer.m_cover);
-        layer.m_coverMoved = false;
-    }
-    paintDirty(layer);
+    for (auto &child : layer.children())
+        updateBackings(static_cast<CompositingLayer &>(child.get()), refine);
 }
 
 bool LayerCompositor::moveCover(CompositingLayer &layer, const IntRect &cover) {
@@ -295,19 +375,20 @@ bool LayerCompositor::moveCover(CompositingLayer &layer, const IntRect &cover) {
         }
     } else {
         uint64_t bytes = uint64_t(cover.width()) * cover.height() * 4;
-        uint64_t oldBytes = layer.m_backing.isNull() ? 0 : layer.m_backing.computeByteSize();
-        if (m_backingBytes - oldBytes + bytes > backingBudgetBytes) {
-            m_overBudget = true;
-            releaseBacking(layer);
-            return false;
-        }
         SkBitmap backing;
         auto info =
             SkImageInfo::Make(cover.width(), cover.height(), kBGRA_8888_SkColorType,
                               layer.contentsOpaque() ? kOpaque_SkAlphaType : kPremul_SkAlphaType);
         if (!backing.tryAllocPixels(info)) {
-            m_overBudget = true;
+            // The page has no more memory: what it holds becomes its budget
+            // until it may have freed some, and the caller paints the layers
+            // flattened meanwhile.
             releaseBacking(layer);
+            m_budget = std::min(m_budget, m_backingBytes);
+            m_budgetRetryAt = microseconds() + budgetRetryUs;
+            m_flatten = true;
+            m_damage = Region(IntRect(IntPoint(), m_viewport));
+            m_changed = true;
             return false;
         }
         if (!kept.isEmpty())
@@ -360,31 +441,92 @@ void LayerCompositor::paintDirty(CompositingLayer &layer) {
     m_changed = true;
 }
 
-std::optional<Region> LayerCompositor::composite(SkCanvas &canvas) {
+Composition LayerCompositor::composite(SkCanvas &canvas) {
+    // Frames that came without a rendering update.
+    for (auto *layer : m_videoLayers)
+        if (layer->m_reached) takeVideoFrame(*layer);
     m_changed = false;
-    auto damage = std::exchange(m_damage, Region());
-    if (!m_root || m_unsupported || m_overBudget) {
-        // The flattened paint covers the viewport; redraw it all once layers return.
-        m_damage = Region(IntRect(IntPoint(), m_viewport));
-        return std::nullopt;
-    }
-    if (damage.isEmpty()) return damage;
-    // Draw only the damage: the rest of the surface already shows these layers.
+    Composition composition{std::exchange(m_damage, Region()), m_flatten || !m_root};
+    auto &damage = composition.damage;
+    if (damage.isEmpty()) return composition;
+    // Sparse damage goes rectangle by rectangle, dense damage as its bounds.
     auto rects = damage.rects();
     auto extent = damage.bounds();
     if (coalesceDamage(rects.size(), damage.totalArea(), extent.size().unclampedArea())) {
         damage = Region(extent);
         rects = {extent};
     }
+    if (composition.flatten) return composition;
+    // Draw only the damage: the rest of the surface already shows these layers.
+    auto &root = static_cast<CompositingLayer &>(*m_root);
     for (auto &rect : rects) {
         canvas.save();
         canvas.resetMatrix();
         canvas.clipRect(SkRect::MakeXYWH(rect.x(), rect.y(), rect.width(), rect.height()));
-        canvas.clear(SK_ColorWHITE);
-        drawLayer(canvas, static_cast<CompositingLayer &>(*m_root));
+        // Under a layer that hides the whole rectangle (a playing video),
+        // nothing is drawn, not even the white.
+        Vector<CompositingLayer *> path;
+        m_occluder.clear();
+        findOccluder(root, rect, path);
+        m_occluded = !m_occluder.isEmpty();
+        if (!m_occluded) canvas.clear(SK_ColorWHITE);
+        drawLayer(canvas, root, rect);
         canvas.restore();
+        m_occluded = false;
     }
-    return damage;
+    return composition;
+}
+
+// The topmost layer that draws all of `damage` opaquely, with no group
+// opacity, 3D or clip short of the damage above it. Its path from the root
+// goes to m_occluder.
+void LayerCompositor::findOccluder(CompositingLayer &layer, const IntRect &damage,
+                                   Vector<CompositingLayer *> &path) {
+    // drawLayer skips at least what this skips, so it reaches the occluder.
+    bool contentsVisible = layer.contentsAreVisible();
+    if ((!contentsVisible && layer.children().isEmpty()) ||
+        layer.renderingIsSuppressedIncludingDescendants() || layer.opacity() < 1 ||
+        layer.preserves3D() || !layer.m_subtreeBounds.intersects(damage))
+        return;
+    path.append(&layer);
+    if (contentsVisible && coversOpaquely(layer, damage)) m_occluder = path;
+    // As drawLayer clips the children.
+    auto clipping = layer.contentsClippingRect();
+    bool clipsToContents =
+        layer.contentsRectClipsDescendants() &&
+        (clipping.isRounded() || !clipping.rect().contains(layer.contentsRect()));
+    bool clipped = false;
+    if (clipsToContents || layer.masksToBounds()) {
+        FloatRect clip = clipsToContents
+                             ? clipping.rect()
+                             : FloatRect(FloatPoint(layer.boundsOrigin()), layer.size());
+        clipped = (clipsToContents && clipping.isRounded()) ||
+                  !layer.m_combined.isIdentityOrTranslation() ||
+                  !layer.m_combined.mapRect(clip).contains(damage);
+    }
+    if (!clipped)
+        for (auto &child : layer.children())
+            findOccluder(static_cast<CompositingLayer &>(child.get()), damage, path);
+    path.removeLast();
+}
+
+bool LayerCompositor::coversOpaquely(const CompositingLayer &layer, const IntRect &damage) const {
+    auto &matrix = layer.m_combined;
+    if (!matrix.isIdentityOrTranslation() || matrix.m43()) return false;
+    FloatSize offset(std::round(matrix.m41()), std::round(matrix.m42()));
+    auto image = layer.m_videoFrame ? layer.m_videoFrame->platformImage() : nullptr;
+    auto clipping = layer.contentsClippingRect();
+    if (image && image->isOpaque() && !clipping.isRounded()) {
+        auto shown = intersection(layer.contentsRect(), clipping.rect());
+        shown.move(offset);
+        if (shown.contains(damage)) return true;
+    }
+    if (layer.contentsOpaque() && !layer.m_backing.isNull()) {
+        FloatRect shown(layer.m_cover);
+        shown.move(offset);
+        if (shown.contains(damage)) return true;
+    }
+    return false;
 }
 
 // Layers that are only translated draw at whole pixels: exact copies, and text
@@ -397,13 +539,21 @@ static SkM44 drawingMatrix(const TransformationMatrix &matrix, bool &exact) {
 
 // Paint order and clipping follow SkiaCompositingLayer::recursivePaint. The
 // canvas matrix is identity between layers; 3D transforms are drawn flattened.
-void LayerCompositor::drawLayer(SkCanvas &canvas, CompositingLayer &layer) {
+void LayerCompositor::drawLayer(SkCanvas &canvas, CompositingLayer &layer, const IntRect &damage) {
     // Hidden contents (visibility: hidden) still draw their children, which
-    // may be visible (SkiaCompositingLayer::isVisible).
+    // may be visible (SkiaCompositingLayer::isVisible). Subtrees away from
+    // the damage draw nothing there.
     bool contentsVisible = layer.contentsAreVisible();
     if ((!contentsVisible && layer.children().isEmpty()) ||
-        layer.renderingIsSuppressedIncludingDescendants() || layer.opacity() <= 0)
+        layer.renderingIsSuppressedIncludingDescendants() || layer.opacity() <= 0 ||
+        !layer.m_subtreeBounds.intersects(damage))
         return;
+    // Before the occluder, only its path is walked, for the clips.
+    if (m_occluded) {
+        if (!m_occluder.contains(&layer)) return;
+        if (&layer == m_occluder.last()) m_occluded = false;
+        else contentsVisible = false;
+    }
     float alpha = layer.opacity();
     bool group = alpha < 1 && !layer.children().isEmpty();
     int saved = canvas.getSaveCount();
@@ -432,7 +582,7 @@ void LayerCompositor::drawLayer(SkCanvas &canvas, CompositingLayer &layer) {
             canvas.resetMatrix();
         }
         for (auto &child : layer.children())
-            drawLayer(canvas, static_cast<CompositingLayer &>(child.get()));
+            drawLayer(canvas, static_cast<CompositingLayer &>(child.get()), damage);
     }
     canvas.restoreToCount(saved);
 }
@@ -456,12 +606,30 @@ void LayerCompositor::drawContents(SkCanvas &canvas, CompositingLayer &layer, fl
             integer ? SkSamplingOptions() : SkSamplingOptions(SkFilterMode::kLinear);
         canvas.drawImage(image, layer.m_cover.x(), layer.m_cover.y(), sampling, &imagePaint);
     }
-    if (layer.m_solidColor.isValid() && layer.m_solidColor.isVisible()) {
-        auto clipping = layer.contentsClippingRect();
-        if (clipping.isRounded() || !clipping.rect().contains(layer.contentsRect()))
-            canvas.clipRRect(SkRRect(clipping), !integer);
+    bool solidColor = layer.m_solidColor.isValid() && layer.m_solidColor.isVisible();
+    if (!solidColor && !layer.m_videoFrame) {
+        canvas.restore();
+        return;
+    }
+    auto clipping = layer.contentsClippingRect();
+    if (clipping.isRounded() || !clipping.rect().contains(layer.contentsRect()))
+        canvas.clipRRect(SkRRect(clipping), !integer);
+    if (solidColor) {
         paint.setColor(SkColor(layer.m_solidColor.colorWithAlphaMultipliedBy(alpha)));
         canvas.drawRect(SkRect(layer.contentsRect()), paint);
+    }
+    if (auto image = layer.m_videoFrame ? layer.m_videoFrame->platformImage() : nullptr) {
+        // Frames come at the size the page shows them (MediaRendererSOS2::
+        // frameSize): at whole pixels they are copied, never filtered.
+        SkPaint imagePaint;
+        imagePaint.setAlphaf(alpha);
+        auto contents = layer.contentsRect();
+        bool copied = integer && contents == FloatRect(enclosingIntRect(contents)) &&
+                      contents.size() == FloatSize(image->width(), image->height());
+        canvas.drawImageRect(image, SkRect::Make(image->bounds()), SkRect(contents),
+                             copied ? SkSamplingOptions()
+                                    : SkSamplingOptions(SkFilterMode::kLinear),
+                             &imagePaint, SkCanvas::kFast_SrcRectConstraint);
     }
     canvas.restore();
 }

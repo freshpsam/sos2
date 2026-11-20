@@ -9,7 +9,7 @@
 
 namespace SOS2::State {
 constexpr size_t originQuota = 5 * 1024 * 1024;
-constexpr size_t profileQuota = 8 * 1024 * 1024;
+constexpr size_t profileQuota = 5 * 1024 * 1024; // within the 6 MiB database
 using Items = std::vector<std::pair<std::u16string, std::u16string>>;
 
 // Hosts supplied by WebKit are canonical ASCII/IDNA. Cookie sites are schemeful
@@ -35,11 +35,15 @@ struct CookieContext {
 
 class Store {
 public:
-    explicit Store(const std::string &path);
+    // The database pages share at path, in /tmp, and its durable copy.
+    Store(const std::string &path, const std::string &durable);
     ~Store();
     Store(const Store &) = delete;
     Store &operator=(const Store &) = delete;
     bool available();
+    // Brings the durable copy up to date once this page's changes have
+    // settled; cheap when nothing is due. From the main loop.
+    void save();
     // The version of an origin's local storage, which changes when a page,
     // possibly another one, changes its items. Unless Cached, first catch up
     // with the other pages: at most every 250 ms, or Now.

@@ -1,4 +1,5 @@
 #include "boot_memory.h"
+#include "page_alloc.h"
 
 static struct memory_region obstacle(const struct platform_devices *d, unsigned i, uintptr_t dtb,
                                      uintptr_t ks, uintptr_t ke) {
@@ -90,17 +91,16 @@ static bool arena(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
 
 bool redmi2_browser_arena(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
                           uintptr_t ke, uintptr_t *out, size_t *size) {
-    return arena(d, dtb, ks, ke, 256ull << 20, 384ull << 20, out, size);
+    return arena(d, dtb, ks, ke, 256ull << 20, (uint64_t)PAGE_POOL_PAGES * PAGE_SIZE, out, size);
 }
 
 #ifdef __aarch64__
-/* A free stretch of RAM below 4 GiB, clear of the firmware's reservations, the
- * kernel, the DTB, the framebuffer, the initrd and `extra`: the largest, or
- * with `fit` the smallest that holds that many bytes. */
-static bool free_stretch(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
-                         uintptr_t ke, struct memory_region extra, uint64_t fit, uint64_t *out,
-                         uint64_t *size) {
-    uint64_t best = 0, best_size = 0;
+/* Calls visit for each free stretch of RAM below 4 GiB, clear of the
+ * firmware's reservations, the kernel, the DTB, the framebuffer, the initrd
+ * and `extra`; false on an impossible region. */
+static bool free_stretches(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
+                           uintptr_t ke, struct memory_region extra,
+                           void (*visit)(void *, uint64_t start, uint64_t length), void *context) {
     unsigned obstacles = (unsigned)d->reserved_region_count + 5;
     for (unsigned n = 0; n < d->ram_region_count; ++n) {
         struct memory_region ram = d->ram_regions[n];
@@ -125,41 +125,88 @@ static bool free_stretch(const struct platform_devices *d, uintptr_t dtb, uintpt
                 continue;
             }
             uint64_t length = (gap_end & ~4095ull) - at;
-            if (fit ? length >= fit && (!best_size || length < best_size) : length > best_size) {
-                best = at;
-                best_size = length;
-            }
+            if (length) visit(context, at, length);
             if (gap_end == end) break;
             at = gap_end & ~4095ull;
             if (at < gap_end) at += 4096;
         }
     }
-    if (!best_size) return false;
-    *out = best;
-    *size = best_size;
     return true;
 }
 
-bool boot_memory_pool(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks, uintptr_t ke,
-                      uintptr_t resources, size_t resource_size, uint64_t maximum, uintptr_t *out,
-                      size_t *size) {
-    uint64_t start, length;
-    if (!free_stretch(d, dtb, ks, ke, (struct memory_region){resources, resource_size}, 0, &start,
-                      &length))
-        return false;
-    *out = (uintptr_t)start;
-    *size = (size_t)(length < maximum ? length : maximum);
-    return true;
+struct pool_search {
+    struct memory_region *regions;
+    unsigned count;
+};
+
+/* Keeps the BOOT_POOL_REGIONS largest stretches of at least 1 MiB. */
+static void pool_visit(void *context, uint64_t start, uint64_t length) {
+    struct pool_search *s = context;
+    if (length < (1u << 20)) return;
+    unsigned at = s->count;
+    if (at == BOOT_POOL_REGIONS) {
+        at = 0;
+        for (unsigned i = 1; i < s->count; ++i)
+            if (s->regions[i].size < s->regions[at].size) at = i;
+        if (s->regions[at].size >= length) return;
+    } else {
+        ++s->count;
+    }
+    s->regions[at] = (struct memory_region){start, length};
+}
+
+unsigned boot_memory_pool(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
+                          uintptr_t ke, uintptr_t resources, size_t resource_size, uint64_t span,
+                          struct memory_region regions[BOOT_POOL_REGIONS]) {
+    struct pool_search search = {regions, 0};
+    if (!free_stretches(d, dtb, ks, ke, (struct memory_region){resources, resource_size},
+                        pool_visit, &search) ||
+        !search.count)
+        return 0;
+    /* In address order, then within `span` bytes from the first's start to
+     * the last's end, dropping the smaller stretch at either end first. */
+    for (unsigned i = 1; i < search.count; ++i)
+        for (unsigned j = i; j && regions[j - 1].start > regions[j].start; --j) {
+            struct memory_region swap = regions[j];
+            regions[j] = regions[j - 1];
+            regions[j - 1] = swap;
+        }
+    unsigned first = 0, count = search.count;
+    while (regions[first + count - 1].start + regions[first + count - 1].size -
+               regions[first].start >
+           span) {
+        if (count == 1) {
+            regions[first].size = span;
+            break;
+        }
+        if (regions[first].size < regions[first + count - 1].size) ++first;
+        --count;
+    }
+    for (unsigned i = 0; i < count; ++i) regions[i] = regions[first + i];
+    return count;
+}
+
+struct fit_search {
+    uint64_t fit, best, best_size;
+};
+
+static void fit_visit(void *context, uint64_t start, uint64_t length) {
+    struct fit_search *s = context;
+    if (length >= s->fit && (!s->best_size || length < s->best_size)) {
+        s->best = start;
+        s->best_size = length;
+    }
 }
 
 bool boot_memory_resources(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
                            uintptr_t ke, size_t size, uintptr_t *out) {
-    uint64_t start, length, pages = ((uint64_t)size + 4095) & ~4095ull;
+    uint64_t pages = ((uint64_t)size + 4095) & ~4095ull;
+    struct fit_search search = {pages, 0, 0};
     if (!size ||
-        !free_stretch(d, dtb, ks, ke, (struct memory_region){0, 0}, pages, &start, &length) ||
-        !boot_memory_available(d, start, pages, dtb, ks, ke, true))
+        !free_stretches(d, dtb, ks, ke, (struct memory_region){0, 0}, fit_visit, &search) ||
+        !search.best_size || !boot_memory_available(d, search.best, pages, dtb, ks, ke, true))
         return false;
-    *out = (uintptr_t)start;
+    *out = (uintptr_t)search.best;
     return true;
 }
 #endif

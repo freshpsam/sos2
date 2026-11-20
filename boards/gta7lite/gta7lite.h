@@ -21,6 +21,39 @@ bool gta7lite_rtc_read(uint32_t *seconds);
 /* The battery's level, estimated from its voltage, and whether the MT6370
  * charges it, as LK left the charger configured. */
 bool gta7lite_battery_read(struct battery_view *out);
+/* An MT6357 register read; and a register's bits of mask set to value's,
+ * the rest kept (a plain write for a mask of 0xffff): the audio codec, its
+ * jack detection and clock buffer (audio.c), the CPUs' supplies
+ * (cpu_clock.c). */
+bool gta7lite_pmic_read(uint16_t address, uint16_t *value);
+bool gta7lite_pmic_update(uint16_t address, uint16_t value, uint16_t mask);
+/* A volume key (keys.c): +1 for Volume Up, -1 for Volume Down, once per
+ * press and repeated while held; 0 otherwise. */
+int gta7lite_volume_key(void);
+
+/* The volume of the output in use (audio.c), from 0, silent, to
+ * GTA7LITE_VOLUME_STEPS, after stepping it by step; and whether that output
+ * is headphones in the jack, which turns the speakers off. */
+enum { GTA7LITE_VOLUME_STEPS = 15 };
+
+unsigned gta7lite_audio_volume(int step);
+bool gta7lite_audio_headphones(void);
+
+/* I2C (i2c.c): one register written, or read, of the device at a 7-bit
+ * address. I2C5 is as LK left it; I2C3, whose registers for the AP are its
+ * channel 0x100 in (the stock DT's ch_offset_default), needs its init. */
+enum { GTA7LITE_I2C3 = 0x1100f100, GTA7LITE_I2C5 = 0x11016000 };
+
+bool gta7lite_i2c_transfer(uintptr_t bus, uint8_t device, uint8_t reg, bool write, uint8_t *value);
+void gta7lite_i2c3_init(void);
+/* The CPU clocks (cpu_clock.c): MediaTek's top operating point, the supply
+ * raised first, or LK's clocks back, the supply lowered last. False when the
+ * clocks or supply are not as LK or the last change left them, or a supply
+ * change does not confirm; the clocks are not changed again then. */
+bool gta7lite_cpu_clock(bool fast);
+/* The clocks' governor, from the main loop with process_user_us(): fast
+ * while pages use a tenth of a CPU, LK's clocks after a second below. */
+void gta7lite_cpu_clock_poll(uint64_t user_us);
 /* The MT6370 (mt6370.c). The backlight's enable: off turns it off when LK
  * left it on, on restores it. The charger's state: 0 ready, 1 charging,
  * 2 done, 3 fault, or -1 when the chip does not answer. */
@@ -99,10 +132,7 @@ const char *gta7lite_connsys_start(void (*yield)(void));
 /* Its supplies (pmic.c): VCN18 and VCN33, then VCN28 for its crystal. */
 bool gta7lite_connsys_supplies(void);
 bool gta7lite_connsys_crystal_supply(void);
-/* The network device (wifi.c) and its randomness. */
+/* The radio of the shared Wi-Fi device (wifi.c, include/wifi_device.h). */
 struct net_device;
-bool gta7lite_wifi_init(const struct platform_devices *, struct net_device *);
-size_t gta7lite_wifi_random(void *, size_t);
-/* Standby keeps the station off its network and lets the chip sleep. */
-void gta7lite_wifi_standby(bool on);
+void gta7lite_wifi_init(struct net_device *);
 #endif

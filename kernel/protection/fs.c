@@ -10,7 +10,10 @@
 enum {
     BLOCK = 4096,
     CACHE = 512,
-    TEMP_BYTES = 1024 * 1024,
+    /* The browser keeps its working cookie and storage database here
+     * (programs/browser/web_state.cpp): up to 6 MiB, with room for the two
+     * more copies littlefs makes while rewriting it and a journal. */
+    TEMP_BYTES = 24 * 1024 * 1024,
     RESERVE_BYTES = 64 * 1024,
     INTERNAL_PATH = 160,
     RESOURCE = 1,
@@ -62,8 +65,11 @@ static struct fs_pool *pools;
  * Paths are canonical and cannot climb out of a profile's directory, so
  * nothing inside a profile is hidden. */
 enum { DATA, TEMP, VOLUMES };
-static struct volume volumes[VOLUMES];
-static unsigned char temporary[TEMP_BYTES] __attribute__((aligned(16)));
+/* Cached: littlefs reads its caches a byte at a time (CRCs, metadata), which
+ * in the kernel's uncached data made every file operation milliseconds long.
+ * Only CPU 0 runs the file system. */
+static struct volume volumes[VOLUMES] __attribute__((section(".cpu_private")));
+static unsigned char *temporary;
 /* CPU-only buffers are cached: every file read and write copies through them. */
 static unsigned char *transfer;
 
@@ -213,6 +219,9 @@ void fs_init(const struct platform_devices *devices) {
         vm_cpu_free(session_memory, SESSION_BYTES / PAGE_SIZE);
         session_memory = 0;
     }
+    if (temporary) vm_cpu_free(temporary, TEMP_BYTES / PAGE_SIZE);
+    if (!(temporary = vm_cpu_alloc(TEMP_BYTES / PAGE_SIZE)))
+        panic("not enough memory for temporary storage");
     memset(volumes, 0, sizeof(volumes)); /* Per-process file tables are allocated zeroed. */
     /* Without its system store, which an eMMC failure stops, the installed
      * system has no volume. */
@@ -507,10 +516,22 @@ static struct inode *open_inode(struct fs_space *s, struct volume *v, const char
     return 0;
 }
 
+/* A file another process committed to (littlefs marks it "dusty"), reopened
+ * so that it reads the new contents and stops holding the old blocks. */
+static bool reopen(struct volume *v, struct inode *n, const char *relative) {
+    lfs_file_close(&v->fs, &n->file);
+    if (!lfs_file_opencfg(&v->fs, &n->file, relative, LFS_O_RDWR, &n->config)) return true;
+    n->lost = true;
+    n->path[0] = 0;
+    return false;
+}
+
 /* Each process has its own littlefs file for a path, which keeps the contents
  * it opened. So the lock hands contents over: releasing commits the holder's
- * writes, and taking reopens the taker's file if another process committed
- * to it since (littlefs marks it "dusty"), for all its descriptors. */
+ * writes and reopens the other processes' files, which would otherwise each
+ * keep a whole old copy (the browser's database in /tmp), and taking reopens
+ * the taker's file if another process committed to it since, for all its
+ * descriptors. */
 static int32_t file_lock(struct fs_space *s, const char *path, uint32_t take) {
     if (take > 1) return USER_EINVAL;
     char relative[INTERNAL_PATH];
@@ -533,19 +554,19 @@ static int32_t file_lock(struct fs_space *s, const char *path, uint32_t take) {
                          ? error(lfs_file_sync(&v->fs, &n->file))
                          : 0;
         l->holder = 0;
+        for (struct fs_pool *p = pools; p; p = p->next)
+            for (unsigned j = 0; j < USER_FILE_HANDLES; ++j) {
+                struct inode *other = &p->inodes[j];
+                if (other->volume == v && !other->lost && (other->file.flags & LFS_F_DUSTY) &&
+                    !strcmp(other->path, relative))
+                    (void)reopen(v, other, relative);
+            }
         return result;
     }
     if (!take) return USER_EINVAL;
     if (!unused || held >= PROCESS_FILE_LOCKS) return USER_EAGAIN;
     struct inode *n = open_inode(s, v, relative);
-    if (n && (n->file.flags & LFS_F_DUSTY)) {
-        lfs_file_close(&v->fs, &n->file);
-        if (lfs_file_opencfg(&v->fs, &n->file, relative, LFS_O_RDWR, &n->config)) {
-            n->lost = true;
-            n->path[0] = 0;
-            return USER_EIO;
-        }
-    }
+    if (n && (n->file.flags & LFS_F_DUSTY) && !reopen(v, n, relative)) return USER_EIO;
     unused->holder = s;
     unused->volume = v;
     strcpy(unused->path, relative);

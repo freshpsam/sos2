@@ -183,6 +183,10 @@ int sos2_update(unsigned op, void *data, uint32_t size) {
     return call3(SYS_UPDATE, op, sos2_ptr(data), size);
 }
 
+int sos2_audio(unsigned op, uintptr_t argument, uint32_t count) {
+    return call3(SYS_AUDIO, op, argument, count);
+}
+
 int sos2_browser_command(struct user_browser_command *out) {
     return sos2_result(call(SYS_BROWSER_COMMAND, sos2_ptr(out), sizeof(*out)));
 }
@@ -1110,6 +1114,16 @@ int sched_yield(void) { return sos2_result(call(SYS_YIELD, 0, 0)); }
 #define MAPPING_MAX (USER_HEAP_END - USER_HEAP_BASE)
 
 void *mmap(void *address, size_t length, int prot, int flags, int fd, off_t offset) {
+    /* MAP_ALIGNED(n), for anonymous memory only: the kernel places it at a
+     * multiple of 2^n bytes, with no slack to unmap afterwards. */
+    unsigned alignment = ((unsigned)flags & (unsigned)MAP_ALIGNMENT_MASK) >> MAP_ALIGNMENT_SHIFT;
+    flags &= ~MAP_ALIGNMENT_MASK;
+    if (alignment &&
+        (!(flags & MAP_ANONYMOUS) || alignment < 12 || alignment - 12 > USER_MAP_ALIGN_MAX)) {
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+    unsigned align_pages = alignment ? alignment - 12 : 0;
     if (!(flags & MAP_ANONYMOUS)) {
         int index = device_get(fd);
         if (index == -1) return MAP_FAILED;
@@ -1141,11 +1155,12 @@ void *mmap(void *address, size_t length, int prot, int flags, int fd, off_t offs
     /* address is a hint, not authorization to replace existing allocations. */
     sos2_word hint = sos2_ptr(address);
     sos2_status r = USER_EINVAL;
-    if (jit) r = call4(SYS_VM_ALLOC_RANGE, USER_JIT_BASE, USER_JIT_END, pages, permissions);
+    unsigned placed = permissions | align_pages << USER_MAP_ALIGN_SHIFT;
+    if (jit) r = call4(SYS_VM_ALLOC_RANGE, USER_JIT_BASE, USER_JIT_END, pages, placed);
     if (!jit && hint >= USER_HEAP_BASE && hint < SOS2_BRK_BASE &&
-        pages <= (SOS2_BRK_BASE - hint) / 4096)
+        pages <= (SOS2_BRK_BASE - hint) / 4096 && !(hint & ((4096u << align_pages) - 1)))
         r = call3(SYS_VM_MAP, hint, pages, permissions);
-    if (r < 0 && !jit) r = sos2_map(pages, permissions);
+    if (r < 0 && !jit) r = sos2_map(pages, placed);
     if (r < 0) {
         errno = sos2_errno((int)r);
         return MAP_FAILED;

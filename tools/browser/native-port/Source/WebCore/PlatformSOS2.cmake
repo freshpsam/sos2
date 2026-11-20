@@ -22,7 +22,8 @@ list(REMOVE_ITEM WebCore_SOURCES
 list(REMOVE_ITEM WebCore_PRIVATE_FRAMEWORK_HEADERS
     page/scrolling/coordinated/ScrollingTreeCoordinated.h
 )
-# YUV layer buffers carry GStreamer video frames; SOS2 builds without video.
+# YUV layer buffers carry GStreamer video frames; SOS2's media engine paints
+# its own (platform/graphics/sos2).
 list(REMOVE_ITEM WebCore_SOURCES
     platform/graphics/texmap/coordinated/CoordinatedPlatformLayerBufferYUV.cpp
 )
@@ -33,6 +34,7 @@ list(APPEND WebCore_PRIVATE_INCLUDE_DIRECTORIES
     "${WEBCORE_DIR}/platform/graphics/egl"
     "${WEBCORE_DIR}/platform/graphics/opengl"
     "${WEBCORE_DIR}/platform/graphics/texmap"
+    "${WEBCORE_DIR}/platform/graphics/sos2"
     "${WEBCORE_DIR}/platform/network/sos2"
     "${WEBCORE_DIR}/platform/video-codecs"
     "${THIRDPARTY_DIR}/ANGLE/include"
@@ -43,6 +45,12 @@ list(APPEND WebCore_SOURCES
     platform/text/Hyphenation.cpp
     platform/text/LocaleICU.cpp
     platform/unix/LoggingUnix.cpp
+    platform/graphics/sos2/ISOBMFFParserSOS2.cpp
+    platform/graphics/sos2/MediaPlayerPrivateSOS2.cpp
+    platform/graphics/sos2/MediaRendererSOS2.cpp
+    platform/graphics/sos2/MediaSampleSOS2.cpp
+    platform/graphics/sos2/MediaSourcePrivateSOS2.cpp
+    platform/graphics/sos2/SourceBufferPrivateSOS2.cpp
     platform/sos2/PlatformScreenSOS2.cpp
     platform/sos2/PlatformDisplaySOS2.cpp
     platform/graphics/PlatformDisplay.cpp

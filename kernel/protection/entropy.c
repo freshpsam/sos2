@@ -111,3 +111,10 @@ size_t entropy_read(void *output, size_t size) {
     if (!count) offer();
     return size;
 }
+
+/* Virtio's reads are offered and completed through the service worker. */
+size_t entropy_read_now(void *output, size_t size) {
+    (void)output;
+    (void)size;
+    return 0;
+}

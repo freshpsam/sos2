@@ -2,9 +2,15 @@
 #include "platform.h"
 #include "boot_progress.h"
 
+/* Each run's first entry holds its length: an allocation's, or with WITHHELD
+ * a gap between the pool's stretches of RAM. The rest of a run hold INTERIOR.
+ * Heads reject interior, partial and double frees, and searches skip runs
+ * whole. */
+#define WITHHELD 0x80000000u
+#define INTERIOR UINT32_MAX
+
 static uintptr_t pool;
 static unsigned capacity, available, first_free;
-/* Allocation lengths at each head reject interior, partial and double frees. */
 static uint32_t allocations[PAGE_POOL_PAGES];
 
 bool pages_init(void *start, size_t size) {
@@ -18,22 +24,55 @@ bool pages_init(void *start, size_t size) {
     return true;
 }
 
+static void mark(unsigned index, unsigned count, uint32_t head) {
+    allocations[index] = head;
+    for (unsigned n = 1; n < count; ++n) allocations[index + n] = INTERIOR;
+    available -= count;
+}
+
+/* The next run from a free page or a run's head. */
+static unsigned next_run(unsigned index) {
+    uint32_t head = allocations[index];
+    return index + (!head || head == INTERIOR ? 1 : head & ~WITHHELD);
+}
+
+static void advance_first_free(void) {
+    while (first_free < capacity && allocations[first_free]) first_free = next_run(first_free);
+}
+
+bool pages_withhold(void *start, size_t size) {
+    uintptr_t address = (uintptr_t)start;
+    if (address < pool || (address - pool) % PAGE_SIZE || !size || size % PAGE_SIZE) return false;
+    uintptr_t index = (address - pool) / PAGE_SIZE, count = size / PAGE_SIZE;
+    if (index >= capacity || count > capacity - index) return false;
+    for (uintptr_t n = 0; n < count; ++n)
+        if (allocations[index + n]) return false;
+    mark((unsigned)index, (unsigned)count, WITHHELD | (uint32_t)count);
+    advance_first_free();
+    return true;
+}
+
 void *pages_reserve(unsigned count, unsigned alignment) {
     if (!count || count > available || !alignment || (alignment & (alignment - 1)) ||
         alignment > PAGE_POOL_PAGES)
         return 0;
-    for (unsigned i = first_free; i <= capacity - count; ++i) {
-        if (((pool / PAGE_SIZE + i) & (alignment - 1)) || allocations[i]) continue;
+    for (unsigned i = first_free; i <= capacity - count;) {
+        if (allocations[i]) {
+            i = next_run(i);
+            continue;
+        }
+        if ((pool / PAGE_SIZE + i) & (alignment - 1)) {
+            ++i;
+            continue;
+        }
         unsigned n = 0;
         while (n < count && !allocations[i + n]) ++n;
         if (n != count) {
             i += n;
             continue;
         }
-        allocations[i] = count;
-        for (n = 1; n < count; ++n) allocations[i + n] = UINT32_MAX;
-        available -= count;
-        while (first_free < capacity && allocations[first_free]) ++first_free;
+        mark(i, count, count);
+        advance_first_free();
         return (void *)(pool + (uintptr_t)i * PAGE_SIZE);
     }
     return 0;

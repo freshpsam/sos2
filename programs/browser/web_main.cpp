@@ -287,10 +287,14 @@ public:
         schedule.updatePending = true;
     }
 
-    // Composite for animated transforms and opacity. will-change and backdrop
-    // filters composite regardless; fixed and overflow scrolling stay painted.
+    // Composite for animated transforms and opacity, and on the CPU for video,
+    // whose frames the compositor draws without repainting the page.
+    // will-change and backdrop filters composite regardless; fixed and
+    // overflow scrolling stay painted.
     CompositingTriggerFlags allowedCompositingTriggers() const final {
-        return AnimationTrigger | AnimatedOpacityTrigger;
+        CompositingTriggerFlags triggers = AnimationTrigger | AnimatedOpacityTrigger;
+        if (!compositors.usesGPU()) triggers |= VideoTrigger;
+        return triggers;
     }
 };
 
@@ -299,9 +303,8 @@ int main() {
     mi_option_set(mi_option_purge_delay, -1);
     // SOS2 commits memory when it is mapped, so JavaScriptCore's address space
     // reservations (the JIT pool, and on 64-bit the structure heap) are cut to
-    // what pages use. A process has 16 threads and WebKit stops a page that
-    // cannot start one, so GC marking adds at most 3 threads and the JIT
-    // worklist 2, leaving room for workers and image decoders.
+    // what pages use. GC marking and the JIT worklist keep JavaScriptCore's
+    // defaults: a marker per CPU the page can use and three compiler threads.
     // ScriptController's own JSC::initialize() below then does nothing.
     JSC::initialize([] {
 #if CPU(ADDRESS64)
@@ -312,15 +315,7 @@ int main() {
         // Pages compile under 1 MiB of code (Wikipedia: 0.9 MiB), and every
         // page maps the whole pool.
         JSC::Options::jitMemoryReservationSize() = 4 * MB;
-        // Pages map memory only in the SDK's 128 MiB mmap range: the rest of
-        // the quota that ramSize() reports is the newlib break, which the
-        // engine's allocator never grows (sdk/runtime/internal.h). The heap
-        // grows by the smaller figure.
-        JSC::Options::forceRAMSize() = 128 * MB;
 #endif
-        JSC::Options::numberOfGCMarkers() = std::min(JSC::Options::numberOfGCMarkers(), 4u);
-        JSC::Options::minNumberOfWorklistThreads() = 1;
-        JSC::Options::maxNumberOfWorklistThreads() = 2;
         // The sos2.jsc= boot argument, such as useDFGJIT=false (LLInt and the
         // baseline JIT) or useJIT=false (LLInt alone); a bad one stops here.
         if (const char* options = sos2_engine_options())
@@ -333,8 +328,10 @@ int main() {
     FrameSchedule schedule;
     // Before the page: layers keep pointers to their compositor until destroyed.
     Compositors compositors;
-    auto configuration =
-        pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());
+    // An identifier gives the page a media session manager, without which
+    // media elements never start playing.
+    auto configuration = pageConfigurationWithEmptyClients(PageIdentifier::generate(),
+                                                           PAL::SessionID::defaultSessionID());
     configuration.chromeClient = makeUniqueRef<NativeChromeClient>(schedule, compositors);
     SOS2::configureInput(configuration);
     SOS2::configureNavigation(configuration);
@@ -434,6 +431,7 @@ int main() {
         RunLoop::cycle();
         SOS2::handleBrowserCommands(page.get());
         SOS2::HTTP::closeIdleConnections();
+        SOS2::saveStorage();
         // Bound work per frame even when a device or page produces continuous input.
         for (unsigned budget = 0; budget < 64; ++budget) {
             user_input_event event;
@@ -515,16 +513,10 @@ int main() {
                 // walks the render tree (SOS2::coalesceDamage). The strips a fast
                 // scroll exposed paint apart even when dense; the idle refinement
                 // reconciles Skia's clip-dependent coverage of curved edges.
-                if (composited) {
-                    // The compositor redraws the viewport; the comparison below
-                    // finds the pixels that changed.
-                    presentation = IntRect(0, 0, pageWidth, pageHeight);
-                    rectangles.clear();
-                    rectangles.append(presentation);
-                } else if (!rectangles.isEmpty() &&
-                           SOS2::coalesceDamage(rectangles.size(), damage.totalArea(),
-                                                damage.bounds().size().unclampedArea(),
-                                                !schedule.copiedSincePaint)) {
+                if (!composited && !rectangles.isEmpty() &&
+                    SOS2::coalesceDamage(rectangles.size(), damage.totalArea(),
+                                         damage.bounds().size().unclampedArea(),
+                                         !schedule.copiedSincePaint)) {
                     damage = Region(damage.bounds());
                     rectangles.clear();
                     rectangles.append(damage.bounds());
@@ -539,19 +531,16 @@ int main() {
                                         view.layoutContext().inPaintableState() &&
                                         !view.needsLayout();
                 schedule.painting = true;
-                std::optional<Region> composed;
-                if (composited && (composed = compositor->composite(*canvas))) {
-                    // Only the compositor's damage changed; compare and present just
-                    // that. A scroll hint shifts every presented pixel in its
-                    // rectangle, so then the whole viewport is compared.
-                    rectangles = composed->rects();
-                    presentation = composed->bounds();
-                    if (schedule.presentScroll.rect.width) {
-                        presentation = IntRect(0, 0, pageWidth, pageHeight);
-                        rectangles.clear();
-                        rectangles.append(presentation);
-                    }
-                } else {
+                // Only the compositor's damage changed: it draws it, or leaves
+                // it to be painted flattened below.
+                bool flatten = false;
+                if (composited) {
+                    auto composition = compositor->composite(*canvas);
+                    flatten = composition.flatten;
+                    rectangles = composition.damage.rects();
+                    presentation = composition.damage.bounds();
+                }
+                if (!composited || flatten) {
                     // A composited tree the compositor cannot draw paints flattened.
                     auto behavior = view.paintBehavior();
                     if (composited)
@@ -570,6 +559,13 @@ int main() {
                         canvas->restore();
                     }
                     if (composited) view.setPaintBehavior(behavior);
+                }
+                // A scroll hint shifts every presented pixel in its rectangle,
+                // so then the whole viewport is compared.
+                if (composited && schedule.presentScroll.rect.width) {
+                    presentation = IntRect(0, 0, pageWidth, pageHeight);
+                    rectangles.clear();
+                    rectangles.append(presentation);
                 }
                 schedule.painting = false;
                 if (!composited) {
@@ -608,12 +604,15 @@ int main() {
                                              static_cast<unsigned>(presentation.height())};
                     SOS2::PixelDamageList patches;
                     if (!hasPresented) patches = {{{0, 0, pageWidth, pageHeight}}, 1};
-                    else if (scroll.rect.width) {
+                    else if (scroll.rect.width || composited) {
                         // Both retained images received the same scroll above.
                         // Only clipped paint can change their remaining pixels:
                         // compare exposed strips and fixed content, not the whole
                         // viewport on every touch movement. Multiple scrolls use
                         // the full presentation comparison through the fallback.
+                        // A composited frame changed only the compositor's
+                        // damage: compare each of its rectangles, not the span
+                        // between them.
                         for (const auto &rect : rectangles)
                             SOS2::appendChangedRegions(
                                 patches, pixels.data(), presentedPixels.data(), pageWidth,

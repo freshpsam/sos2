@@ -35,6 +35,8 @@ run:      ENGINE=none opens an empty desktop
           RUN_ARGS='--graphics virgl' adds GPU composition and retained textures
           RUN_ARGS='--jsc useDFGJIT=false' sets JavaScriptCore options
           (useJIT=false: interpreter only; useDFGJIT=false: up to the baseline JIT)
+          Sound through PulseAudio or PipeWire when one runs; RUN_ARGS='--audio
+          none' leaves it out, '--audio wav:FILE' records it
 phone:    REDMI2_WIFI_FIRMWARE=folder (default third_party/redmi2-firmware)
           Optional REDMI2_WIFI_PROFILE=file
           REDMI2_ADRENO_FIRMWARE=folder (default build/redmi2-adreno once

@@ -8,6 +8,7 @@
 #include "kernel_io.h"
 #include "wifi_setup.h"
 #include "redmi2_wifi.h"
+#include "wifi_device.h"
 
 static struct framebuffer *screen;
 static uint64_t last_poll;
@@ -99,7 +100,7 @@ static void update(enum boot_phase phase, uint32_t done, uint32_t total) {
         first +
         (total ? (unsigned)((uint64_t)(done < total ? done : total) * (last - first) / total) : 0);
     if (percent > shown_percent) shown_percent = percent;
-    paint(phase, shown_percent, phase == BOOT_WIFI ? redmi2_wifi_status() : 0);
+    paint(phase, shown_percent, phase == BOOT_WIFI ? wifi_device_status() : 0);
 }
 
 void redmi2_startup_begin(struct framebuffer *target) {
@@ -124,7 +125,7 @@ void redmi2_startup_wait_wifi(void) {
         boot_progress_report(BOOT_WIFI, done, total);
         if (!(wifi_setup_startup_pending() || kernel_io_busy())) break;
         if (!timed_out && time_us() - started >= 90000000) {
-            redmi2_wifi_startup_timeout();
+            wifi_device_fail("Wi-Fi startup timed out");
             timed_out = true;
         }
         process_step();
@@ -132,7 +133,7 @@ void redmi2_startup_wait_wifi(void) {
     /* The desktop follows: show the start complete, even if the last report
      * fell within the repaint interval. */
     shown_percent = 100;
-    if (redmi2_power_screen_on()) paint(BOOT_WIFI, 100, redmi2_wifi_status());
+    if (redmi2_power_screen_on()) paint(BOOT_WIFI, 100, wifi_device_status());
 }
 
 void redmi2_startup_end(void) {

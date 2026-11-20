@@ -12,6 +12,12 @@ target_link_libraries(sos2-web PRIVATE "${SOS2_MBEDTLS}" "${SOS2_MBEDX509}" "${S
 find_library(SOS2_NGHTTP2 nghttp2 REQUIRED)
 target_link_libraries(sos2-web PRIVATE "${SOS2_NGHTTP2}")
 target_link_libraries(sos2-web PRIVATE SQLite3::SQLite3)
+# The media engine's decoders (WebCore/platform/graphics/sos2), from FFmpeg
+# (tools/build_native_render.py).
+foreach (library avcodec swscale swresample avutil)
+    find_library(SOS2_FFMPEG_${library} ${library} REQUIRED)
+    target_link_libraries(sos2-web PRIVATE "${SOS2_FFMPEG_${library}}")
+endforeach ()
 # GPU rasterization and compositing (web_gpu.h, web_gpu_compositor.h): Mesa's
 # EGL and OpenGL ES with the SOS2 libdrm shim, built by
 # tools/build_native_mesa.py with 32-bit enums, which the GL interfaces never

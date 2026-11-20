@@ -5,10 +5,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import tarfile
 import zipfile
 import arch
-from build_native_runtime import ROOT,SYSROOT,sdk_flags,preserve_headers
+from build_native_runtime import ROOT,SYSROOT,link_flags,link_libraries,sdk_flags,preserve_headers
 from native_sources import apply_patch,copy_if_changed,digest,download,run_logged
 
 BASE=ROOT/('build/native-webkit'+arch.SUFFIX)
@@ -46,7 +47,10 @@ def prepare(record):
 
 
 def run(command,label,cwd=None):
-    env=os.environ.copy();env['PKG_CONFIG_LIBDIR']=str(SYSROOT/'lib/pkgconfig');env['PKG_CONFIG_PATH']='';env['PKG_CONFIG_SYSROOT_DIR']=str(SYSROOT)
+    # Without make engine's command line, whose ARCH=arm32 or arm64 would
+    # override FFmpeg's own ARCH and leave out its assembly.
+    env={name:value for name,value in os.environ.items() if name not in ('MAKEFLAGS','MFLAGS','MAKEOVERRIDES')}
+    env['PKG_CONFIG_LIBDIR']=str(SYSROOT/'lib/pkgconfig');env['PKG_CONFIG_PATH']='';env['PKG_CONFIG_SYSROOT_DIR']=str(SYSROOT)
     run_logged(command,BASE/'dependencies'/(label+'.log'),'Native dependency',cwd,env)
 
 
@@ -87,6 +91,9 @@ def build(record,jobs):
              'SQLITE_MAX_MMAP_SIZE=0','SQLITE_TEMP_STORE=3','SQLITE_DEFAULT_MEMSTATUS=0'])
         for header in ('sqlite3.h','sqlite3ext.h'):copy_if_changed(source/header,SYSROOT/'include'/header)
         return
+    if name=='ffmpeg':
+        ffmpeg(source,output,jobs)
+        return
     options={
         'png':{'PNG_SHARED':'OFF','PNG_STATIC':'ON','PNG_TESTS':'OFF','PNG_TOOLS':'OFF','PNG_ARM_NEON':'off'},
         'jpeg':{'ENABLE_SHARED':'OFF','ENABLE_STATIC':'ON','WITH_SIMD':'OFF','WITH_TURBOJPEG':'OFF'},
@@ -124,6 +131,40 @@ def build(record,jobs):
     if name=='mbedtls':
         (SYSROOT/'include/sos2').mkdir(exist_ok=True)
         copy_if_changed(ROOT/'tools/browser/mbedtls-sos2.h',SYSROOT/'include/sos2/mbedtls_config.h')
+
+
+def ffmpeg(source,output,jobs):
+    # Decoders only, for the engine's media player (platform/graphics/sos2 in
+    # the WebCore port), which parses MSE's MP4 itself: H.264 and AAC with
+    # their NEON code, swscale for frames and swresample for SYS_AUDIO.
+    configure=[str(source/'configure'),'--prefix='+str(SYSROOT),'--enable-cross-compile','--target-os=none',
+        '--arch='+('aarch64' if arch.ARM64 else 'arm'),'--cc='+arch.tool('gcc'),'--ar='+arch.tool('ar'),
+        '--ranlib='+arch.tool('ranlib'),'--nm='+arch.tool('nm'),'--strip='+arch.tool('strip'),
+        '--extra-cflags='+' '.join([*sdk_flags(),'-I'+str(output/'include')]),
+        # Link tests need the CPU flags too: they pick ARM32's hard-float libgcc.
+        '--extra-ldflags='+' '.join([*arch.CPU,*link_flags()]),
+        '--extra-libs='+' '.join(link_libraries()),'--enable-static','--disable-shared','--disable-debug',
+        '--disable-everything','--disable-programs','--disable-doc','--disable-network','--disable-autodetect',
+        '--disable-avformat','--disable-avdevice','--disable-avfilter','--enable-swscale','--enable-swresample',
+        '--enable-decoder=h264,aac','--enable-pthreads','--disable-runtime-cpudetect',
+        # The Cortex-A53 has NEON and nothing later (no SVE, dot product or I8MM).
+        *(['--disable-dotprod','--disable-i8mm','--disable-sve','--disable-sve2'] if arch.ARM64 else ['--enable-neon'])]
+    # The SDK's -isystem sysroot puts Newlib's <stdatomic.h>, FreeBSD's
+    # struct-wrapped atomics, ahead of GCC's C11 one, which FFmpeg needs.
+    compiler=subprocess.run([arch.tool('gcc'),'-print-file-name=include'],check=True,capture_output=True,text=True)
+    atomics=Path(compiler.stdout.strip())/'stdatomic.h'
+    if not atomics.is_file():raise RuntimeError('Missing GCC <stdatomic.h>: '+str(atomics))
+    (output/'include').mkdir(parents=True,exist_ok=True)
+    forward=output/'include/stdatomic.h';text='#include "'+str(atomics)+'"\n'
+    if not forward.is_file() or forward.read_text()!=text:forward.write_text(text)
+    signature=hashlib.sha256(json.dumps([configure,arch.prefix()]).encode()).hexdigest()
+    stamp=output/'.sos2-config'
+    if not stamp.exists() or stamp.read_text().strip()!=signature:
+        output.mkdir(parents=True,exist_ok=True)
+        run(configure,'ffmpeg-configure',output)
+        stamp.write_text(signature+'\n')
+    run(['make','-j',str(jobs)],'ffmpeg-build',output)
+    with preserve_headers():run(['make','install'],'ffmpeg-install',output)
 
 
 def main():

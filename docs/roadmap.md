@@ -14,7 +14,8 @@ Open work; the other documents describe what exists.
    installed systems' eMMC data. Multi-block transfers would shorten the
    phone's boot-time read.
 4. **Compositing and GPU drawing.** Composited fixed and overflow-scrolling
-   elements and masks in the CPU compositor; damage tracking and worker-thread
+   elements, masks and blend modes in the CPU compositor, which paints the
+   last two flattened where they change; damage tracking and worker-thread
    tiles in the GPU compositor; fewer device requests per frame with virgl;
    qualify the [Adreno path](gpu.md#redmi-2-adreno), then bring GPU drawing to
    the Adreno 306 through freedreno.
@@ -33,8 +34,27 @@ Open work; the other documents describe what exists.
    (multi-sector eMMC writes), and a way back when a release fails to start,
    which now takes lk2nd's fastboot; authenticated time and time zones.
 7. **Web platform.** IndexedDB, service workers, Cache Storage, downloads,
-   media and other web APIs; website-data controls and per-site process
-   isolation, since every page shares the browser profile.
-8. **Power.** Standby draws 6.0 mA. Next: Wi-Fi's share in power save, the
-   display's power domain, then clock and voltage scaling, sleep with the
-   screen on, and thermal handling.
+   media files outside Media Source Extensions, more codecs (VP9, Opus),
+   Web Audio and other web APIs; WebGL once the devices draw with their GPUs;
+   website-data controls and per-site process isolation, since every page
+   shares the browser profile.
+8. **Sound.** An audio driver for the phone (the MSM8916's LPASS and the
+   PM8916 codec), whose pages until then play video silently, on the same
+   clock; on the tablet, its volumes kept across restarts, its headphones'
+   microphone and buttons, and the codec's power-up and power-down ramps
+   (about 30 ms each) run in steps rather than holding CPU 0's loop. In the
+   browser, sound for more than one element at a time (a second video plays
+   silently), and volume and mute that reach the half second already queued,
+   which needs `SYS_AUDIO` to take them.
+9. **Power.** Standby draws 6.0 mA. The tablet raises its CPU clocks only
+   while pages work. Next: Wi-Fi's share in power save, the display's power
+   domain, the phone's clock and voltage scaling, sleep with the screen on,
+   and thermal handling.
+10. **Speed.** The kernel's mutable data and page tables are uncached, which
+    slows CPU 0's loop (every syscall waits for it) and every TLB miss. In the
+    browser, a playing video's frames are still blended with the page's
+    overlays above them, and layers with CSS shadows or filters blur them
+    again at each repaint: YouTube's player controls, while shown, hold
+    playback near 8 frames per second on the tablet. The browser saves its
+    cookie and storage database (up to 6 MiB) on the page's main thread,
+    which holds the page while the copy is written.

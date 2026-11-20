@@ -9,13 +9,25 @@ import shutil
 ROOT = Path(__file__).resolve().parents[1]
 
 # Per architecture: QEMU binary (and its override variable), CPU, CPU limit,
-# RAM (the arm32 page pool is fixed in arch/arm/resources.ld; arm64 takes the
-# largest free stretch the DTB reports).
-MACHINES = {"arm32": ("QEMU_ARM", "qemu-system-arm", "cortex-a15", 4, "1G"),
+# RAM (the arm32 page pool, 640 MiB, about the Redmi 2's, is fixed in
+# arch/arm/resources.ld; arm64's spans the free stretches the DTB reports).
+MACHINES = {"arm32": ("QEMU_ARM", "qemu-system-arm", "cortex-a15", 4, "2G"),
             "arm64": ("QEMU_ARM64", "qemu-system-aarch64", "cortex-a53", 8, "2G")}
+AUDIO = ("pa", "pipewire", "alsa", "sdl")
+
+def default_audio(display):
+    """With a window, PulseAudio's server, which PipeWire also provides, else
+    PipeWire's own: QEMU stops at start when its server is missing. Without a
+    window or either server, no sound device."""
+    if display not in ("gtk", "sdl"):
+        return "none"
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    if os.environ.get("PULSE_SERVER") or (runtime / "pulse/native").exists():
+        return "pa"
+    return "pipewire" if (runtime / "pipewire-0").exists() else "none"
 
 def command(display="gtk", bundle=None, disk=None, ram_only=False, cpus=4, graphics="ramfb", arch="arm32",
-            jsc=None):
+            jsc=None, audio=None):
     variable, binary, cpu, limit, memory = MACHINES[arch]
     if not 1 <= cpus <= limit:
         raise ValueError(f'CPU count must be between 1 and {limit}')
@@ -23,6 +35,10 @@ def command(display="gtk", bundle=None, disk=None, ram_only=False, cpus=4, graph
     # to 127 bytes and stops at boot on more.
     if jsc is not None and (not jsc or len(jsc) > 127 or not all('!' <= c <= '~' for c in jsc)):
         raise ValueError('--jsc: 1-127 printable ASCII characters, comma-separated JavaScriptCore options')
+    audio = audio or default_audio(display)
+    backend, _, wav = audio.partition(":")
+    if not (audio == "none" or audio in AUDIO or (backend == "wav" and wav)):
+        raise ValueError(f"--audio: {', '.join(AUDIO)}, wav:FILE or none")
     if graphics == 'virgl' and display in ('gtk', 'sdl'):
         display += ',gl=on'
     cmd = [os.environ.get(variable, binary),
@@ -50,6 +66,13 @@ def command(display="gtk", bundle=None, disk=None, ram_only=False, cpus=4, graph
         else:
             escaped=str(Path(bundle).resolve()).replace(",",",,")
             cmd += ["-device",f"loader,file={escaped},addr=0x50000000,force-raw=on"]
+    if audio != "none":
+        # The guest's rate, so that QEMU does not resample, and one stream, an
+        # output: nothing records.
+        options = f"{backend},id=sos2audio,out.frequency=48000"
+        if wav:
+            options += ",path=" + str(Path(wav).resolve()).replace(",", ",,")
+        cmd += ["-audiodev", options, "-device", "virtio-sound-device,audiodev=sos2audio,streams=1"]
     arguments = (["sos2.storage=ram"] if ram_only else []) + ([f"sos2.jsc={jsc}"] if jsc else [])
     cmd += ["-device", "virtio-rng-device", "-append", " ".join(arguments)]
     return cmd
@@ -67,6 +90,10 @@ def main():
                         help="JavaScriptCore options for pages, comma-separated: useJIT=false runs the "
                              "interpreter, useDFGJIT=false stops at the baseline JIT")
     parser.add_argument("--display", default="gtk", choices=("gtk", "sdl"))
+    parser.add_argument("--audio", metavar="OUTPUT",
+                        help="sound through pa (PulseAudio, or PipeWire's PulseAudio server), pipewire, alsa "
+                             "or sdl; wav:FILE records it; none has no sound device, so pages play silently "
+                             "as on the phone and the tablet (default: pa or pipewire when one runs, else none)")
     parser.add_argument("--bundle", type=Path, help="read-only resource image: loaded at 0x50000000 on arm32, the "
                                                     "initrd on arm64 (raw, or SORZ-compressed)")
     parser.add_argument("--disk", type=Path, help="existing writable disk image; make run STORAGE=persistent creates one safely")
@@ -77,7 +104,7 @@ def main():
         parser.error("--disk must be an existing disk image; the launcher never formats disks")
     try:
         cmd = command(display=args.display, graphics=args.graphics, bundle=args.bundle, disk=args.disk,
-                      ram_only=args.ram_only, cpus=args.cpus, arch=args.arch, jsc=args.jsc)
+                      ram_only=args.ram_only, cpus=args.cpus, arch=args.arch, jsc=args.jsc, audio=args.audio)
     except ValueError as error:
         parser.error(str(error))
     if not shutil.which(cmd[0]):

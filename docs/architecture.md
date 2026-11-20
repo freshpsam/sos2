@@ -12,11 +12,14 @@ engine, `/bin/sos2-web`, which runs once per open page, and the
 - Each page or app is a static ARM ELF process in its own address space. The
   kernel preempts user code every 5 ms; a fault ends only that process, and
   **Close** reclaims even a hung page.
-- Free RAM and, per process, a 192 MiB quota (384 MiB on AArch64) and 16
+- Free RAM and, per process, a 544 MiB quota (1 GiB on AArch64) and 64
   threads limit what runs. When the last page closes, free memory must be
   back at its post-boot baseline, or the kernel panics.
 - Up to four CPUs run, eight on AArch64. CPU 0 owns the desktop, scheduler,
-  syscalls and drivers; the others run page threads. On the Redmi 2 the
+  syscalls and drivers; the others run page threads, a page's own threads
+  side by side (its GC markers, compiler threads, image decoders and
+  workers). Only unmapping or protecting memory and suspending a thread
+  pause the page's other threads. On the Redmi 2 the
   secondary cores start as the vendor kernel starts them, and a core that
   misses a bounded wait is skipped.
 
@@ -37,11 +40,13 @@ Read-only ELF segments (the engine's code and constants) are loaded once and
 shared by every page. The engine's allocator is mimalloc, configured for SOS2,
 which backs every mapping with RAM when it is created. JavaScriptCore's 16 KiB
 heap blocks are mapped one by one at that size instead, since mimalloc would
-spend 32 KiB on each aligned block.
+spend 32 KiB on each aligned block. Both ask mmap for aligned memory
+(`MAP_ALIGNED`), which the kernel places directly, so no slack is unmapped.
 
 On AArch64 the device tree places everything: the kernel's page pool is the
-largest stretch of RAM below 4 GiB that no reservation, framebuffer, device
-tree or resource uses, and the resources arrive as the initrd. A compressed
+16 largest stretches of RAM below 4 GiB that no reservation, framebuffer,
+device tree or resource uses, with the gaps between them withheld, and the
+resources arrive as the initrd. A compressed
 (SORZ) one, as on the tablet, expands at boot into the smallest free stretch
 that holds it, through a temporary cached mapping (`arch/arm64/boot_cache.c`),
 since the data cache is still off.
@@ -65,14 +70,23 @@ are static, and what they print goes nowhere. Syscalls are in
 | `/settings` | Kernel-only Wi-Fi and clock settings |
 | `/data`, `/tmp` | The process's profile: its files and temporary files |
 | `/data/www` | The browser's local website, `https://www.sos2.local/` |
-| `/data/browser/state.sqlite3` | Cookies and web storage |
+| `/data/browser/state.sqlite3` | Cookies and web storage (durable copy) |
+| `/tmp/browser/state.sqlite3` | Cookies and web storage as pages use them |
 
 Web pages share the profile `/profiles/browser`; the updater has
 `/profiles/updater` and each app `/profiles/apps/<id>`. The kernel separates
 profiles and WebKit separates origins; nothing is encrypted at rest. Pages
 share the browser's database through kernel file locks taken by SQLite's VFS
 (`sdk/runtime/sqlite_vfs.c`), and pick up each other's cookie and storage
-changes within 250 ms.
+changes within 250 ms. That database lives in `/tmp`, in RAM: littlefs
+rewrites a file's tail for each write inside it, which made SQLite's writes
+on the eMMC half of a heavy site's load. The first page after boot copies it
+from `/data`, and a fresh copy goes back 3 s after the last change, or 30 s
+after the first unsaved one, saved by one page at a time: the page that made
+the change, or any page open later (`programs/browser/web_state.cpp`). A power
+loss or restart loses at most those last seconds, unless no page stayed open
+after the page that made a change closed. `/tmp` is a 24 MiB RAM volume,
+emptied at every boot.
 
 - **RAM mode** (`sos2.storage=ram`, the default for `make run` and
   `make phone`) keeps a 32 MiB data volume in RAM until reboot.
@@ -90,7 +104,8 @@ changes within 250 ms.
 
 Web storage and cookies follow the usual browser rules (localStorage per
 origin, no third-party cookies, the pinned Public Suffix List) within fixed
-limits: 5 MiB per origin and a 12 MiB database.
+limits: 5 MiB of storage, per origin and in all, in a database of at most
+6 MiB.
 
 ## Updates
 
@@ -109,10 +124,13 @@ sessions show updates but install none.
 ## Networking
 
 lwIP provides IPv4, DHCP, DNS and TCP over virtio Ethernet (QEMU) or the
-devices' native Wi-Fi drivers. HTTPS (Mbed TLS 1.2/1.3) checks hostname,
+devices' native Wi-Fi drivers. TCP keeps segments that arrive past a gap and
+reports them with SACK, so a frame Wi-Fi loses costs one resend rather than a
+window; the Wi-Fi drivers hand lwIP up to 256 received frames at a time, a
+whole aggregate. HTTPS (Mbed TLS 1.2/1.3) checks hostname,
 chain and date with no fallback to HTTP; WebKit enforces CORS, CSP, mixed
 content and credentials. HTTP/1.1 and HTTP/2 are supported; bodies are
-limited to 8 MiB.
+limited to 32 MiB decoded.
 
 ## Web platform and rendering
 
@@ -124,12 +142,13 @@ backports selected upstream security fixes. Each security patch in
 `GTA7LITE_JSC` for the devices) passes JavaScriptCore options to every page, such as `useJIT=false` to
 compare the tiers. Dedicated workers are supported.
 Not available: IPv6, WebSocket, file uploads, IndexedDB, service workers,
-media and WebGL/WebGPU. Text uses FreeType, HarfBuzz and ICU with DejaVu, Noto
+Web Audio and WebGL/WebGPU; video plays only through Media Source Extensions
+([Video](#video)). Text uses FreeType, HarfBuzz and ICU with DejaVu, Noto
 Sans CJK and Noto Color Emoji. SOS2's languages are English and Chinese: ICU's
 data keeps theirs alone (tools/build_native_runtime.py), and the CJK font is
 cut down to GB2312's Simplified Chinese (tools/browser_fonts.py), so that the
 system, engine included, fits a 32 MiB boot partition on both devices:
-about 28 MB compressed on each, with the engine built at -O2 and its code
+about 30 MB compressed on each, with the engine built at -O2 and its code
 through branch filters (include/boot_bundle.h), which make call targets
 absolute: xz's ARM64 one on AArch64, and on ARM32, whose engine is mostly
 Thumb-2 with ARM-mode libraries, an ARM and a Thumb-2 one, each over its
@@ -137,9 +156,16 @@ instruction set's ranges.
 
 WebKit draws with Skia on the CPU into a retained backing store per page, or
 with Skia's GL backend under QEMU [virgl](gpu.md). Scrolling moves pixels and
-repaints only what is exposed. Animated layers (transforms, opacity) go to a
-CPU compositor that redraws only what changed, up to a 24 MiB budget. Pages
-send the kernel only changed pixels.
+repaints only what is exposed. Animated layers (transforms, opacity) and
+videos go to a CPU compositor that redraws only what changed
+(`programs/browser/web_compositor.h`), and nothing beneath a layer that
+covers the change. It keeps pixels for the layers the viewport shows, up to
+24 MiB, and draws each video frame into the page itself, so playback repaints
+nothing else. Layers it cannot draw (masks, blend modes, more than the
+budget) are painted flattened where they changed. Fixed elements that
+overlap layers become layers too and keep their place as the page scrolls
+(`tools/browser/patches/wpe-2.52.6-native-fixed-layers.patch`). Pages send
+the kernel only changed pixels.
 
 ## Desktop and input
 
@@ -158,6 +184,47 @@ header above a 480×752 page surface.
   buttons and keys give a 15 ms buzz (`kernel/protection/haptics.c`).
 - Header, keyboard and desktop input, including Wi-Fi passwords, never
   reaches a page.
+
+## Video
+
+Pages play video through Media Source Extensions, as YouTube and most
+streaming sites send it: fragmented MP4 with H.264 (8-bit Baseline, Main or
+High profile) and AAC (LC or HE). SOS2's media engine
+(`tools/browser/native-port/Source/WebCore/platform/graphics/sos2`) parses
+the segments and decodes each track on a thread of its own with FFmpeg's
+H.264 and AAC decoders, the only parts of FFmpeg built
+(`tools/build_native_render.py`, LGPL 2.1); H.264 decodes frames in parallel
+on up to four more threads. Each frame is converted on its decoder thread to
+the size the page shows it at, so the compositor copies it unscaled, and
+waits for the clock: the page's [audio stream](#audio) as it is heard, or
+monotonic time without audio. A page has one audio stream, which its
+first video with sound takes. Pages may start playback, sound included,
+without a tap. They are told that video larger than 1280×720 (854×480 on
+ARM32) or faster than 30 frames per second is unsupported, which keeps
+YouTube's choice of quality to what the devices decode, and each source
+buffer keeps at most 64 MiB (24 MiB on ARM32). Media files played without
+MSE, other codecs and playback rates other than 1 are not supported.
+
+## Audio
+
+A page or app may open one output stream (`sos2_audio`, `SYS_AUDIO`) of
+interleaved 16-bit stereo frames at 48 kHz. Writes never block: the kernel
+queues up to 0.5 s per stream, in pool pages taken when the stream opens and
+returned when it closes or its process ends. The mixer
+(`kernel/audio/audio.c`) sums the playing streams and saturates the total. A
+stream's `played` count grows as frames leave its queue and `latency` counts
+those still queued in the device, so what is heard is `played - latency`, the
+clock media playback follows. Without an audio device, as on the phone,
+streams play silently at the same rate, so the clock still keeps real time.
+QEMU's virtio-sound device gets 10 ms periods, at most four at a time, and
+stops a quarter second after the streams run dry
+(`kernel/audio/virtio_snd.c`). The tablet's speakers, or headphones in its
+jack, play a ring the audio DMA reads, which the main loop's polls fill up
+to 133 ms ahead, with silence where the streams run dry; they power down 3 s
+after the last frame. Its volume keys set a volume for each output, which
+scales the mix (`boards/gta7lite/audio.c`, [Galaxy Tab A7 Lite](gta7lite.md)). `make run` plays through PulseAudio or
+PipeWire when one runs; `RUN_ARGS='--audio none'` leaves the device out, and
+`'--audio wav:FILE'` records it.
 
 ## Native apps
 

@@ -12,6 +12,7 @@
 #include "fs.h"
 #include "entropy.h"
 #include "network.h"
+#include "audio.h"
 #include "arm_machine.h"
 #include "arm_smp.h"
 #include "kernel_io.h"
@@ -37,6 +38,7 @@ struct thread {
     user_ptr completion;
     uint32_t result;
     user_ptr wait_address;
+    uint64_t wait_epoch; /* vm_epoch() when wait_address was last found mapped */
     uint32_t suspended;
     unsigned running_cpu;
     bool resume;
@@ -44,14 +46,15 @@ struct thread {
 };
 
 /* What first-fit searches in the heap or the JIT window found: no free run of
- * count pages or more starts between the range's start and address. Mapping
- * keeps that true and unmapping lowers it (lower_hints), so a search for
- * count pages starts at address instead of walking every mapped page's table
- * entries (uncached) from the start, as JavaScriptCore's per-block mappings
- * would otherwise make every search do. */
+ * count pages or more starts at a multiple of alignment pages between the
+ * range's start and address. Mapping keeps that true and unmapping lowers it
+ * (lower_hints), so a search for count pages starts at address instead of
+ * walking every mapped page's table entries (uncached) from the start, as
+ * JavaScriptCore's per-block mappings would otherwise make every search do. */
 struct range_hint {
     user_ptr address;
     unsigned count; /* 0: unused */
+    unsigned alignment;
 };
 
 #define RANGE_HINTS 4
@@ -105,6 +108,7 @@ static struct {
 } dispatched[ARM_CPU_MAX];
 
 static bool continue_slice;
+static uint64_t user_us;
 static struct process *io_owner;
 static bool frozen;
 static struct thread *io_thread;
@@ -214,6 +218,7 @@ bool process_init(struct platform_devices *devices, uintptr_t dtb) {
     random_ready = entropy_init(devices);
     boot_progress_report(BOOT_NETWORK, 0, 0);
     network_init(devices);
+    audio_init(devices);
     boot_progress_report(BOOT_CLOCK, 0, 0);
     const struct system_clock_ops clock = {arm_rtc_read, arm_rtc_kind()};
     system_clock_init(&clock);
@@ -339,30 +344,36 @@ static unsigned hint_range(user_ptr address) {
 }
 
 /* Pages from address on were unmapped: a run of count pages may now start up
- * to count - 1 pages below it (runs below a hint are shorter than count). */
+ * to count - 1 pages below it, at a multiple of its alignment (runs below a
+ * hint are shorter than count). */
 static void lower_hints(struct process *p, user_ptr address) {
     unsigned range = hint_range(address);
     user_ptr base = range ? USER_JIT_BASE : USER_HEAP_BASE;
     for (unsigned i = 0; i < RANGE_HINTS; ++i) {
         struct range_hint *hint = &p->hints[range][i];
-        user_ptr reach = hint->count ? (user_ptr)(hint->count - 1) * PAGE_SIZE : 0;
+        if (!hint->count) continue;
+        user_ptr reach = (user_ptr)(hint->count - 1) * PAGE_SIZE;
         user_ptr floor = address - base > reach ? address - reach : base;
+        floor &= ~((user_ptr)hint->alignment * PAGE_SIZE - 1);
+        if (floor < base) floor = base;
         if (hint->address > floor) hint->address = floor;
     }
 }
 
-/* First-fit placement of count pages in [lower, upper), within the heap or
- * the JIT window, resumed where earlier searches for count pages ended. */
-static user_ptr allocate_range(struct process *p, unsigned count, user_ptr lower, user_ptr upper,
-                               unsigned flags) {
+/* First-fit placement of count pages at a multiple of alignment pages in
+ * [lower, upper), within the heap or the JIT window, resumed where earlier
+ * searches for such runs ended. */
+static user_ptr allocate_range(struct process *p, unsigned count, unsigned alignment,
+                               user_ptr lower, user_ptr upper, unsigned flags) {
     unsigned range = hint_range(lower);
     struct range_hint *hint = 0;
     for (unsigned i = 0; i < RANGE_HINTS; ++i)
-        if (p->hints[range][i].count == count) hint = &p->hints[range][i];
+        if (p->hints[range][i].count == count && p->hints[range][i].alignment == alignment)
+            hint = &p->hints[range][i];
     user_ptr known = hint ? hint->address : range ? USER_JIT_BASE : USER_HEAP_BASE;
     user_ptr from = known > lower ? known : lower;
     if (from >= upper) return 0;
-    user_ptr address = vm_allocate_range(&p->space, count, from, upper, flags);
+    user_ptr address = vm_allocate_range(&p->space, count, alignment, from, upper, flags);
     /* Only a search that covered the range from its start teaches anything;
      * a failure may be the page pool running out, not a lack of room. */
     if (address && from == known) {
@@ -370,6 +381,7 @@ static user_ptr allocate_range(struct process *p, unsigned count, user_ptr lower
             hint = &p->hints[range][p->next_hint[range]];
             p->next_hint[range] = (p->next_hint[range] + 1) % RANGE_HINTS;
             hint->count = count;
+            hint->alignment = alignment;
         }
         hint->address = address + (user_ptr)count * PAGE_SIZE;
     }
@@ -383,7 +395,7 @@ static user_result memory_call(struct process *p, uint32_t number, user_ptr addr
         ((flags & 6) == 6 && !jit) || (flags && !(flags & VM_READ)))
         return USER_EINVAL;
     if (number == SYS_VM_MAP && !address) {
-        address = allocate_range(p, count, USER_HEAP_BASE, USER_HEAP_END, flags);
+        address = allocate_range(p, count, 1, USER_HEAP_BASE, USER_HEAP_END, flags);
         return address ? (user_result)address : USER_ENOMEM;
     }
     if (number == SYS_VM_CHECK) {
@@ -532,6 +544,7 @@ static void syscall(struct process *p) {
             else {
                 t->state = T_WAIT;
                 t->wait_address = r[0];
+                t->wait_epoch = vm_epoch();
                 t->deadline = timeout == USER_WAIT_FOREVER ? UINT64_MAX : time_us() + timeout;
                 r[0] = 0;
             }
@@ -572,8 +585,18 @@ static void syscall(struct process *p) {
                 r[0] = (user_reg)USER_ENODEV;
                 break;
             }
-            current_thread->state = T_SERVICE;
-            continue_slice = false;
+            /* A seeded generator answers at once; seeding, and virtio's
+             * reads, wait in the service worker. */
+            unsigned char bytes[256];
+            if (entropy_read_now(bytes, size) == size)
+                r[0] = vm_copy_to_user(&p->space, r[0], bytes, size) ? (user_reg)size
+                                                                     : (user_reg)USER_EFAULT;
+            else {
+                current_thread->state = T_SERVICE;
+                continue_slice = false;
+            }
+            volatile unsigned char *wipe = bytes;
+            for (unsigned i = 0; i < sizeof(bytes); ++i) wipe[i] = 0;
             break;
         }
         case SYS_VM_MAP:
@@ -586,16 +609,18 @@ static void syscall(struct process *p) {
             break;
         case SYS_VM_ALLOC_RANGE: {
             user_ptr lower = r[0], upper = r[1];
-            unsigned count = (uint32_t)r[2], flags = (uint32_t)r[3];
+            unsigned count = (uint32_t)r[2], flags = (uint32_t)r[3] & 7u;
+            unsigned shift = (uint32_t)r[3] >> USER_MAP_ALIGN_SHIFT;
             bool jit = jit_window(p, lower, upper);
             if (((lower < USER_HEAP_BASE || upper > USER_HEAP_END) && !jit) || lower >= upper ||
                 ((lower | upper) & (PAGE_SIZE - 1)) || !count ||
-                count > (upper - lower) / PAGE_SIZE || (flags & ~7u) ||
+                count > (upper - lower) / PAGE_SIZE || shift > USER_MAP_ALIGN_MAX ||
+                (((uint32_t)r[3] >> 3) & ((1u << (USER_MAP_ALIGN_SHIFT - 3)) - 1)) ||
                 ((flags & 6) == 6 && !jit) || (flags && !(flags & VM_READ))) {
                 r[0] = (user_reg)USER_EINVAL;
                 break;
             }
-            user_ptr address = allocate_range(p, count, lower, upper, flags);
+            user_ptr address = allocate_range(p, count, 1u << shift, lower, upper, flags);
             r[0] = address ? address : (user_reg)USER_ENOMEM;
             break;
         }
@@ -608,6 +633,9 @@ static void syscall(struct process *p) {
                 vm_copy_to_user(&p->space, r[0], &info, sizeof(info)) ? 0 : (user_reg)USER_EFAULT;
             break;
         }
+        case SYS_AUDIO:
+            r[0] = (user_reg)audio_call(p->pid, &p->space, (uint32_t)r[0], r[1], (uint32_t)r[2]);
+            break;
         case SYS_PRESENT:
             r[0] = (user_reg)page_host_present(p->pid - 1, &p->space, r[0], (uint32_t)r[1]);
             break;
@@ -740,17 +768,31 @@ static void syscall(struct process *p) {
     }
 }
 
-static bool needs_quiescence(uint32_t call) {
-    switch (call) {
+/* Whether a call must wait for the process's other threads to leave user mode.
+ * New pages that are not executable need not: entries go from invalid to
+ * valid, which no CPU caches, and with the quota and the page pool holding
+ * every page and table they could take, no failure halfway frees one again.
+ * Allocating threads then no longer stop GC markers and compiler threads. */
+static bool needs_quiescence(const struct process *p, const user_reg *r) {
+    unsigned count, flags;
+    switch ((uint32_t)r[SYSCALL_NUMBER]) {
         case SYS_VM_MAP:
+            count = (uint32_t)r[1];
+            flags = (uint32_t)r[2];
+            break;
+        case SYS_VM_ALLOC_RANGE:
+            count = (uint32_t)r[2];
+            flags = (uint32_t)r[3];
+            break;
         case SYS_VM_PROTECT:
         case SYS_VM_UNMAP:
         case SYS_VM_DISCARD:
-        case SYS_VM_ALLOC_RANGE:
         case SYS_THREAD_SUSPEND:
         case SYS_THREAD_CONTEXT: return true;
         default: return false;
     }
+    return !count || (flags & VM_EXEC) || count > USER_PAGE_QUOTA - p->space.mapped_pages ||
+           pages_available() < count + count / 128 + 8;
 }
 
 static bool quiescence_pending(const struct process *p) {
@@ -763,6 +805,7 @@ static void handle_trap(const struct arm_trap *trap, uint64_t elapsed) {
     /* All syscalls and mutable kernel services run on CPU 0. The worker has
      * switched to the kernel root before handing this context back to us. */
     continue_slice = false;
+    user_us += elapsed;
     current->cpu_us += elapsed;
     current_thread->cpu_us += elapsed;
     current_thread->context = trap->context;
@@ -770,7 +813,7 @@ static void handle_trap(const struct arm_trap *trap, uint64_t elapsed) {
         /* Mapping changes and GC suspension require every peer to leave user
          * mode first. Stop dispatching this address space, then collect its
          * bounded timer slices before changing translations or taking stacks. */
-        if (current->running_mask && needs_quiescence((uint32_t)trap->context.r[SYSCALL_NUMBER])) {
+        if (current->running_mask && needs_quiescence(current, trap->context.r)) {
             current_thread->state = T_QUIESCE;
             return;
         }
@@ -786,6 +829,7 @@ static void handle_trap(const struct arm_trap *trap, uint64_t elapsed) {
 static void stop(struct process *p) {
     page_host_closed(p->pid - 1);
     network_close_process(p->pid);
+    audio_close_process(p->pid);
     p->reap_pending = true;
 }
 
@@ -1010,8 +1054,49 @@ static void collect(unsigned cpu) {
     arm_cpu_release(cpu);
 }
 
-static void dispatch(unsigned cpu) {
-    if (frozen || !arm_cpu_idle(cpu)) return;
+/* Sleeps and waits that have ended make their threads ready: once per step,
+ * not once per idle CPU and pass. A waiting thread's word was mapped when it
+ * began to wait; only a mapping change since (vm_epoch) can have removed it,
+ * so the table walk that checks it happens only then. */
+static void wake_expired(struct process *p, uint64_t now, uint64_t epoch) {
+    for (unsigned i = 0; i < USER_THREAD_LIMIT; ++i) {
+        struct thread *t = &p->threads[i];
+        if (t->running_cpu) continue;
+        if (t->state == T_SLEEP && now >= t->deadline) t->state = T_READY;
+        if (t->state != T_WAIT) continue;
+        if (t->wait_epoch != epoch) {
+            t->wait_epoch = epoch;
+            if (!vm_resolve(&p->space, t->wait_address, VM_READ)) {
+                t->context.r[0] = (user_reg)USER_EFAULT;
+                t->state = T_READY;
+                continue;
+            }
+        }
+        if (t->deadline != UINT64_MAX && now >= t->deadline) {
+            t->context.r[0] = (user_reg)USER_ETIMEDOUT;
+            t->state = T_READY;
+        }
+    }
+}
+
+/* The thread of p to run next: one still within the slice a syscall
+ * interrupted first, then any ready one, from where the last one was found. */
+static struct thread *next_ready(struct process *p, uint64_t now) {
+    for (unsigned pass = 0; pass < 2; ++pass)
+        for (unsigned attempt = 0; attempt < USER_THREAD_LIMIT; ++attempt) {
+            unsigned index = (p->next_thread + attempt) % USER_THREAD_LIMIT;
+            struct thread *t = &p->threads[index];
+            if (!t->running_cpu && t->state == T_READY && !t->suspended &&
+                (pass || (t->resume && now < t->slice_deadline))) {
+                p->next_thread = (index + 1) % USER_THREAD_LIMIT;
+                return t;
+            }
+        }
+    return 0;
+}
+
+static void dispatch(unsigned cpu, uint64_t now) {
+    if (!arm_cpu_idle(cpu)) return;
     unsigned count = 0;
     for (struct process *p = processes; p; p = p->next) ++count;
     for (unsigned checked = 0; checked < count; ++checked) {
@@ -1021,33 +1106,7 @@ static void dispatch(unsigned cpu) {
          * run together until a mapping, suspension or I/O operation needs the
          * whole address space quiescent. Never dispatch one thread twice. */
         if (p == io_owner || p->state != RUNNABLE || quiescence_pending(p)) continue;
-        struct thread *t = 0;
-        uint64_t now = time_us();
-        for (unsigned pass = 0; pass < 2 && !t; ++pass) {
-            for (unsigned attempt = 0; attempt < USER_THREAD_LIMIT; ++attempt) {
-                unsigned index = (p->next_thread + attempt) % USER_THREAD_LIMIT;
-                struct thread *candidate = &p->threads[index];
-                if (candidate->running_cpu) continue;
-                if (candidate->state == T_SLEEP && time_us() >= candidate->deadline)
-                    candidate->state = T_READY;
-                if (candidate->state == T_WAIT) {
-                    if (!vm_resolve(&p->space, candidate->wait_address, VM_READ)) {
-                        candidate->context.r[0] = (user_reg)USER_EFAULT;
-                        candidate->state = T_READY;
-                    } else if (candidate->deadline != UINT64_MAX &&
-                               time_us() >= candidate->deadline) {
-                        candidate->context.r[0] = (user_reg)USER_ETIMEDOUT;
-                        candidate->state = T_READY;
-                    }
-                }
-                if (candidate->state == T_READY && !candidate->suspended &&
-                    (pass || (candidate->resume && now < candidate->slice_deadline))) {
-                    t = candidate;
-                    p->next_thread = (index + 1) % USER_THREAD_LIMIT;
-                    break;
-                }
-            }
-        }
+        struct thread *t = next_ready(p, now);
         if (!t) continue;
         if (!t->resume || now >= t->slice_deadline) t->slice_deadline = now + 5000;
         t->resume = false;
@@ -1062,6 +1121,25 @@ static void dispatch(unsigned cpu) {
     }
 }
 
+/* Gives idle CPUs to ready threads: CPU 0 alone while no worker is online
+ * (first 0), else the workers in turn from first. */
+static void dispatch_idle(unsigned first) {
+    if (frozen) return;
+    unsigned cpus = first ? ARM_CPU_MAX - 1 : 1, order[ARM_CPU_MAX];
+    bool idle = false;
+    for (unsigned i = 0; i < cpus; ++i) {
+        order[i] = first ? 1 + (first - 1 + i) % (ARM_CPU_MAX - 1) : 0;
+        idle = idle || arm_cpu_idle(order[i]);
+    }
+    if (!idle) return;
+    uint64_t now = time_us(), epoch = vm_epoch();
+    for (struct process *p = processes; p; p = p->next)
+        if (p->state == RUNNABLE) wake_expired(p, now, epoch);
+    for (unsigned i = 0; i < cpus; ++i) dispatch(order[i], now);
+}
+
+uint64_t process_user_us(void) { return user_us; }
+
 /* Standby: no user thread starts a slice; running slices end within 5 ms.
  * Kernel services, including I/O already submitted, keep running. */
 void process_freeze(bool freeze) { frozen = freeze; }
@@ -1070,18 +1148,18 @@ void process_step(void) {
     for (unsigned cpu = 0; cpu < ARM_CPU_MAX; ++cpu) collect(cpu);
     for (struct process *p = processes; p; p = p->next) finish_quiescent(p);
     network_poll();
+    audio_poll();
     service_step();
     if (random_ready != entropy_available()) {
         random_ready = entropy_available();
         page_host_entropy_status(random_ready, entropy_error());
     }
     if (arm_smp_online() == 1) {
-        dispatch(0);
+        dispatch_idle(0);
         collect(0);
         return;
     }
     unsigned first = next_cpu;
     next_cpu = next_cpu % (ARM_CPU_MAX - 1) + 1;
-    for (unsigned i = 0; i < ARM_CPU_MAX - 1; ++i)
-        dispatch(1 + (first - 1 + i) % (ARM_CPU_MAX - 1));
+    dispatch_idle(first);
 }

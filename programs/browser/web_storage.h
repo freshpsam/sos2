@@ -13,6 +13,8 @@ class ResourceRequest;
 
 namespace SOS2 {
 void configureStorage(WebCore::PageConfiguration &);
+// The profile's durable cookies and local storage, once changes settle.
+void saveStorage();
 std::string requestCookies(const WebCore::ResourceRequest &, bool crossSiteRedirect);
 void responseCookie(const WebCore::ResourceRequest &, std::string_view, bool crossSiteRedirect);
 bool differentCookieSites(const WTF::URL &, const WTF::URL &);

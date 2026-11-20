@@ -5,26 +5,37 @@
 // or fading a layer then costs a composite instead of a repaint. Pages without
 // composited layers keep the direct paint path.
 //
-// On the CPU (LayerCompositor), each layer paints into its own Skia bitmap
-// during WebCore's layer flush, and every frame draws the layer tree with its
-// transforms, opacity and clips. Pages painting on the GPU use WebKit's own
-// compositor instead (GPUCompositor, web_gpu_compositor.h).
+// On the CPU (LayerCompositor), each layer the viewport shows paints into its
+// own Skia bitmap during WebCore's layer flush, and each frame draws the layer
+// tree with its transforms, opacity and clips where it changed. A video has a
+// layer of its own, into which the compositor draws the player's current
+// frame, so new frames repaint nothing. Pages painting on the GPU use WebKit's
+// own compositor instead (GPUCompositor, web_gpu_compositor.h).
 #include <WebCore/Color.h>
 #include <WebCore/FloatRect.h>
 #include <WebCore/GraphicsLayer.h>
 #include <WebCore/GraphicsLayerFactory.h>
 #include <WebCore/IntRect.h>
+#include <WebCore/NativeImage.h>
 #include <WebCore/Region.h>
 #include <WebCore/TransformationMatrix.h>
 #include <skia/core/SkBitmap.h>
+#include <wtf/HashSet.h>
 #include <cstdint>
-#include <optional>
 
 class SkCanvas;
 
 namespace SOS2 {
 
 class LayerCompositor;
+
+// What a composite changed: the damage, in surface coordinates, as rectangles
+// to draw (SOS2::coalesceDamage). When the compositor cannot draw the tree it
+// draws nothing, and the caller paints the damage with the layers flattened.
+struct Composition {
+    WebCore::Region damage;
+    bool flatten{false};
+};
 
 // What web_main.cpp drives each frame, on either compositor.
 class Compositor {
@@ -51,17 +62,17 @@ public:
     virtual void commit() { }
 
     // Draws the layers into the canvas where they changed since the last
-    // composite and returns that damage. Nullopt when the compositor cannot
-    // draw the tree: the caller then paints the whole view flattened.
-    virtual std::optional<WebCore::Region> composite(SkCanvas &) = 0;
+    // composite, or leaves that damage to the caller to paint flattened.
+    virtual Composition composite(SkCanvas &) = 0;
 
 protected:
     RefPtr<WebCore::GraphicsLayer> m_root;
 };
 
-// A layer's contents live in one bitmap ("cover"): the whole layer when it is at
-// most twice the viewport, otherwise only the part the viewport shows, as for
-// the document's root contents. Moving the cover keeps overlapping pixels.
+// A layer's contents live in one bitmap ("cover") while the viewport shows any
+// of it: the whole layer when it is at most twice the viewport, otherwise only
+// the part the viewport shows, as for the document's root contents. Moving the
+// cover keeps overlapping pixels; layers out of view keep none.
 class CompositingLayer final : public WebCore::GraphicsLayer {
 public:
     CompositingLayer(Type, WebCore::GraphicsLayerClient &, LayerCompositor &);
@@ -102,8 +113,11 @@ public:
     void setContentsClippingRect(const WebCore::FloatRoundedRect &) final;
     void setContentsRectClipsDescendants(bool) final;
     void setContentsToSolidColor(const WebCore::Color &) final;
+    // A video: the player's frames, drawn in the contents rectangle
+    // (MediaPlayerPrivateSOS2::supportsAcceleratedRendering).
+    void setContentsToPlatformLayer(PlatformLayer *, ContentsLayerPurpose) final;
 
-    bool usesContentsLayer() const final { return m_solidColor.isValid(); }
+    bool usesContentsLayer() const final { return m_solidColor.isValid() || m_showsVideo; }
 
     // Declined, so WebCore paints filters and images into the layer itself.
     // Backdrop filters are not drawn, as without compositing.
@@ -120,12 +134,18 @@ private:
     friend class LayerCompositor;
     void willModifyChildren() final;
     void noteChange();
+    RefPtr<WebCore::NativeImage> currentVideoFrame() const;
 
     LayerCompositor &m_compositor;
     WebCore::Color m_solidColor;
+    bool m_showsVideo{false};
+    bool m_reached{false};                     // in the tree the last update walked
+    RefPtr<WebCore::NativeImage> m_videoFrame; // the frame drawn
+    WebCore::FloatRect m_videoBounds;          // surface coordinates, clipped
     WebCore::TransformationMatrix m_combined; // layer coordinates to the page surface
     WebCore::FloatRect m_subtreeBounds;       // surface coordinates, clipped
     WebCore::IntRect m_cover;                 // layer coordinates of m_backing
+    WebCore::IntRect m_wantedCover;           // what this update gives it
     SkBitmap m_backing;
     WebCore::Region m_dirty;          // layer coordinates
     bool m_coverMoved{false};         // strips were painted since the last full repaint
@@ -148,15 +168,18 @@ public:
         m_damage = WebCore::Region(WebCore::IntRect(WebCore::IntPoint(), m_viewport));
     }
 
-    bool needsComposite() const final { return m_changed; }
+    bool needsComposite() const final;
+
+    // New video frames alone are drawn without a WebCore rendering update.
+    bool compositesWithoutUpdate() const final { return !m_changed; }
 
     bool refinementDue(uint64_t nowUs) const final {
         return m_refineAfter && nowUs >= m_refineAfter;
     }
 
-    // Nullopt also when a layer needs a feature this compositor lacks (mask,
-    // replica, blend mode) or backings exceed the memory budget.
-    std::optional<WebCore::Region> composite(SkCanvas &) final;
+    // Flattened when a layer needs a feature this compositor lacks (mask,
+    // replica, blend mode) or the backings would exceed the memory budget.
+    Composition composite(SkCanvas &) final;
 
 private:
     friend class CompositingLayer;
@@ -174,13 +197,17 @@ private:
 
     void update(CompositingLayer &root, const WebCore::FloatRect &viewport);
     void updateLayer(CompositingLayer &, const WebCore::TransformationMatrix &parentForChildren,
-                     const WebCore::FloatRect &clip, bool refine);
-    void updateBacking(CompositingLayer &, const WebCore::FloatRect &visible, bool refine);
+                     const WebCore::FloatRect &clip);
+    void updateBackings(CompositingLayer &, bool refine);
     bool moveCover(CompositingLayer &, const WebCore::IntRect &cover);
     void paintDirty(CompositingLayer &);
     void releaseBacking(CompositingLayer &);
     void addDamage(const WebCore::FloatRect &);
-    void drawLayer(SkCanvas &, CompositingLayer &);
+    bool takeVideoFrame(CompositingLayer &);
+    void findOccluder(CompositingLayer &, const WebCore::IntRect &damage,
+                      Vector<CompositingLayer *> &path);
+    bool coversOpaquely(const CompositingLayer &, const WebCore::IntRect &damage) const;
+    void drawLayer(SkCanvas &, CompositingLayer &, const WebCore::IntRect &damage);
     void drawContents(SkCanvas &, CompositingLayer &, float alpha);
 
     Factory m_factory{*this};
@@ -190,8 +217,16 @@ private:
     WebCore::Region m_damage; // surface coordinates
     bool m_changed{true};
     bool m_unsupported{false};
-    bool m_overBudget{false};
+    bool m_flatten{false};      // the caller paints the layers flattened
     uint64_t m_backingBytes{0}; // all layers' backings, held within the memory budget
+    uint64_t m_wantedBytes{0};  // what this update's covers need
+    uint64_t m_budget;          // lowered for a while when memory runs out
+    uint64_t m_budgetRetryAt{0};
+    HashSet<CompositingLayer *> m_videoLayers; // polled for new frames
+    // While drawing a rectangle: the path from the root to the topmost layer
+    // that hides all of it, and whether drawing has yet to reach that layer.
+    Vector<CompositingLayer *> m_occluder;
+    bool m_occluded{false};
 };
 
 }

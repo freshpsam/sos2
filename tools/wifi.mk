@@ -4,7 +4,7 @@ WIFI_MBEDTLS_SOURCES := $(wildcard third_party/wifi-mbedtls/library/*.c)
 # The station (802.11 frames, scans, joins) and its WPA2/WPA3 authentication,
 # shared by the boards with Wi-Fi.
 WIFI_AUTH_SOURCES := kernel/wifi/wifi_port.c kernel/wifi/wifi_ec.c kernel/wifi/wifi_auth.c
-WIFI_SOURCES := $(WIFI_AUTH_SOURCES) kernel/wifi/wifi_station.c
+WIFI_SOURCES := $(WIFI_AUTH_SOURCES) kernel/wifi/wifi_station.c kernel/wifi/wifi_device.c
 WIFI_CRYPTO_FLAGS := -Iinclude -Ithird_party/wifi-mbedtls/include \
     -DMBEDTLS_CONFIG_FILE='"wifi/mbedtls_config.h"'
 WIFI_AUTH_FLAGS := $(WIFI_CRYPTO_FLAGS) -Ithird_party/hostap/src -Ithird_party/hostap/src/utils \
