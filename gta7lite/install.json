@@ -1,0 +1,19 @@
+{
+  "release": "2026-11-21 15:57 f979743",
+  "board": "gta7litewifi",
+  "wifi_profile": false,
+  "files": {
+    "flash-boot.img": {
+      "bytes": 24485904,
+      "sha256": "66c54edbd4a304e281d0c9ef32012c85fc512511d40356dde8caf50c6aa0fa06"
+    },
+    "sos2-gta7lite.update": {
+      "bytes": 24492032,
+      "sha256": "328547918be364288add3aea2616edb86ba7fe3be574b7c49500edb4e1bda81b"
+    }
+  },
+  "flash": [
+    "fastboot flash boot flash-boot.img",
+    "fastboot reboot"
+  ]
+}

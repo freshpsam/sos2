@@ -1,0 +1,20 @@
+{
+  "release": "2026-11-21 15:57 f979743",
+  "board": "lge-hammerhead",
+  "boot_cmdline": "sos2.storage=installed",
+  "wifi_profile": false,
+  "files": {
+    "flash-boot.img": {
+      "bytes": 22704128,
+      "sha256": "035de5766e7c0505761fd921a01543c3033d4e967f672593b85e6fa24c11bcf5"
+    },
+    "sos2-nexus5.update": {
+      "bytes": 22708224,
+      "sha256": "a7d99c3b9103d6b3932df9ef1e319a435a6beb82c0ebdf2bce3560462ecdb272"
+    }
+  },
+  "flash": [
+    "fastboot flash boot flash-boot.img",
+    "fastboot reboot"
+  ]
+}

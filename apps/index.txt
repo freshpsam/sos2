@@ -1,0 +1,2 @@
+SOS2 apps 1
+calculator 1 77972 d1ac19e50d1e293af7f06687b7b94bcf0d1bda29c7f1c27dcd6cffe303470da3 Calculator
