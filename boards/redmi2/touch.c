@@ -1,6 +1,6 @@
 #include "redmi2_touch.h"
 #include "redmi2_touch_hw.h"
-#include "msm8916_i2c.h"
+#include "qup_i2c.h"
 
 /* Independently implemented from these protocol/hardware descriptions:
  * Linux msm8916-wingtech-wt88047.dts: edt,edt-ft5506, address 0x38, 720x1280.
@@ -55,6 +55,10 @@ enum {
     START_US = 300000,
     NO_CONTACT = 0xff,
 };
+
+/* BLSP1 QUP5 on GPIO18/19 at 100 kHz; touch_hw.c enables its core and AHB
+ * clocks, the pins' mux and the controller's supplies before init. */
+static struct qup_i2c touch_bus = {.base = 0x078b9000};
 
 struct touch_report {
     uint16_t active, off_panel;
@@ -203,13 +207,13 @@ bool redmi2_touch_init(uint32_t width, uint32_t height) {
     display_width = width;
     display_height = height;
     if (!width || !height || width > 8192 || height > 8192) return false;
-    if (!redmi2_touch_hw_init() || !msm8916_i2c_init()) return false;
+    if (!redmi2_touch_hw_init() || !qup_i2c_init(&touch_bus)) return false;
     uint8_t name[22], identity[3] = {0};
-    if (!msm8916_i2c_read(TOUCH_ADDRESS, 0xbb, name, sizeof(name))) return false;
+    if (!qup_i2c_read(&touch_bus, TOUCH_ADDRESS, 0xbb, name, sizeof(name))) return false;
     if (ep0_prefix(name + 1)) return false; /* EDT M06 report protocol: unsupported */
     if (!ep0_prefix(name)) {
-        if (!msm8916_i2c_read(TOUCH_ADDRESS, 0xa6, identity, 2) ||
-            !msm8916_i2c_read(TOUCH_ADDRESS, 0xa8, identity + 2, 1))
+        if (!qup_i2c_read(&touch_bus, TOUCH_ADDRESS, 0xa6, identity, 2) ||
+            !qup_i2c_read(&touch_bus, TOUCH_ADDRESS, 0xa8, identity + 2, 1))
             return false;
         /* Linux's Evervision FT5726 variant has reversed coordinate order. */
         if (identity[2] == 0x59) return false;
@@ -218,10 +222,10 @@ bool redmi2_touch_init(uint32_t width, uint32_t height) {
      * documented to return bogus data on its first register access. Its value
      * and a failed transfer are discarded; the full report below must pass. */
     uint8_t dummy = 0;
-    (void)msm8916_i2c_read(TOUCH_ADDRESS, 0, &dummy, 1);
+    (void)qup_i2c_read(&touch_bus, TOUCH_ADDRESS, 0, &dummy, 1);
     uint8_t bytes[REPORT_BYTES];
     struct touch_report report;
-    if (!msm8916_i2c_read(TOUCH_ADDRESS, 0x00, bytes, sizeof(bytes)) ||
+    if (!qup_i2c_read(&touch_bus, TOUCH_ADDRESS, 0x00, bytes, sizeof(bytes)) ||
         !decode_report(bytes, &report))
         return false;
     last_read = last_good_report = now_us();
@@ -261,7 +265,7 @@ void redmi2_touch_suspend(void) {
      * the error. */
     hibernating = available;
     if (!available) return;
-    (void)msm8916_i2c_write(TOUCH_ADDRESS, PMODE_REGISTER, PMODE_HIBERNATE);
+    (void)qup_i2c_write(&touch_bus, TOUCH_ADDRESS, PMODE_REGISTER, PMODE_HIBERNATE);
     /* Then held in reset until waking, whose reset pulse ends it, as Linux's
      * power-off suspend asserts reset before cutting the supply: hibernated
      * but out of reset it still drew about 1 mA. Its supply (L17, shared with
@@ -308,10 +312,10 @@ bool redmi2_touch_poll(struct pointer_event *event) {
      * Most reports end within the first two records; only when those cannot
      * settle a report, read the complete one again in a single transaction,
      * so records from two controller frames are never combined. */
-    bool read_ok = msm8916_i2c_read(TOUCH_ADDRESS, 0x00, bytes, PREFIX_BYTES);
+    bool read_ok = qup_i2c_read(&touch_bus, TOUCH_ADDRESS, 0x00, bytes, PREFIX_BYTES);
     int decoded = read_ok ? decode_records(bytes, PREFIX_RECORDS, &report) : DECODE_BAD;
     if (decoded == DECODE_SHORT) {
-        read_ok = msm8916_i2c_read(TOUCH_ADDRESS, 0x00, bytes, sizeof(bytes));
+        read_ok = qup_i2c_read(&touch_bus, TOUCH_ADDRESS, 0x00, bytes, sizeof(bytes));
         decoded = read_ok ? decode_records(bytes, CONTACTS, &report) : DECODE_BAD;
     }
     /* Rate-limit from completion, not the start of a possibly slow transaction. */

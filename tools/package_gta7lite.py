@@ -141,7 +141,7 @@ def tablet_resources(bundle, release, touch=None, wifi=None, profile=None):
     """The SORZ resources and the apps they leave out, as packages by id: the
     arm64 bundle, checked, without its apps, with the release's name, the
     touch and Wi-Fi firmware files when given, and a Wi-Fi profile's
-    /system/wifi-profile; about 29 MB with the engine, which the boot
+    /system/wifi-profile; about 24 MB with the engine, which the boot
     partition's 32 MiB hold."""
     files = resources.bundle_files(bundle)
     updater = files.get(b'/bin/sos2-updater', b'')

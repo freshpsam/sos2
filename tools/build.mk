@@ -1,6 +1,6 @@
 # One browser kernel per board and architecture; no embedded experiments or
-# sample apps. ARM32 serves QEMU and the Redmi 2; arm64 serves QEMU and the
-# Galaxy Tab A7 Lite.
+# sample apps. ARM32 serves QEMU, the Redmi 2 and the Nexus 5; arm64 serves
+# QEMU and the Galaxy Tab A7 Lite.
 # On PATH, or an Arm GNU Toolchain unpacked into .tools/ (as tools/arch.py).
 ARM32_PREFIX ?= $(if $(shell command -v arm-none-eabi-gcc 2>/dev/null),arm-none-eabi-,$(CURDIR)/.tools/arm-none-eabi/bin/arm-none-eabi-)
 ARM32_CC := $(ARM32_PREFIX)gcc
@@ -17,7 +17,7 @@ COMMON_FLAGS := -marm -mfloat-abi=soft -mgeneral-regs-only -mno-unaligned-access
     -Ithird_party/littlefs -DLFS_CONFIG=sos2_lfs_config.h \
     -Iinclude/lwip -Ithird_party/lwip/src/include
 QEMU_FLAGS := $(COMMON_FLAGS) -mcpu=cortex-a15
-REDMI2_PROTECTED_CFLAGS := $(COMMON_FLAGS) -mcpu=cortex-a53 -DSOS2_BOARD_REDMI2=1 -Iboards/redmi2 -Ithird_party/jitterentropy
+REDMI2_PROTECTED_CFLAGS := $(COMMON_FLAGS) -mcpu=cortex-a53 -DSOS2_BOARD_REDMI2=1 -Iboards/redmi2 -Iboards/qcom -Ithird_party/jitterentropy
 include tools/wifi.mk
 REDMI2_PROTECTED_CFLAGS += $(WIFI_CRYPTO_FLAGS)
 
@@ -33,7 +33,7 @@ QEMU_SOURCES := $(wildcard kernel/*.c) \
     kernel/audio/audio.c kernel/audio/virtio_snd.c $(ARM_SOURCES) $(LIBRARIES)
 PHONE_SOURCES := $(filter-out kernel/ramfb.c kernel/input.c kernel/virtio_gpu.c,$(wildcard kernel/*.c)) \
     $(filter-out kernel/protection/block.c kernel/protection/entropy.c,$(wildcard kernel/protection/*.c)) \
-    $(wildcard boards/redmi2/*.c) kernel/net/network.c kernel/net/network_time.c kernel/net/strings.c kernel/audio/audio.c \
+    $(wildcard boards/redmi2/*.c) boards/qcom/qup_i2c.c boards/qcom/scm.c kernel/net/network.c kernel/net/network_time.c kernel/net/strings.c kernel/audio/audio.c \
     $(ARM_SOURCES) $(LIBRARIES) $(wildcard third_party/jitterentropy/src/*.c) $(WIFI_SOURCES) \
     $(HOSTAP_SOURCES) $(WIFI_MBEDTLS_SOURCES)
 QEMU_OBJECTS := $(patsubst %.c,build/resources-arm32/%.o,$(QEMU_SOURCES)) \
@@ -114,6 +114,35 @@ build/redmi2/boot.dtb: boards/redmi2/boot.dts tools/dtc.py
 	@mkdir -p $(@D)
 	$(PYTHON) tools/dtc.py -I dts -O dtb -o $@ $<
 
+# The Nexus 5 (LG hammerhead, MSM8974): the ARM32 kernel for its Krait cores,
+# ARMv7 like QEMU's Cortex-A15, with the stock bootloader's splash as its
+# screen (boards/nexus5), the QUP I2C and secure-call drivers it shares with
+# the Redmi 2 (boards/qcom), Wi-Fi on the shared station (kernel/wifi), the
+# phone's CPU-jitter randomness and its eMMC.
+NEXUS5_CFLAGS := $(COMMON_FLAGS) -mcpu=cortex-a15 -DSOS2_BOARD_NEXUS5=1 -Iboards/nexus5 -Iboards/qcom -Ithird_party/jitterentropy \
+    $(WIFI_CRYPTO_FLAGS)
+NEXUS5_SOURCES := $(filter-out kernel/ramfb.c kernel/input.c kernel/virtio_gpu.c,$(wildcard kernel/*.c)) \
+    $(filter-out kernel/protection/block.c kernel/protection/entropy.c,$(wildcard kernel/protection/*.c)) \
+    $(wildcard boards/nexus5/*.c) boards/qcom/qup_i2c.c boards/qcom/scm.c kernel/net/network.c kernel/net/network_time.c kernel/net/strings.c kernel/audio/audio.c \
+    $(ARM_SOURCES) $(LIBRARIES) $(wildcard third_party/jitterentropy/src/*.c) $(WIFI_SOURCES) \
+    $(HOSTAP_SOURCES) $(WIFI_MBEDTLS_SOURCES)
+NEXUS5_OBJECTS := $(patsubst %.c,build/nexus5-arm32/%.o,$(NEXUS5_SOURCES)) \
+    $(patsubst %,build/nexus5-arm32/arch/arm/%.o,boot process scm cache_ops psci)
+build/nexus5-arm32/third_party/jitterentropy/%.o: third_party/jitterentropy/%.c Makefile tools/build.mk
+	@mkdir -p $(@D)
+	$(ARM32_CC) $(NEXUS5_CFLAGS) -O0 -fwrapv -c $< -o $@
+build/nexus5-arm32/%.o: %.c Makefile tools/build.mk
+	@mkdir -p $(@D)
+	$(ARM32_CC) $(NEXUS5_CFLAGS) -c $< -o $@
+build/nexus5-arm32/%.o: %.S Makefile tools/build.mk
+	@mkdir -p $(@D)
+	$(ARM32_CC) $(NEXUS5_CFLAGS) -c $< -o $@
+build/nexus5-arm32/kernel.elf: $(NEXUS5_OBJECTS) boards/nexus5/kernel.ld
+	$(ARM32_CC) $(NEXUS5_CFLAGS) -nostdlib -Wl,-T,boards/nexus5/kernel.ld,-Map,$(@:.elf=.map),--build-id=none,-z,noexecstack,--gc-sections $(NEXUS5_OBJECTS) -lgcc -o $@
+build/nexus5/boot.dtb: boards/nexus5/boot.dts tools/dtc.py
+	@mkdir -p $(@D)
+	$(PYTHON) tools/dtc.py -I dts -O dtb -o $@ $<
+
 build/host/mkfs: tools/mkfs.c third_party/littlefs/lfs.c third_party/littlefs/lfs.h include/sos2_lfs_config.h
 	@mkdir -p $(@D)
 	$(HOST_CC) $(HOST_CFLAGS) -Iinclude -Ithird_party/littlefs -DLFS_CONFIG=sos2_lfs_config.h -DSOS2_LFS_HOST tools/mkfs.c third_party/littlefs/lfs.c -o $@
@@ -121,4 +150,5 @@ build/host/fs-image: tools/fs_image.c include/apps.h include/runtime_files.h thi
 	@mkdir -p $(@D)
 	$(HOST_CC) $(HOST_CFLAGS) -Iinclude -Ithird_party/littlefs -DLFS_CONFIG=sos2_lfs_config.h -DSOS2_LFS_HOST tools/fs_image.c third_party/littlefs/lfs.c -o $@
 
--include $(QEMU_OBJECTS:.o=.d) $(PHONE_OBJECTS:.o=.d) $(ARM64_OBJECTS:.o=.d) $(GTA7LITE_OBJECTS:.o=.d)
+-include $(QEMU_OBJECTS:.o=.d) $(PHONE_OBJECTS:.o=.d) $(ARM64_OBJECTS:.o=.d) $(GTA7LITE_OBJECTS:.o=.d) \
+    $(NEXUS5_OBJECTS:.o=.d)

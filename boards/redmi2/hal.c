@@ -194,7 +194,7 @@ static bool restart_nv(struct wcn_hal *h, uint64_t now) {
      * from zero. Do this once, only for a non-final NV fragment: first-fragment,
      * final parsing, other-command, malformed and transport failures stay fatal.
      * Never infer "radio absent" from the legacy host status enum here.
-     * See docs/redmi2-wifi.md for the firmware evidence. */
+     * See docs/redmi2.md for the firmware evidence. */
     if (h->ready || h->phase || h->request != WCN36XX_HAL_DOWNLOAD_NV_REQ ||
         h->response_size != 12 || le32(h->rx + 8) != 5 || !h->fragment || !h->nv_sent ||
         le16(h->tx + 10) || h->nv_restarts)

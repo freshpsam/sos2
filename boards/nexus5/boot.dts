@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: MIT
+/dts-v1/;
+
+// Boot handoff for this native kernel, not a Linux hardware DTB. The stock
+// hammerhead bootloader (HHZ20h) picks the tree appended to the kernel by
+// qcom,msm-id, replaces /memory's reg with its two 1 GiB RAM banks, fills
+// /chosen with the command line and the ramdisk, and starts the kernel with
+// its splash still on the panel (boards/nexus5/display.c). See docs/nexus5.md.
+/ {
+    model = "LGE MSM 8974 HAMMERHEAD, sos2 boot handoff";
+    compatible = "lge,hammerhead", "qcom,msm8974";
+    qcom,msm-id = <126 150 0x20002>;
+    #address-cells = <1>;
+    #size-cells = <1>;
+
+    chosen {
+    };
+
+    memory {
+        device_type = "memory";
+        reg = <0 0>;
+    };
+
+    reserved-memory {
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges;
+
+        // Google's msm8974.dtsi qcom,msm-mem-hole: the modem, ADSP, Wi-Fi
+        // and video firmware, shared memory, TrustZone and the bootloader.
+        // HHZ20h's splash, which SOS2 draws into, lies in it too: the
+        // 1080x1920 RGB888 buffer at 0x0D200000, in the region of WCNSS
+        // Wi-Fi firmware this phone does not have.
+        firmware@7b00000 {
+            reg = <0x07b00000 0x08400000>;
+        };
+
+        // SOS2's USB link: the controller's queue heads and buffers, never
+        // cached (boards/nexus5/usb.c).
+        usb@2600000 {
+            reg = <0x02600000 0x00010000>;
+        };
+
+        // LG's bootloader keeps the second bank's first MiB, and the stock
+        // kernel its RAM console in the next (arch/arm/mach-msm/lge/devices_lge.c).
+        lge@40000000 {
+            reg = <0x40000000 0x00200000>;
+        };
+    };
+};

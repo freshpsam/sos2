@@ -1,12 +1,16 @@
 #include "display.h"
 #include "platform.h"
 /* QEMU's displays: virtio-gpu, else ramfb. The devices keep the framebuffer
- * their loader set up, the Redmi 2 with its Adreno. */
-#if !defined(SOS2_BOARD_REDMI2) && !defined(SOS2_BOARD_GTA7LITE)
+ * their loader set up, the Redmi 2 with its Adreno; the Nexus 5's panel
+ * shows it only as frames sent to it (boards/nexus5/display.c). */
+#if !defined(SOS2_BOARD_REDMI2) && !defined(SOS2_BOARD_GTA7LITE) && !defined(SOS2_BOARD_NEXUS5)
 #define QEMU_DISPLAY 1
 #endif
 #ifdef SOS2_BOARD_REDMI2
 #include "redmi2_adreno.h"
+#endif
+#ifdef SOS2_BOARD_NEXUS5
+#include "nexus5.h"
 #endif
 #ifndef SOS2_BOARD_REDMI2
 static struct framebuffer *screen;
@@ -22,8 +26,8 @@ bool display_init(const struct platform_devices *devices, struct framebuffer *ou
     (void)devices;
     (void)out;
     return false; /* The phone uses its verified handoff. */
-#elif defined(SOS2_BOARD_GTA7LITE)
-    /* LK's framebuffer, from the verified handoff; no GPU. */
+#elif defined(SOS2_BOARD_GTA7LITE) || defined(SOS2_BOARD_NEXUS5)
+    /* The bootloader's framebuffer, from the verified handoff; no GPU. */
     screen = out;
     *out = devices->framebuffer;
     return devices->has_framebuffer;
@@ -38,6 +42,8 @@ bool display_init(const struct platform_devices *devices, struct framebuffer *ou
 void display_poll(void) {
 #ifdef SOS2_BOARD_REDMI2
     redmi2_adreno_poll();
+#elif defined(SOS2_BOARD_NEXUS5)
+    nexus5_display_poll();
 #elif defined(QEMU_DISPLAY)
     if (!gpu || failed) return;
     virtio_gpu_poll();
@@ -66,6 +72,9 @@ bool display_gpu_frames(void) {
 void display_flush_error(void) {
 #ifdef SOS2_BOARD_REDMI2
     redmi2_adreno_stop();
+#elif defined(SOS2_BOARD_NEXUS5)
+    /* Only the boot CPU sends frames; its waits read the timer. */
+    if (!arch_cpu_affinity() && arch_counter_frequency()) nexus5_display_flush();
 #elif defined(QEMU_DISPLAY)
     if (!gpu || failed) return;
     /* Only the boot CPU owns the queue. A broken timer must not recurse into

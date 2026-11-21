@@ -374,6 +374,7 @@ void wifi_device_init(const struct wifi_radio *r, struct net_device *out) {
     struct wifi_profile bootstrap;
     bool imported =
         config && wifi_profile_read(&bootstrap, runtime_file_data(config), config->size);
+    wifi_rsn_pmf(!r->no_pmf);
     const struct wifi_setup_ops ops = {
         start_radio,     service_pending,     service, snapshot, scan_networks,
         connect_profile, wifi_auth_credential};

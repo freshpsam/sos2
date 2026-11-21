@@ -26,6 +26,8 @@ struct wifi_radio {
     int (*configure)(enum wifi_action, const struct wifi_station *, uint64_t now);
     bool (*send)(const void *frame, unsigned size, bool data);
     bool (*drained)(void);
+    /* The radio cannot protect management frames (wifi_rsn_pmf). */
+    bool no_pmf;
 };
 
 /* Resets the device with this radio and starts the desktop's Wi-Fi setup,

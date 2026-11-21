@@ -9,7 +9,7 @@ _Static_assert(sizeof(struct wcn36xx_tx_bd) + 8 == WCN_TX_BD_SIZE,
                "Pronto TX descriptor prefix and extension");
 
 /* Pronto's reset is CCU bit 2, not the Riva CSR reset. Its CSR enable value
- * is H2H_SYNC | ECTR | ENABLE; see the stock DXE sources in redmi2-wifi.md. */
+ * is H2H_SYNC | ECTR | ENABLE; see the stock DXE sources in docs/redmi2.md. */
 enum {
     DXE = 0x0a202000,
     CCU = 0x0a204000,

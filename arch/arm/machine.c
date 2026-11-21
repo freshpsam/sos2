@@ -7,6 +7,9 @@
 #ifdef SOS2_BOARD_GTA7LITE
 #include "gta7lite.h"
 #endif
+#ifdef SOS2_BOARD_NEXUS5
+#include "nexus5.h"
+#endif
 
 static struct arm_machine machine;
 
@@ -67,6 +70,32 @@ bool arm_machine_init(const struct platform_devices *d) {
         {0x01a98000,0x1000}, /* DSI0 controller, PLL and PHY: panel sleep, pipeline off */
         {0x0184d000,0x1000}, /* GCC MDSS clocks and power domain */
         {0x01a01000,0x2000}, {0x01a6b000,0x1000}, /* MDP top and CTL0, INTF1 */
+    };
+    for (unsigned i = 0; i < sizeof(phone) / sizeof(phone[0]); ++i)
+        if (!device(phone[i].start, phone[i].size)) return false;
+#elif defined(SOS2_BOARD_NEXUS5)
+    if (!d->nexus5_hammerhead || !d->has_framebuffer) return false;
+    /* MSM8974's QGIC2 and the virtual timer's PPI 4 (INTID 20), from Google's
+     * hammerhead msm8974.dtsi and Linux's qcom-msm8974.dtsi. */
+    machine.timer = (struct arm_timer_route){0xf9000000, 0xf9002000, 20, true};
+    static const struct arm_mapping phone[] = {
+        {0xfd8c2000, 0x2000},  /* MMCC: the display's clocks, the vibrator's PWM */
+        {0xfd900000, 0x23000}, /* MDSS: MDP 1.2, the splash's CTL and DSI0 (display.c) */
+        {0xfc4cf000, 0x1000},  /* SPMI arbiter core, channel 0: PM8941 (pmic.c) */
+        {0xf9a55000, 0x1000},  /* ChipIdea USB controller: the fastboot link (usb.c) */
+        {0x02600000, 0x10000}, /* its queue heads and buffers, RAM kept uncached */
+        {0xfc400000, 0x2000},  /* GCC: the USB controller's and I2C buses' clocks */
+        {0xf9923000, 0x2000},  /* BLSP1 QUP1, QUP2: the battery's and touch screen's I2C */
+        {0xf9967000, 0x1000},  /* BLSP2 QUP5: the backlight's I2C bus */
+        {0xfd511000, 0x1000},  /* TLMM GPIO 0-145: the touch screen's and Wi-Fi's pins */
+        {0xfd512000, 0x1000},  /* TLMM SDC pad control: SDC2's, Wi-Fi's bus */
+        {0xf98a4000, 0x1000},  /* SDCC2 and its SDHCI: the Wi-Fi chip's SDIO (sdio.c) */
+        {0xf9824000, 0x1000},  /* SDCC1 and its SDHCI: the eMMC (emmc.c) */
+        {0xfe805000, 0x1000},  /* IMEM: the restart reason the bootloader reads */
+        {0xf9010000, 0x10000}, /* APCS: its clock control, the L2's SAW2 and HFPLL */
+        {0xf9088000, 0x40000}, /* each CPU's ACC, SAW2 and HFPLL (n at 0x10000 n) */
+        {0xfc4b8000, 0x1000},  /* QFPROM: the CPUs' speed and voltage bins */
+        {0xfc4ab000, 0x1000},  /* MPM2 PS_HOLD: dropped to restart */
     };
     for (unsigned i = 0; i < sizeof(phone) / sizeof(phone[0]); ++i)
         if (!device(phone[i].start, phone[i].size)) return false;
@@ -136,7 +165,7 @@ bool arm_machine_init(const struct platform_devices *d) {
 }
 
 enum arm_rtc_kind arm_rtc_kind(void) {
-#ifdef SOS2_BOARD_REDMI2
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
     return ARM_RTC_PMIC;
 #else
     return ARM_RTC_UNIX;
@@ -147,6 +176,9 @@ bool arm_rtc_read(uint32_t *seconds) {
     if (!seconds) return false;
 #ifdef SOS2_BOARD_REDMI2
     return redmi2_rtc_read(seconds);
+#elif defined(SOS2_BOARD_NEXUS5)
+    /* PM8941's counter, which stock Android never sets: an unknown epoch. */
+    return nexus5_rtc_read(seconds);
 #elif defined(SOS2_BOARD_GTA7LITE)
     /* The MT6357's calendar, which Android keeps in UTC: Unix seconds. */
     return gta7lite_rtc_read(seconds);

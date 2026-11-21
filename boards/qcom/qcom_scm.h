@@ -2,10 +2,15 @@
 #define SOS2_QCOM_SCM_H
 #include <stdint.h>
 #include <stdbool.h>
-/* Secure monitor calls are privileged and serialized. An individual SMC is
- * trusted firmware execution; software cannot impose a deadline inside it. */
+/* Qualcomm's secure monitor calls (scm.c), the Redmi 2's and the Nexus 5's:
+ * the SMC32 convention where the firmware has it, else the legacy one.
+ * Secure monitor calls are privileged and serialized. An individual SMC is
+ * trusted firmware execution; software cannot impose a deadline inside it.
+ * init probes the convention and the PAS (peripheral image) calls, which
+ * only the Redmi 2's Wi-Fi uses. */
 bool qcom_scm_init(void);
-/* Cold-boot entry for the MSM8916 single cluster. Independent of WCNSS PAS. */
+/* Cold-boot entry for the CPUs of the single cluster (cpu_mask: bit n is
+ * CPU n). Independent of WCNSS PAS. */
 bool qcom_scm_cpu_boot(uintptr_t entry, unsigned cpu_mask);
 /* The entry the firmware takes when a CPU in cpu_mask powers up after a power
  * collapse. Register it with the cold-boot entry, before the PAS setup. */

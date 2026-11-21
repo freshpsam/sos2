@@ -2,16 +2,17 @@
 """Publish each device's installed system, its update and its apps on GitHub Pages.
 
 make phone writes build/redmi2-install and build/apps (ARM32), make tablet
-build/gta7lite-install and build/apps-arm64 (AArch64); this pushes those of
-the devices built to the gh-pages branch of origin as a single commit, so the
-branch never keeps old images: each published device's folders and
-index.html are replaced, and every other file already on the branch, another
-device's included, is kept. The updater (programs/updater) downloads
-https://<owner>.github.io/<repository>/<device>/sos2-<device>.update and the
-packages its architecture's apps folder lists. Pages is public, so a build
-with a bootstrap Wi-Fi profile is refused. The commit is built in a temporary
-index; the checkout's own index and files are untouched. --device limits it
-to the devices named (redmi2, gta7lite).
+build/gta7lite-install and build/apps-arm64 (AArch64), make nexus5
+build/nexus5-install and build/apps (the Redmi 2's ARM32 apps); this pushes
+those of the devices built to the gh-pages branch of origin as a single
+commit, so the branch never keeps old images: each published device's
+folders and index.html are replaced, and every other file already on the
+branch, another device's included, is kept. The updater (programs/updater)
+downloads https://<owner>.github.io/<repository>/<device>/sos2-<device>.update
+and the packages its architecture's apps folder lists. Pages is public, so a
+build with a bootstrap Wi-Fi profile is refused. The commit is built in a
+temporary index; the checkout's own index and files are untouched. --device
+limits it to the devices named (redmi2, gta7lite, nexus5).
 """
 import argparse
 import hashlib
@@ -30,7 +31,8 @@ APP = ROOT/'programs/updater/updater.c'
 # Each device: its folder on Pages and name, its build's install and apps
 # folders, and its architecture's apps folder on Pages.
 DEVICES = (('redmi2', 'Redmi 2', 'build/redmi2-install', 'build/apps', 'apps'),
-           ('gta7lite', 'Galaxy Tab A7 Lite', 'build/gta7lite-install', 'build/apps-arm64', 'apps-arm64'))
+           ('gta7lite', 'Galaxy Tab A7 Lite', 'build/gta7lite-install', 'build/apps-arm64', 'apps-arm64'),
+           ('nexus5', 'Nexus 5', 'build/nexus5-install', 'build/apps', 'apps'))
 
 
 def git(*args, env=None, data=None):
@@ -56,7 +58,7 @@ def load(directory):
     manifest = json.loads((directory/'install.json').read_text())
     if manifest.get('wifi_profile') is not False:
         raise RuntimeError(f'{directory} carries a Wi-Fi profile, and Pages is public; '
-                           'build it without REDMI2_WIFI_PROFILE or GTA7LITE_WIFI_PROFILE')
+                           'build it without REDMI2_WIFI_PROFILE, GTA7LITE_WIFI_PROFILE or NEXUS5_WIFI_PROFILE')
     files = {}
     for name, entry in manifest['files'].items():
         content = (directory/name).read_bytes()
@@ -127,12 +129,16 @@ def index_page(sections):
 '''
 
 
-def check_updater(url, device, apps_folder):
-    """The updater must download from where this publishes."""
+def check_updater(url, device, apps_folder, board):
+    """The updater must download from where this publishes: in its table of
+    devices, this board's update; the apps in an APPS_URL."""
     source = APP.read_text()
-    for name, wanted in (('UPDATE_URL', f'{url}{device}/sos2-{device}.update'), ('APPS_URL', f'{url}{apps_folder}/')):
-        if wanted not in re.findall(rf'#define {name}\s+"([^"]+)"', source):
-            raise RuntimeError(f'the updater ({APP.relative_to(ROOT)}) must have {name} {wanted}')
+    update = f'{url}{device}/sos2-{device}.update'
+    if not re.search(rf'\{{\s*"{re.escape(board)}",\s*"{re.escape(update)}"', source):
+        raise RuntimeError(f'the updater ({APP.relative_to(ROOT)}) must list {update} for board {board}')
+    apps = f'{url}{apps_folder}/'
+    if apps not in re.findall(r'#define APPS_URL\s+"([^"]+)"', source):
+        raise RuntimeError(f'the updater ({APP.relative_to(ROOT)}) must have APPS_URL {apps}')
 
 
 def published(ref, path):
@@ -153,11 +159,11 @@ def publish(only=()):
              if (not only or device in only) and
              (ROOT/install/'install.json').is_file() and (ROOT/apps/'index.txt').is_file()]
     if not built:
-        raise RuntimeError('nothing to publish: run make phone or make tablet first')
+        raise RuntimeError('nothing to publish: run make phone, make tablet or make nexus5 first')
     entries, releases, current = {}, {}, {}
     for device, title, install, apps_directory, folder in built:
-        check_updater(url, device, folder)
         manifest, files = load(install)
+        check_updater(url, device, folder, manifest['board'])
         apps, app_files = load_apps(apps_directory)
         entries.update({f'{device}/{name}': content for name, content in files.items()})
         entries.update({f'{folder}/{name}': content for name, content in app_files.items()})
@@ -167,6 +173,8 @@ def publish(only=()):
     ref = f'refs/remotes/origin/{BRANCH}'
     if remote:
         git('fetch', '--quiet', 'origin', f'+refs/heads/{BRANCH}:{ref}')
+    # An apps folder published now replaces what every device sharing it lists.
+    new_apps = {folder: current[device][1] for device, _, _, _, folder in built}
     sections = []
     for device, title, _, _, folder in DEVICES:
         if device in current:
@@ -174,8 +182,11 @@ def publish(only=()):
         elif remote and published(ref, f'{device}/install.json') is not None:
             # Another device's release stays as published.
             manifest = json.loads(published(ref, f'{device}/install.json'))
-            apps, _ = parse_apps(published(ref, f'{folder}/index.txt') or b'',
-                              lambda name: published(ref, f'{folder}/{name}') or b'', folder)
+            if folder in new_apps:
+                apps = new_apps[folder]
+            else:
+                apps, _ = parse_apps(published(ref, f'{folder}/index.txt') or b'',
+                                  lambda name: published(ref, f'{folder}/{name}') or b'', folder)
         else:
             continue
         sections.append(device_section(device, title, folder, manifest, apps))
@@ -207,7 +218,7 @@ def publish(only=()):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--device', action='append', default=[], help='publish only this device (redmi2, gta7lite)')
+    parser.add_argument('--device', action='append', default=[], help='publish only this device (redmi2, gta7lite, nexus5)')
     args = parser.parse_args()
     try:
         publish(args.device)

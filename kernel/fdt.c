@@ -301,7 +301,10 @@ bool fdt_discover(const void *blob, struct platform_devices *d) {
 #ifdef SOS2_BOARD_GTA7LITE
                 n->gicv3 = compatible(p, len, "arm,gic-v3");
 #endif
-                if (depth == 0) d->redmi2_wt88047 = compatible(p, len, "wingtech,wt88047");
+                if (depth == 0) {
+                    d->redmi2_wt88047 = compatible(p, len, "wingtech,wt88047");
+                    d->nexus5_hammerhead = compatible(p, len, "lge,hammerhead");
+                }
             } else if (equals(name, "bootargs") && depth == 1 && n->chosen) {
                 if (!single_string(p, len)) return false;
                 own_arguments(d->bootargs, sizeof(d->bootargs), p);

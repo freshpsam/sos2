@@ -32,6 +32,12 @@
 #include "wifi_setup.h"
 #include "wifi_device.h"
 #endif
+#ifdef SOS2_BOARD_NEXUS5
+#include "nexus5.h"
+#include "boot_progress.h"
+#include "wifi_setup.h"
+#include "wifi_device.h"
+#endif
 extern char __image_start[], __image_end[];
 static struct framebuffer screen;
 
@@ -101,9 +107,19 @@ static void enter_standby(struct pointer_event *cancel) {
     gta7lite_touch_standby(true);
     gta7lite_display_standby(true);
 #endif
+#ifdef SOS2_BOARD_NEXUS5
+    nexus5_touch_standby(true);
+    (void)nexus5_backlight(false);
+    nexus5_display_standby(true);
+#endif
     page_host_input(cancel);
     process_freeze(true);
     battery_standby(true);
+#ifdef SOS2_BOARD_NEXUS5
+    wifi_setup_standby(true);
+    wifi_device_standby(true);
+    nexus5_cpu_clock_standby(true);
+#endif
 #ifdef SOS2_BOARD_GTA7LITE
     (void)gta7lite_cpu_clock(false);
     arm_smp_sleep();
@@ -124,6 +140,11 @@ static void enter_standby(struct pointer_event *cancel) {
 
 static void leave_standby(void) {
     standby = false;
+#ifdef SOS2_BOARD_NEXUS5
+    nexus5_cpu_clock_standby(false);
+    wifi_device_standby(false);
+    wifi_setup_standby(false);
+#endif
 #ifdef SOS2_BOARD_GTA7LITE
     arm_smp_wake();
     wifi_device_standby(false);
@@ -149,6 +170,11 @@ static void leave_standby(void) {
     gta7lite_display_standby(false);
     gta7lite_touch_standby(false);
 #endif
+#ifdef SOS2_BOARD_NEXUS5
+    nexus5_display_standby(false);
+    (void)nexus5_backlight(true);
+    nexus5_touch_standby(false);
+#endif
     page_host_redraw();
 }
 
@@ -173,12 +199,23 @@ static void boot_feed(enum boot_phase phase, uint32_t done, uint32_t total) {
     gta7lite_watchdog_feed();
 }
 #endif
+#ifdef SOS2_BOARD_NEXUS5
+/* Long boot work keeps sending the panel what the screen holds, and keeps
+ * the USB link answering. */
+static void boot_frames(enum boot_phase phase, uint32_t done, uint32_t total) {
+    (void)phase;
+    (void)done;
+    (void)total;
+    nexus5_display_poll();
+    nexus5_usb_poll();
+}
+#endif
 
 void kernel_main(const void *dtb) {
     /* Board RAM window: verify the maximum DTB span before parsing its header. */
     uintptr_t dtb_address = (uintptr_t)dtb;
-    if ((dtb_address & 7) || dtb_address < SOS2_RAM_START ||
-        dtb_address > SOS2_RAM_END - 2 * 1024 * 1024)
+    if ((dtb_address & 7) || (uint64_t)dtb_address - SOS2_RAM_START >
+                                 (uint64_t)SOS2_RAM_END - SOS2_RAM_START - 2 * 1024 * 1024)
         panic("DTB outside board RAM window");
     static struct platform_devices devices;
     if (!fdt_discover(dtb, &devices)) panic("invalid device tree");
@@ -214,6 +251,19 @@ void kernel_main(const void *dtb) {
         panic(error);
     }
 #endif
+#ifdef SOS2_BOARD_NEXUS5
+    const char *error = nexus5_handoff(&devices, start, end, dtb_address);
+    if (error) {
+        if (devices.has_framebuffer) {
+            screen = devices.framebuffer;
+            platform_set_framebuffer(&screen);
+        }
+        panic(error);
+    }
+    boot_progress_set_handler(boot_frames);
+    /* The faster clocks before the long work of expanding the resources. */
+    (void)nexus5_cpu_clock_init();
+#endif
     if (end <= start || !fdt_range_in_ram(&devices, start, end - start))
         panic("kernel static memory outside RAM");
     if (dtb_address < end && dtb_address + devices.dtb_size > start)
@@ -221,8 +271,16 @@ void kernel_main(const void *dtb) {
     if (!display_init(&devices, &screen)) panic("display initialization failed");
     platform_set_framebuffer(&screen);
 #endif
+#ifdef SOS2_BOARD_NEXUS5
+    /* The USB link, connected once polls run often (before process_init):
+     * fastboot from the computer. */
+    const char *usb = nexus5_usb_init();
+#endif
     if (!gfx_framebuffer_valid(&screen)) panic("browser framebuffer invalid");
     page_host_init(&screen);
+#ifdef SOS2_BOARD_NEXUS5
+    page_host_usb_status(usb);
+#endif
 #ifdef SOS2_BOARD_GTA7LITE
     /* The USB link from here on, so that after a panic the tablet can be
      * restarted from the computer; the host sees it once the main loop
@@ -238,7 +296,10 @@ void kernel_main(const void *dtb) {
     page_host_render();
     display_poll();
     barrier();
-#ifndef SOS2_BOARD_GTA7LITE /* Tablet touch starts after process_init; no key driver. */
+#ifdef SOS2_BOARD_NEXUS5
+    nexus5_usb_connect();
+#endif
+#if !defined(SOS2_BOARD_GTA7LITE) && !defined(SOS2_BOARD_NEXUS5) /* No virtio input. */
     if (!input_init(devices.virtio, devices.virtio_count, screen.width, screen.height))
         panic("input initialization failed");
     (void)keyboard_init(devices.virtio, devices.virtio_count);
@@ -250,6 +311,9 @@ void kernel_main(const void *dtb) {
 #ifdef SOS2_BOARD_GTA7LITE
     /* Its firmware is a runtime file and its SPI a device mapping, both ready now. */
     page_host_touch_status(gta7lite_touch_init(devices.lcm_name, screen.width, screen.height));
+#endif
+#ifdef SOS2_BOARD_NEXUS5
+    page_host_touch_status(nexus5_touch_init(screen.width, screen.height));
 #endif
 #ifdef SOS2_BOARD_REDMI2
     redmi2_cpu0_wake_source(redmi2_power_key_irq()); /* CPU 0's power-down is ready now. */
@@ -267,10 +331,18 @@ void kernel_main(const void *dtb) {
 #ifdef SOS2_BOARD_GTA7LITE
     gta7lite_usb_connect();
 #endif
+#ifdef SOS2_BOARD_NEXUS5
+    /* The main loop polls the panel and the link from here on; allocations
+     * then must not (boot_progress.h). */
+    boot_progress_set_handler(0);
+#endif
     for (;;) {
 #ifdef SOS2_BOARD_GTA7LITE
         gta7lite_watchdog_feed();
         gta7lite_usb_poll();
+#endif
+#ifdef SOS2_BOARD_NEXUS5
+        nexus5_usb_poll();
 #endif
         (void)haptics_poll();
 #ifdef SOS2_BOARD_REDMI2
@@ -280,6 +352,8 @@ void kernel_main(const void *dtb) {
 #else
 #ifdef SOS2_BOARD_GTA7LITE
         bool power_pressed = gta7lite_power_key_pressed();
+#elif defined(SOS2_BOARD_NEXUS5)
+        bool power_pressed = nexus5_power_key_pressed();
 #else
         bool power_pressed = power_key_pressed();
 #endif
@@ -292,7 +366,7 @@ void kernel_main(const void *dtb) {
 #ifdef SOS2_BOARD_REDMI2
             /* A GPU job still in flight at standby retires first; then it naps. */
             redmi2_adreno_standby(true);
-#elif !defined(SOS2_BOARD_GTA7LITE)
+#elif !defined(SOS2_BOARD_GTA7LITE) && !defined(SOS2_BOARD_NEXUS5)
             /* Drop input queued while the screen is off; nothing acts on it. */
             int32_t wheel_x, wheel_y;
             struct user_input_event key;
@@ -337,6 +411,8 @@ void kernel_main(const void *dtb) {
         if (gta7lite_touch_poll(&event)) page_host_input(&event);
         volume_poll();
         gta7lite_cpu_clock_poll(process_user_us());
+#elif defined(SOS2_BOARD_NEXUS5)
+        if (nexus5_touch_poll(&event)) page_host_input(&event);
 #else
         /* Drain queued virtio tablet reports. Taking one per pass lets the
          * 64-event ring fill while the loop is slow, and the device then drops

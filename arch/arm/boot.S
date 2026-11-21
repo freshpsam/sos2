@@ -63,17 +63,34 @@ svc_entry:
     mrc     p15, 0, r0, c1, c0, 0  @ SCTLR
     tst     r0, #5
     bne     unsupported_entry
+    bic     r0, r0, #(1 << 1)      @ No alignment checks: the engine relies on
+                                   @ unaligned access (the Nexus 5's bootloader
+                                   @ leaves the check on); the kernel avoids it.
     bic     r0, r0, #(1 << 13)     @ Use VBAR, not the legacy high-vector address.
     bic     r0, r0, #(1 << 25)     @ Little-endian exception data accesses.
     bic     r0, r0, #(1 << 30)     @ Exception handlers run in ARM state.
     /* Instruction caching works with translation disabled. Data caching waits
-     * for audited RAM/MMIO mappings; never cache the inherited framebuffer. */
+     * for audited RAM/MMIO mappings; never cache the inherited framebuffer.
+     * Not on the Nexus 5: with translation off nothing is execute-never, so
+     * ARMv7 lets the core fetch instructions speculatively from any address,
+     * and Krait's predicted or prefetched fetches reached memory its
+     * TrustZone protects, which answers with a watchdog reset (the
+     * bootloader then reports bootreason=wdog_reset; 2026-11-20, which
+     * builds did it followed code layout). There the instruction cache and
+     * branch prediction wait for translation: boot_cache.c turns them on
+     * with its MMU for the engine's decoding, about 3 s in, and vm_init
+     * (arch/arm/mmu.c) for good. */
     mov     r1, #0
     dsb     sy
     mcr     p15, 0, r1, c7, c5, 0   @ ICIALLU
     mcr     p15, 0, r1, c7, c5, 6   @ BPIALL
     dsb     sy
+#ifdef SOS2_BOARD_NEXUS5
+    bic     r0, r0, #(1 << 12)      @ no instruction cache
+    bic     r0, r0, #(1 << 11)      @ no branch prediction
+#else
     orr     r0, r0, #(1 << 12)
+#endif
     mcr     p15, 0, r0, c1, c0, 0
     isb
     cmp     r9, #1

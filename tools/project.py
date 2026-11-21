@@ -20,14 +20,17 @@ HELP = """SOS2 — native ARM web desktop
   make phone           Package Redmi 2 boot.img, the installed system and the
                        app packages; never accesses the phone
   make publish         Push each built device's installed system, update and
-                       apps to GitHub Pages (PUBLISH=redmi2 or gta7lite: one)
+                       apps to GitHub Pages (PUBLISH=redmi2, gta7lite or
+                       nexus5: one)
   make tablet          Package the Galaxy Tab A7 Lite's boot image and installed
                        system (arm64); never accesses the tablet
+  make nexus5          Package the Nexus 5's RAM boot image, installed system
+                       and app packages (ARM32); never accesses the phone
   make clean           Delete build/ entirely, including downloads, caches and disks
   make help            Show this list
 
 ARCH=arm32 (default) or arm64: build and run QEMU's ARM or AArch64 system;
-          phone sets ARM32 (the Redmi 2), tablet arm64
+          phone and nexus5 set ARM32 (the Redmi 2, the Nexus 5), tablet arm64
 run/phone: STORAGE=ram (default) or persistent; ENGINE=path/to/native-web.bundle
 run:      ENGINE=none opens an empty desktop
           Four CPUs by default; RUN_ARGS='--cpus 1' selects a single CPU
@@ -51,8 +54,14 @@ tablet:   GTA7LITE_STOCK=folder with the stock firmware's boot.img and vbmeta.im
           (default GTA7LITE_STOCK/wifi-firmware) gives the tablet Wi-Fi
           Optional GTA7LITE_WIFI_PROFILE=file, joined at boot
           Optional GTA7LITE_JSC=options: JavaScriptCore options for pages
-See README.md, docs/redmi2.md and docs/gta7lite.md for prerequisites and device
-limitations.
+nexus5:   NEXUS5_STOCK=folder with wifi-firmware/: the stock system's
+          fw_bcmdhd.bin and bcmdhd.cal (docs/nexus5.md)
+          NEXUS5_WIFI_FIRMWARE=folder (default NEXUS5_STOCK/wifi-firmware)
+          gives the phone Wi-Fi
+          Optional NEXUS5_WIFI_PROFILE=file (open or WPA2), joined at boot
+          Optional NEXUS5_JSC=options: JavaScriptCore options for pages
+See README.md, docs/redmi2.md, docs/gta7lite.md and docs/nexus5.md for
+prerequisites and device limitations.
 """
 
 
@@ -148,9 +157,29 @@ def tablet(engine):
     run(*args)
 
 
+def nexus5(engine):
+    args = [sys.executable, ROOT / 'tools/package_nexus5.py',
+            '--kernel', ROOT / 'build/nexus5-arm32/kernel.img',
+            '--elf', ROOT / 'build/nexus5-arm32/kernel.elf',
+            '--dtb', ROOT / 'build/nexus5/boot.dtb',
+            '--resources', engine, '--release', release_name(), '--output-dir', ROOT / 'build/nexus5',
+            # The installed system for make publish, and the Redmi 2's ARM32 apps.
+            '--install-dir', ROOT / 'build/nexus5-install', '--apps-dir', ROOT / 'build/apps']
+    if os.environ.get('NEXUS5_JSC'):
+        args += ['--jsc', os.environ['NEXUS5_JSC']]
+    wifi = os.environ.get('NEXUS5_WIFI_FIRMWARE')
+    if wifi and (ROOT / wifi).is_dir():
+        args += ['--wifi-firmware', ROOT / wifi]
+        if os.environ.get('NEXUS5_WIFI_PROFILE'):
+            args += ['--wifi-profile', os.environ['NEXUS5_WIFI_PROFILE']]
+    elif wifi:
+        print(f'NEXUS5_WIFI_FIRMWARE: no folder {wifi}, so no Wi-Fi')
+    run(*args)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('help', 'clean', 'run', 'phone', 'publish', 'tablet'))
+    parser.add_argument('command', choices=('help', 'clean', 'run', 'phone', 'publish', 'tablet', 'nexus5'))
     parser.add_argument('--engine', default=f'build/native-webkit{arch.SUFFIX}/native-web.bundle')
     parser.add_argument('--storage', choices=('ram', 'persistent'), default='ram')
     argv = sys.argv[1:]
@@ -167,6 +196,8 @@ def main():
         return
     if arch.ARM64 and args.command == 'phone':
         parser.error('the Redmi 2 runs ARM32: phone needs ARCH=arm32')
+    if arch.ARM64 and args.command == 'nexus5':
+        parser.error('the Nexus 5 runs ARM32: nexus5 needs ARCH=arm32')
     if not arch.ARM64 and args.command == 'tablet':
         parser.error('the Galaxy Tab A7 Lite runs AArch64: tablet needs ARCH=arm64')
     if args.command == 'publish':
@@ -177,7 +208,7 @@ def main():
             parser.exit(1, str(error) + '\n')
         return
     engine = None if args.engine == 'none' else ROOT / args.engine
-    if args.command in ('phone', 'tablet') and engine is None:
+    if args.command in ('phone', 'tablet', 'nexus5') and engine is None:
         parser.error(f'{args.command} requires an engine bundle; run make engine first')
     if engine is not None and not engine.is_file():
         parser.error('engine bundle is missing; run make engine or set ENGINE to an existing bundle')
@@ -186,6 +217,8 @@ def main():
             launch(engine, args.storage, extra)
         elif args.command == 'tablet':
             tablet(engine)
+        elif args.command == 'nexus5':
+            nexus5(engine)
         else:
             phone(engine, args.storage)
     except (OSError, subprocess.CalledProcessError) as error:

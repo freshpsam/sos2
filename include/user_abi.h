@@ -316,22 +316,23 @@ struct user_present_frame {
 /* SYS_UPDATE(operation, address, size): system and app updates, for the
  * system's updater (/bin/sos2-updater, programs/updater) alone; other
  * processes get USER_ENOSYS. BEGIN takes the USER_UPDATE_HEADER bytes that
- * start a file, sos2-redmi2.update or an app's .sos2app, WRITE the bytes after
- * them in order, at most USER_UPDATE_WRITE_MAX at a time, and FINISH, called
- * until it stops returning USER_EAGAIN, checks the file and installs it. Only
- * a phone started from its installed system installs, and INFO says so with
- * USER_UPDATE_INSTALLS: elsewhere BEGIN and REMOVE return USER_ENODEV.
- * APPS fills an array of struct user_update_app and
- * returns how many it filled; REMOVE removes the installed app whose id
- * address holds (size 16). CANCEL drops the caller's
- * unfinished file, as when its download failed, and leaves USER_UPDATE_IDLE.
- * Once a system update writes the boot image, it finishes even if its updater
- * ends, and BEGIN, CANCEL and RESTART return USER_EBUSY until it has.
- * RESTART restarts the device; DOWNLOAD restarts it into its bootloader's
- * download mode, where INFO's USER_UPDATE_DOWNLOAD_MODE says it can (the
- * Galaxy Tab A7 Lite's), and returns USER_ENODEV elsewhere. INFO fills struct user_update_info. Address
- * and size are 0 where unused. A failure leaves USER_UPDATE_FAILED and a
- * message. */
+ * start a file, a device's system update (sos2-redmi2.update and the others)
+ * or an app's .sos2app, WRITE the bytes after them in order, at most
+ * USER_UPDATE_WRITE_MAX at a time, and FINISH, called until it stops
+ * returning USER_EAGAIN, checks the file and installs it. Only a device
+ * started from its installed system installs, and INFO says so with
+ * USER_UPDATE_INSTALLS: elsewhere BEGIN and REMOVE return USER_ENODEV. APPS
+ * fills an array of struct user_update_app and returns how many it filled;
+ * REMOVE removes the installed app whose id address holds (size 16). CANCEL
+ * drops the caller's unfinished file, as when its download failed, and
+ * leaves USER_UPDATE_IDLE. Once a system update writes the boot image, it
+ * finishes even if its updater ends, and BEGIN, CANCEL and RESTART return
+ * USER_EBUSY until it has. RESTART restarts the device; DOWNLOAD restarts it
+ * into its bootloader's download mode, where INFO's USER_UPDATE_DOWNLOAD_MODE
+ * says it can (the Galaxy Tab A7 Lite's), and returns USER_ENODEV elsewhere.
+ * INFO fills struct user_update_info, whose board names the device as its
+ * system updates do (include/system_store.h). Address and size are 0 where
+ * unused. A failure leaves USER_UPDATE_FAILED and a message. */
 #define USER_UPDATE_INFO      0
 #define USER_UPDATE_BEGIN     1
 #define USER_UPDATE_WRITE     2
@@ -376,6 +377,7 @@ struct user_update_info {
     uint32_t state, flags, done, total; /* done/total: bytes of the state's work */
     char release[48];                   /* the running release, or empty */
     char message[64];                   /* what failed, or the state's detail */
+    char board[16];                     /* the device's, as its system updates name it */
 };
 
 struct user_update_app {

@@ -6,6 +6,9 @@
 #ifdef SOS2_BOARD_GTA7LITE
 #include "gta7lite.h"
 #endif
+#ifdef SOS2_BOARD_NEXUS5
+#include "nexus5.h"
+#endif
 
 static struct framebuffer *panic_screen;
 
@@ -79,6 +82,15 @@ _Noreturn void panic(const char *message) {
         if (usb) gta7lite_usb_poll();
         for (uint64_t at = arch_counter(); arch_counter() - at < frequency / 1000;) { }
     }
+#elif defined(SOS2_BOARD_NEXUS5)
+    /* On CPU 0 the USB link stays up, started now if it was not yet: the
+     * computer can restart the phone into its bootloader. Its waits read the
+     * timer, as the vibrator's do. */
+    if (!affinity && frequency && nexus5_usb_rescue()) {
+        nexus5_fastboot_panic();
+        for (;;) nexus5_usb_poll();
+    }
+    for (;;) arch_wait_event();
 #else
     for (;;) arch_wait_event();
 #endif

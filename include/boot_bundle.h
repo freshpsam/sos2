@@ -21,10 +21,17 @@ enum {
     BOOT_BUNDLE_FILTER_ARM = 2,
     BOOT_BUNDLE_FILTER_THUMB = 3,
     BOOT_BUNDLE_LIMIT = 256u * 1024 * 1024,
+#ifdef SOS2_BOARD_NEXUS5
+    /* The Nexus 5's ramdisk, where the stock bootloader puts hammerhead's:
+     * below the firmware's memory hole (boards/nexus5/boot.dts). */
+    BOOT_RAMDISK_BASE = 0x02900000,
+    BOOT_RAMDISK_END = 0x07b00000
+#else
     /* The Redmi 2's ramdisk: lk2nd maps only 90 MiB from 0x80000000 to load
      * kernel and ramdisk. arm64 takes the DTB's initrd range instead. */
     BOOT_RAMDISK_BASE = 0x82000000,
     BOOT_RAMDISK_END = 0x85a00000
+#endif
 };
 
 /* Expand the packaged SORZ ramdisk and replace its handoff with the validated

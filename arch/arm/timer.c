@@ -469,6 +469,19 @@ void arm_timer_arm_us(uint32_t microseconds) {
     arch_timer_set_control(1);
 }
 
+/* IDs 1020-1023 acknowledge nothing (1023: spurious, the interrupt gone by
+ * the time it was read, which the Nexus 5's cores see a few times in 10 s
+ * under load; 1022: one this world may not take). They are not ended, and
+ * the trap is a preemption point like the timer's. Any other interrupt
+ * than the scheduler's is a fault: its ID on the panic screen. */
+static bool special(uint32_t id) { return id >= 1020 && id <= 1023; }
+
+static _Noreturn void unexpected(uint32_t id) {
+    static char text[48];
+    *decimal(stpcpy(text, "unexpected scheduler interrupt "), id & 0x1fff) = 0;
+    panic(text);
+}
+
 void arm_timer_stop(bool acknowledge) {
 #ifdef SOS2_BOARD_GTA7LITE
     if (route.gicv3) {
@@ -476,8 +489,10 @@ void arm_timer_stop(bool acknowledge) {
             uint64_t id = icc_read(icc_iar1_el1);
             arch_timer_set_control(0);
             sync();
-            if ((id & 0xffffff) != route.interrupt) panic("unexpected scheduler interrupt");
-            icc_write(icc_eoir1_el1, id);
+            if (!special((uint32_t)(id & 0xffffff))) {
+                if ((id & 0xffffff) != route.interrupt) unexpected((uint32_t)id);
+                icc_write(icc_eoir1_el1, id);
+            }
         }
         stop();
         return;
@@ -487,8 +502,10 @@ void arm_timer_stop(bool acknowledge) {
         uint32_t id = read32(route.cpu + C_IAR);
         arch_timer_set_control(0);
         sync();
-        if ((id & 1023) != route.interrupt) panic("unexpected scheduler interrupt");
-        write32(route.cpu + C_EOIR, id);
+        if (!special(id & 1023)) {
+            if ((id & 1023) != route.interrupt) unexpected(id);
+            write32(route.cpu + C_EOIR, id);
+        }
     }
     stop();
 }

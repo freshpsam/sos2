@@ -2,6 +2,8 @@
 #include "platform.h"
 #ifdef SOS2_BOARD_REDMI2
 #include "redmi2_vibrator.h"
+#elif defined(SOS2_BOARD_NEXUS5)
+#include "nexus5.h"
 #endif
 
 /* Tap feedback as Android gives it for keys: one pulse as the finger lands,
@@ -45,6 +47,8 @@ static uint64_t due;
 static bool run(bool on) {
 #ifdef SOS2_BOARD_REDMI2
     return redmi2_vibrator_run(on);
+#elif defined(SOS2_BOARD_NEXUS5)
+    return nexus5_vibrator_run(on);
 #else
     (void)on;
     return false;
@@ -55,6 +59,10 @@ void haptics_init(void) {
     requested = running = stuck = false;
 #ifdef SOS2_BOARD_REDMI2
     ready = redmi2_vibrator_init(TAP_MV);
+#elif defined(SOS2_BOARD_NEXUS5)
+    /* The Nexus 5's PWM-driven motor (boards/nexus5/vibrator.c): full drive
+     * for the tap, then its brake. */
+    ready = nexus5_vibrator_init();
 #else
     /* QEMU virt has no vibrator, nor has the Galaxy Tab A7 Lite: its stock
      * vendor partition has no vibrator HAL, and pulses of the PMIC's VIBR

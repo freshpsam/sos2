@@ -14,17 +14,24 @@ bool runtime_files_init(struct platform_devices *devices, uintptr_t dtb, uintptr
                         uintptr_t ke) {
     bundle = 0;
     uint64_t start = RUNTIME_FILES_BASE, limit = RUNTIME_FILES_LIMIT;
-#ifdef SOS2_BOARD_REDMI2
-    /* lk2nd's ramdisk carries the resources, whether fastboot sent the image
-     * or the installed system's boot partition holds it. */
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
+    /* The bootloader's ramdisk carries the resources, whether fastboot sent
+     * the image or the installed system's boot partition holds it. */
     if (devices->has_initrd_start && devices->has_initrd_end &&
         devices->initrd_end > devices->initrd_start && devices->initrd_start == BOOT_RAMDISK_BASE &&
         !boot_bundle_prepare(devices, dtb, ks, ke))
         return false;
+#ifdef SOS2_BOARD_NEXUS5
+    /* Expanded into the second bank (boot_memory.c). */
+    if (!devices->has_initrd_start || devices->initrd_start < 0x40000000 ||
+        devices->initrd_end > 0x80000000)
+        return false;
+#else
     /* The phone has no fixed-address loader and must have a real handoff. */
     if (!devices->has_initrd_start || devices->initrd_start < 0x90000000 ||
         devices->initrd_end > 0xc0000000)
         return false;
+#endif
 #endif
 #ifdef __aarch64__
     /* A SORZ ramdisk expands into free RAM first; a SORB one is used in place. */
@@ -40,7 +47,8 @@ bool runtime_files_init(struct platform_devices *devices, uintptr_t dtb, uintptr
         start = devices->initrd_start;
         limit = devices->initrd_end;
     }
-    if (start < SOS2_RAM_START || limit > SOS2_RAM_END || limit <= start || limit - start < 16 ||
+    if (start - SOS2_RAM_START >= (uint64_t)SOS2_RAM_END - SOS2_RAM_START ||
+        limit > SOS2_RAM_END || limit <= start || limit - start < 16 ||
         limit - start > 256u * 1024 * 1024 ||
         !boot_memory_available(devices, start, limit - start, dtb, ks, ke, false))
         return false;

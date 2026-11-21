@@ -99,6 +99,35 @@ static bool same_name(const struct wifi_network *a, const struct wifi_network *b
     return a->ssid_length == b->ssid_length && !memcmp(a->ssid, b->ssid, a->ssid_length);
 }
 
+/* The saved network has its own row on top, so the nearby list leaves it
+ * out: any scanned network its credential serves, by choose()'s rule (the
+ * same name with a mode in common). */
+static bool listed(const struct wifi_setup_view *v, const struct wifi_network *network) {
+    return !v->has_saved || !same_name(network, &v->saved) || !(network->modes & v->saved.modes);
+}
+
+static unsigned listed_count(const struct wifi_setup_view *v) {
+    unsigned count = 0;
+    for (unsigned i = 0; i < v->radio.count; ++i) count += listed(v, &v->radio.networks[i]);
+    return count;
+}
+
+/* The list's index-th network, or NULL past its end. */
+static const struct wifi_network *listed_network(const struct wifi_setup_view *v, unsigned index) {
+    for (unsigned i = 0; i < v->radio.count; ++i)
+        if (listed(v, &v->radio.networks[i]) && !index--) return &v->radio.networks[i];
+    return 0;
+}
+
+/* The saved row stands for the scanned networks the list leaves out: its
+ * page offers their modes too, as both of a transition network's. */
+static struct wifi_network saved_row(const struct wifi_setup_view *v) {
+    struct wifi_network network = v->saved;
+    for (unsigned i = 0; i < v->radio.count; ++i)
+        if (!listed(v, &v->radio.networks[i])) network.modes |= v->radio.networks[i].modes;
+    return network;
+}
+
 static unsigned preferred(unsigned modes) {
     return modes & (1u << WIFI_WPA3_SAE)   ? WIFI_WPA3_SAE
            : modes & (1u << WIFI_WPA2_PSK) ? WIFI_WPA2_PSK
@@ -155,13 +184,14 @@ static const struct wifi_network *network_at(unsigned action) {
  * Previous/Next follow the page's last row with the rows' 8 px gap. */
 static unsigned list_top(void) { return wifi_setup_view()->has_saved ? 224 : 164; }
 
+/* A finished scan that lists nothing: none found, or none but the saved one. */
 static bool no_networks(const struct wifi_setup_view *v) {
-    return !v->radio.count && v->radio.scan_generation && v->radio.state != WIFI_RADIO_SCANNING;
+    return !listed_count(v) && v->radio.scan_generation && v->radio.state != WIFI_RADIO_SCANNING;
 }
 
 static unsigned paging_y(void) {
     const struct wifi_setup_view *v = wifi_setup_view();
-    unsigned first = page * ROWS, rows = first < v->radio.count ? v->radio.count - first : 0;
+    unsigned count = listed_count(v), first = page * ROWS, rows = first < count ? count - first : 0;
     if (rows > ROWS) rows = ROWS;
     return list_top() + (rows ? rows : no_networks(v) ? 1u : 0u) * 64;
 }
@@ -217,7 +247,7 @@ static void action(unsigned action) {
     } else if (action == PREVIOUS) {
         if (page) --page;
     } else if (action == NEXT) {
-        if ((page + 1) * ROWS < v->radio.count) ++page;
+        if ((page + 1) * ROWS < listed_count(v)) ++page;
     } else if (action == FORGET) {
         if (wifi_setup_forget()) {
             clear_password();
@@ -452,25 +482,33 @@ void desktop_wifi_render(struct framebuffer *s) {
     /* No Back buttons here: the phone's Back key (Alt+Left in QEMU) is one,
      * and the tablet's top bar has BACK. */
     if (!detail) {
+        /* Saving a profile takes its network out of the list, which can end
+         * the last page: show the new last one. */
+        unsigned count = listed_count(v);
+        if (page && page * ROWS >= count) page = count ? (count - 1) / ROWS : 0;
         button(s, 16, 104, 448, "SCAN NETWORKS", false);
         if (v->has_saved) row(s, 164, &v->saved, true);
-        for (unsigned i = 0; i < ROWS && page * ROWS + i < v->radio.count; ++i)
-            row(s, list_top() + i * 64, &v->radio.networks[page * ROWS + i], false);
+        for (unsigned i = 0; i < ROWS && page * ROWS + i < count; ++i)
+            row(s, list_top() + i * 64, listed_network(v, page * ROWS + i), false);
         /* The status says "Scanning..."; only a finished scan's empty result shows here. */
-        if (no_networks(v)) gfx_text(s, 20, list_top() + 22, "NO NETWORKS FOUND", 1, 0xf1f5f6);
+        if (no_networks(v))
+            gfx_text(s, 20, list_top() + 22,
+                     v->has_saved && v->radio.count ? "NO OTHER NETWORKS FOUND"
+                                                    : "NO NETWORKS FOUND",
+                     1, 0xf1f5f6);
         if (page) button(s, 16, paging_y(), 216, "PREVIOUS", false);
-        if ((page + 1) * ROWS < v->radio.count) button(s, 248, paging_y(), 216, "NEXT", false);
+        if ((page + 1) * ROWS < count) button(s, 248, paging_y(), 216, "NEXT", false);
         if (v->radio.scan_truncated)
             gfx_text(s, 20, paging_y() + 56, "SOME NETWORKS COULD NOT BE LISTED", 1, 0xf1f5f6);
         drawn = (struct drawn_screen){.valid = true,
                                       .saved = v->has_saved,
-                                      .saved_network = v->saved,
+                                      .saved_network = saved_row(v),
                                       .top = list_top(),
                                       .previous = page != 0,
-                                      .next = (page + 1) * ROWS < v->radio.count,
+                                      .next = (page + 1) * ROWS < count,
                                       .paging_y = paging_y()};
-        for (unsigned i = 0; i < ROWS && page * ROWS + i < v->radio.count; ++i)
-            drawn.row[drawn.rows++] = v->radio.networks[page * ROWS + i];
+        for (unsigned i = 0; i < ROWS && page * ROWS + i < count; ++i)
+            drawn.row[drawn.rows++] = *listed_network(v, page * ROWS + i);
     } else {
         char name[129];
         name_text(name, sizeof(name), &selected);

@@ -1,13 +1,14 @@
-#include "msm8916_i2c.h"
+#include "qup_i2c.h"
 
 /* Original polled implementation of the QUP v2 register/tag protocol.
  * Hardware register definitions and sequencing were checked against:
  * https://github.com/torvalds/linux/blob/master/drivers/i2c/busses/i2c-qup.c
  * https://github.com/u-boot/u-boot/blob/master/drivers/i2c/qup_i2c.c
- * Base/pins: Linux arch/arm64/boot/dts/qcom/msm8916.dtsi (blsp_i2c4/5).
- * Source clock: Linux drivers/clk/qcom/gcc-msm8916.c (QUP4/5 XO /1).
+ * Each board's buses, pins and clocks: the Redmi 2's in Linux's
+ * arch/arm64/boot/dts/qcom/msm8916.dtsi (blsp_i2c2/4/5) and gcc-msm8916.c
+ * (XO /1), the Nexus 5's in qcom-msm8974.dtsi (blsp1_i2c2) and
+ * gcc-msm8974.c (XO /1): a 19.2 MHz core clock.
  *
- * Register reads serve the independent SMB1360 battery and FT5x06 touch buses.
  * The register-pointer write keeps the bus active; the read emits the final
  * NACK/STOP. Input block mode handles a 63-byte report plus its two QUP tags
  * even when that exceeds the hardware FIFO. No controller report is split.
@@ -66,14 +67,11 @@ enum {
     TAG_WRITE = 0x82,
     TAG_WRITE_STOP = 0x83,
     TAG_READ_STOP = 0x87,
-    CLOCK_100KHZ = (3 << 8) | 93,
     TIMEOUT_US = 25000,
     POLL_LIMIT = 100000,
 };
 
 #define RECONFIGURE (UINT32_C(1) << 31)
-
-static struct msm8916_i2c touch_bus = {.base = 0x078b9000};
 
 struct deadline {
     uint64_t start;
@@ -84,7 +82,7 @@ static bool within_deadline(struct deadline *d) {
     return d->polls++ < POLL_LIMIT && now_us() - d->start < TIMEOUT_US;
 }
 
-static bool state_is(struct msm8916_i2c *bus, unsigned mask, unsigned wanted, struct deadline *d) {
+static bool state_is(struct qup_i2c *bus, unsigned mask, unsigned wanted, struct deadline *d) {
     do {
         uint32_t value = read32(bus->base + STATE);
         if ((value & VALID) && (value & mask) == wanted) return true;
@@ -92,13 +90,13 @@ static bool state_is(struct msm8916_i2c *bus, unsigned mask, unsigned wanted, st
     return false;
 }
 
-static bool change_state(struct msm8916_i2c *bus, unsigned state, struct deadline *d) {
+static bool change_state(struct qup_i2c *bus, unsigned state, struct deadline *d) {
     if (!state_is(bus, 0, 0, d)) return false; /* QUP state-valid timeout */
     write32(bus->base + STATE, state);
     return state_is(bus, 3, state, d);
 }
 
-static bool no_error(struct msm8916_i2c *bus, uint32_t *status) {
+static bool no_error(struct qup_i2c *bus, uint32_t *status) {
     uint32_t value = read32(bus->base + I2C_STATUS);
     if (status) *status = value;
     uint32_t bus_errors = value & BUS_ERRORS;
@@ -111,8 +109,7 @@ static bool no_error(struct msm8916_i2c *bus, uint32_t *status) {
     return true;
 }
 
-static bool wait_service(struct msm8916_i2c *bus, unsigned flag, struct deadline *d,
-                         uint32_t *flags) {
+static bool wait_service(struct qup_i2c *bus, unsigned flag, struct deadline *d, uint32_t *flags) {
     do {
         if (!no_error(bus, 0)) return false;
         *flags = read32(bus->base + OPERATIONAL);
@@ -121,12 +118,12 @@ static bool wait_service(struct msm8916_i2c *bus, unsigned flag, struct deadline
     return false; /* service timeout */
 }
 
-static bool reset_engine(struct msm8916_i2c *bus, struct deadline *d) {
+static bool reset_engine(struct qup_i2c *bus, struct deadline *d) {
     write32(bus->base + SW_RESET, 1);
     return state_is(bus, 3, RESET, d);
 }
 
-bool msm8916_i2c_bus_init(struct msm8916_i2c *bus) {
+bool qup_i2c_init(struct qup_i2c *bus) {
     bus->ready = false;
     struct deadline d = {now_us(), 0};
     if (!reset_engine(bus, &d)) return false;
@@ -140,6 +137,17 @@ bool msm8916_i2c_bus_init(struct msm8916_i2c *bus) {
     bus->rx_block_bytes = block_bytes[input_block];
     bus->rx_fifo_bytes = bus->rx_block_bytes * (2u << ((geometry >> 7) & 7));
     if (output_capacity < 8 || bus->rx_fifo_bytes < 8) return false; /* QUP FIFO too small */
+    /* I2C_CLK_CTL as Linux's i2c-qup.c sets it: high-speed divider 3, and a
+     * fast-mode divider from the 19.2 MHz core clock, for a 33%/66% duty
+     * cycle above 100 kHz. */
+    unsigned khz = bus->khz ? bus->khz : 100;
+    if (khz < 40 || khz > 1000) return false; /* outside the dividers' range */
+    if (khz <= 100) {
+        bus->clock = (3u << 8) | ((19200 / khz) / 2 - 3);
+    } else {
+        unsigned divider = (19200 / khz - 6) * 2 / 3;
+        bus->clock = (divider / 2) << 16 | 3u << 8 | (divider & 0xff);
+    }
     write32(bus->base + CONFIG, CORE_CONFIG | NO_INPUT);
     write32(bus->base + MASTER_GEN, 1);
     if (!state_is(bus, I2C_MASTER, I2C_MASTER, &d)) return false; /* QUP I2C master-mode timeout */
@@ -147,13 +155,12 @@ bool msm8916_i2c_bus_init(struct msm8916_i2c *bus) {
     return true;
 }
 
-bool msm8916_i2c_bus_read(struct msm8916_i2c *bus, uint8_t address, uint8_t reg, uint8_t *data,
-                          size_t length) {
+bool qup_i2c_read(struct qup_i2c *bus, uint8_t address, uint8_t reg, uint8_t *data, size_t length) {
     if (!bus->ready) return false; /* QUP not initialized */
-    if (address < 0x08 || address > 0x77 || !data || !length || length > MSM8916_I2C_MAX_READ)
+    if (address < 0x08 || address > 0x77 || !data || !length || length > QUP_I2C_MAX_READ)
         return false; /* I2C read arguments invalid */
     struct deadline d = {now_us(), 0};
-    uint8_t result[MSM8916_I2C_MAX_READ];
+    uint8_t result[QUP_I2C_MAX_READ];
     size_t input_size = length + 2;
     bool block = input_size > bus->rx_fifo_bytes;
     uint32_t flags;
@@ -170,7 +177,7 @@ bool msm8916_i2c_bus_read(struct msm8916_i2c *bus, uint8_t address, uint8_t reg,
     write32(bus->base + IO_MODE, REPACK | (block ? INPUT_BLOCK : 0));
     write32(bus->base + MX_WRITE, 5); /* Four command bytes and one register byte. */
     if (!change_state(bus, RUN, &d)) goto failed;
-    write32(bus->base + CLK_CTL, CLOCK_100KHZ);
+    write32(bus->base + CLK_CTL, bus->clock);
     if (!change_state(bus, PAUSE, &d)) goto failed;
     write32(bus->base + OUT_FIFO,
             TAG_START | ((uint32_t)address << 9) | (TAG_WRITE << 16) | (1u << 24));
@@ -225,7 +232,7 @@ failed:
     return false;
 }
 
-bool msm8916_i2c_bus_write(struct msm8916_i2c *bus, uint8_t address, uint8_t reg, uint8_t value) {
+bool qup_i2c_write(struct qup_i2c *bus, uint8_t address, uint8_t reg, uint8_t value) {
     if (!bus->ready) return false;                      /* QUP not initialized */
     if (address < 0x08 || address > 0x77) return false; /* I2C write arguments invalid */
     struct deadline d = {now_us(), 0};
@@ -243,7 +250,7 @@ bool msm8916_i2c_bus_write(struct msm8916_i2c *bus, uint8_t address, uint8_t reg
     write32(bus->base + IO_MODE, REPACK);
     write32(bus->base + MX_WRITE, 6); /* Four command bytes, the register and its value. */
     if (!change_state(bus, RUN, &d)) goto failed;
-    write32(bus->base + CLK_CTL, CLOCK_100KHZ);
+    write32(bus->base + CLK_CTL, bus->clock);
     if (!change_state(bus, PAUSE, &d)) goto failed;
     write32(bus->base + OUT_FIFO,
             TAG_START | ((uint32_t)address << 9) | (TAG_WRITE_STOP << 16) | (2u << 24));
@@ -263,14 +270,4 @@ failed:
     d = (struct deadline){now_us(), 0};
     if (!reset_engine(bus, &d)) bus->ready = false;
     return false;
-}
-
-bool msm8916_i2c_init(void) { return msm8916_i2c_bus_init(&touch_bus); }
-
-bool msm8916_i2c_write(uint8_t address, uint8_t reg, uint8_t value) {
-    return msm8916_i2c_bus_write(&touch_bus, address, reg, value);
-}
-
-bool msm8916_i2c_read(uint8_t address, uint8_t reg, uint8_t *data, size_t length) {
-    return msm8916_i2c_bus_read(&touch_bus, address, reg, data, length);
 }

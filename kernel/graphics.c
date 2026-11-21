@@ -248,12 +248,12 @@ bool gfx_present(struct framebuffer *visible, const struct framebuffer *complete
     return true;
 }
 
-/* The largest scanout: the Redmi 2's 720x1280 panel, or on AArch64 the
- * Galaxy Tab A7 Lite's 800x1340. */
+/* The largest scanout: the Nexus 5's 1080x1920 panel on ARM32 (the Redmi 2's
+ * is 720x1280), or on AArch64 the Galaxy Tab A7 Lite's 800x1340. */
 #ifdef __aarch64__
 enum { SCANOUT_WIDTH = 800, SCANOUT_HEIGHT = 1340 };
 #else
-enum { SCANOUT_WIDTH = 720, SCANOUT_HEIGHT = 1280 };
+enum { SCANOUT_WIDTH = 1080, SCANOUT_HEIGHT = 1920 };
 #endif
 
 bool gfx_present_scaled_region(struct framebuffer *visible, const struct framebuffer *source,

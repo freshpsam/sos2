@@ -11,6 +11,19 @@
 #ifdef SOS2_BOARD_GTA7LITE
 #include "gta7lite.h"
 #endif
+#ifdef SOS2_BOARD_NEXUS5
+#include "nexus5.h"
+#endif
+/* The phones start their other cores themselves, through their firmware's
+ * boot address and their power controllers, without PSCI. */
+#ifdef SOS2_BOARD_REDMI2
+#define native_prepare(boot) \
+    redmi2_smp_prepare(boot, (uintptr_t)arm_secondary_entry, (uintptr_t)arm_warm_entry)
+#define native_release redmi2_smp_release
+#elif defined(SOS2_BOARD_NEXUS5)
+#define native_prepare(boot) nexus5_smp_prepare(boot, (uintptr_t)arm_secondary_entry)
+#define native_release       nexus5_smp_release
+#endif
 
 struct arm_cpu arm_cpus[ARM_CPU_MAX];
 unsigned char arm_cpu_stacks[ARM_CPU_MAX - 1][ARM_CPU_STACK_BYTES] __attribute__((aligned(4096)));
@@ -103,6 +116,42 @@ void arm_cpu_submit(unsigned id, const struct vm_space *space, const struct arm_
     if (!id) execute(cpu);
 }
 
+#ifndef __aarch64__
+static char *hex(char *out, uint32_t value) {
+    *out++ = '0';
+    *out++ = 'x';
+    for (int shift = 28; shift >= 0; shift -= 4) *out++ = "0123456789abcdef"[(value >> shift) & 15];
+    *out = 0;
+    return out;
+}
+
+/* The boot error screen's account of a kernel trap: its kind (process.S's
+ * vector numbers), the trapped instruction, the caller's return address when
+ * it came from SVC mode, the mode, and for an abort the faulting address and
+ * the fault status, which locate it in kernel.elf. */
+static const char *kernel_trap_text(const struct arm_trap *trap) {
+    static const char *const kinds[] = {"reset", "undefined instruction", "SVC", "prefetch abort",
+                                        "data abort", "reserved", "IRQ", "FIQ"};
+    static char text[160];
+    uint32_t lr = 0;
+    if ((trap->context.cpsr & 31) == 0x13)
+        __asm__ volatile("mrs r12, cpsr\n cps #0x13\n mov %0, lr\n msr cpsr_c, r12"
+                         : "=r"(lr)
+                         :
+                         : "r12", "memory");
+    char *p = stpcpy(text, "exception in protected kernel: ");
+    p = stpcpy(p, trap->vector < 8 ? kinds[trap->vector] : "trap");
+    p = hex(stpcpy(p, " at PC "), trap->context.pc);
+    p = hex(stpcpy(p, ", LR "), lr);
+    p = hex(stpcpy(p, ", CPSR "), trap->context.cpsr);
+    if (trap->vector == 3 || trap->vector == 4) {
+        p = hex(stpcpy(p, ", address "), trap->address);
+        hex(stpcpy(p, ", status "), trap->status);
+    }
+    return text;
+}
+#endif
+
 bool arm_trap_dispatch(struct arm_trap *trap) {
     struct arm_cpu *cpu = arch_cpu_local();
     if (!cpu || !cpu->active || !arch_trap_from_user(trap)) {
@@ -111,7 +160,11 @@ bool arm_trap_dispatch(struct arm_trap *trap) {
             publish(&cpu->state, CPU_FAILED);
             for (;;) __asm__ volatile("wfe");
         }
+#ifdef __aarch64__
         panic("exception in protected kernel");
+#else
+        panic(kernel_trap_text(trap));
+#endif
     }
 #ifndef __aarch64__
     /* The JIT's instruction-cache sync needs this CPU's view of the
@@ -258,14 +311,13 @@ void arm_smp_init(const struct platform_devices *devices) {
     for (unsigned i = 0; i < ARM_CPU_MAX; ++i) arm_cpu_boot[i].mpidr = UINT32_MAX;
     unsigned next = 1;
     unsigned count = devices->psci_method && devices->psci_cpu_on ? devices->cpu_count : 0;
-#ifdef SOS2_BOARD_REDMI2
+#ifdef native_prepare
     bool native = !count;
-    if (native)
-        count = redmi2_smp_prepare(boot, (uintptr_t)arm_secondary_entry, (uintptr_t)arm_warm_entry);
+    if (native) count = native_prepare(boot);
 #endif
     for (unsigned i = 0; i < count && next < ARM_CPU_MAX; ++i) {
         uint32_t id = devices->cpu_mpidr[i];
-#ifdef SOS2_BOARD_REDMI2
+#ifdef native_prepare
         if (native) id = i;
 #endif
         if (id == boot) continue;
@@ -278,8 +330,8 @@ void arm_smp_init(const struct platform_devices *devices) {
         arm_cpu_boot[next] = CPU_BOOT_RECORD(id, cpu, stack);
         barrier();
         int32_t result;
-#ifdef SOS2_BOARD_REDMI2
-        if (native) result = redmi2_smp_release(id) ? 0 : -1;
+#ifdef native_prepare
+        if (native) result = native_release(id) ? 0 : -1;
         else
 #endif
             result = arm_psci_call(devices->psci_method, devices->psci_cpu_on, id,

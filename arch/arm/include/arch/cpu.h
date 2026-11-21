@@ -78,11 +78,18 @@ static inline void arch_timer_set_kernel_control(uint32_t value) {
     __asm__ volatile("mcr p15, 0, %0, c14, c1, 0\n isb" : : "r"(value) : "memory");
 }
 
-/* Whether this CPU runs the kernel (SVC mode) with IRQs and FIQs masked. */
+/* Whether this CPU runs the kernel (SVC mode) with IRQs and FIQs masked. The
+ * Nexus 5's TrustZone keeps CPSR.F from the non-secure world (SCR.FW clear:
+ * cpsid f leaves it 0, as the probe saw at entry) and takes every FIQ
+ * itself, so there IRQs alone are masked. */
 static inline bool arch_kernel_masked(void) {
     uint32_t cpsr;
     __asm__ volatile("mrs %0, cpsr" : "=r"(cpsr));
+#ifdef SOS2_BOARD_NEXUS5
+    return (cpsr & 0x9f) == 0x93;
+#else
     return (cpsr & 0xdf) == 0xd3;
+#endif
 }
 
 /* Invalidates this CPU's instruction cache and branch predictor after code

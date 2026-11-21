@@ -1,7 +1,7 @@
 /* The updater, /bin/sos2-updater: part of the system, like the browser
  * (programs/browser), and opened by the desktop's UPDATES button. It checks
- * UPDATE_URL and the app index at APPS_URL over verified HTTPS, following
- * redirects, and shows the system release and each app next to what runs.
+ * its device's system update and the app index at APPS_URL over verified
+ * HTTPS, following redirects, and shows the system release and each app next to what runs.
  * Installing hands a file to the kernel's update service (SYS_UPDATE,
  * kernel/protection/system_update.c), which checks it and, on a device
  * started from its installed system, installs it: the system into the boot
@@ -29,18 +29,25 @@
 #include "graphics.h"
 
 /* tools/publish_pages.py checks that these are where it publishes: each
- * device's system and the apps for its architecture. The Galaxy Tab A7 Lite
- * is the AArch64 device (QEMU's AArch64 machine checks it too). */
+ * device's system, by the board its kernel names (USER_UPDATE_INFO), and the
+ * apps for its architecture. The Galaxy Tab A7 Lite is the AArch64 device;
+ * the Redmi 2 and the Nexus 5 share the ARM32 updater and apps. A machine
+ * without an entry, QEMU's, checks the first. */
+static const struct device {
+    char board[16];
+    const char *update_url, *name;
+} devices[] = {
 #ifdef __aarch64__
-#define UPDATE_URL "https://freshpsam.github.io/sos2/gta7lite/sos2-gta7lite.update"
-#define APPS_URL   "https://freshpsam.github.io/sos2/apps-arm64/"
-#define BOARD      "gta7litewifi"
-#define DEVICE     "tablet"
+    {"gta7litewifi", "https://freshpsam.github.io/sos2/gta7lite/sos2-gta7lite.update", "tablet"},
 #else
-#define UPDATE_URL "https://freshpsam.github.io/sos2/redmi2/sos2-redmi2.update"
-#define APPS_URL   "https://freshpsam.github.io/sos2/apps/"
-#define BOARD      "redmi2-wt88047"
-#define DEVICE     "phone"
+    {"redmi2-wt88047", "https://freshpsam.github.io/sos2/redmi2/sos2-redmi2.update", "phone"},
+    {"lge-hammerhead", "https://freshpsam.github.io/sos2/nexus5/sos2-nexus5.update", "phone"},
+#endif
+};
+#ifdef __aarch64__
+#define APPS_URL "https://freshpsam.github.io/sos2/apps-arm64/"
+#else
+#define APPS_URL "https://freshpsam.github.io/sos2/apps/"
 #endif
 
 enum {
@@ -271,6 +278,13 @@ static int receive_bytes(void *context, unsigned char *data, size_t size) {
 /* --- What is installed and what is published. */
 
 static bool installs(void) { return info.flags & USER_UPDATE_INSTALLS; }
+
+/* This device's entry, by the board the kernel names. */
+static const struct device *device(void) {
+    for (size_t i = 0; i < sizeof devices / sizeof devices[0]; ++i)
+        if (!memcmp(info.board, devices[i].board, sizeof(info.board))) return &devices[i];
+    return &devices[0];
+}
 
 static bool refresh_info(void) {
     bool changed = false;
@@ -726,7 +740,6 @@ static void start(enum job next, const char *url, enum sink sink, uint32_t size)
 enum { SYSTEM_FILE_SIZE = 120 /* the header's total_size */ };
 
 static bool read_system_header(void) {
-    static const char board[16] = BOARD;
     struct {
         char magic[8];
         uint32_t version, header_size;
@@ -738,7 +751,7 @@ static bool read_system_header(void) {
     memcpy(&file_size, head + SYSTEM_FILE_SIZE, 4);
     if (memcmp(fields.magic, "SOS2UPDT", 8) || fields.version != 2 ||
         fields.header_size != USER_UPDATE_HEADER ||
-        memcmp(fields.board, board, sizeof(board)) ||
+        memcmp(fields.board, device()->board, sizeof(fields.board)) ||
         !memchr(fields.release, 0, sizeof(fields.release)) || !fields.release[0])
         return false;
     for (const char *c = fields.release; *c; ++c)
@@ -1078,8 +1091,9 @@ static bool step_finish(void) {
             char done[16], all[16];
             megabytes(done, sizeof(done), info.done);
             megabytes(all, sizeof(all), info.total);
-            say(false, "%s %s of %s; keep the " DEVICE " on",
-                info.state == USER_UPDATE_WRITING ? "Writing" : "Verifying", done, all);
+            say(false, "%s %s of %s; keep the %s on",
+                info.state == USER_UPDATE_WRITING ? "Writing" : "Verifying", done, all,
+                device()->name);
         }
         render_progress(true);
         return true;
@@ -1153,7 +1167,7 @@ static void act(int target) {
     if (!enabled(target)) return;
     if (target == CHECK) {
         installing[0] = 0;
-        start(CHECKING_SYSTEM, UPDATE_URL, HEADER, 0);
+        start(CHECKING_SYSTEM, device()->update_url, HEADER, 0);
     } else if (target == INSTALL_SYSTEM && download_mode()) {
         say(false, "Restarting into download mode...");
         render();
@@ -1164,7 +1178,7 @@ static void act(int target) {
         }
     } else if (target == INSTALL_SYSTEM) {
         installing[0] = 0;
-        start(INSTALLING, UPDATE_URL, STREAM, available_size);
+        start(INSTALLING, device()->update_url, STREAM, available_size);
     } else if (target == PREVIOUS_APPS || target == NEXT_APPS) {
         if (target == PREVIOUS_APPS) row_offset -= ROWS;
         else row_offset += ROWS;

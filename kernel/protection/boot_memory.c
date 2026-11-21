@@ -40,11 +40,18 @@ bool boot_memory_available(const struct platform_devices *d, uint64_t start, uin
 
 static bool arena(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks, uintptr_t ke,
                   uint64_t minimum, uint64_t maximum, uintptr_t *out, size_t *size) {
+#ifdef SOS2_BOARD_NEXUS5
+    /* The Nexus 5's second bank: identity-mapped kernel memory must stay
+     * clear of ARM32 user space (0x10000000-0x40000000, include/user_abi.h),
+     * and the first bank below it holds the boot data and the firmware. */
+    const uint64_t floor = 0x40000000, ceiling = 0x80000000;
+#else
     /* Stay above the MSM8916 firmware allocation window (TZ/SMEM/modem/
      * WCNSS/venus/MBA), even if the minimal handoff omits its reservations.
      * Also respect every reservation supplied by firmware and the live FB.
      * Source: upstream qcom/msm8916.dtsi reserved-memory + alloc-ranges. */
     const uint64_t floor = 0x90000000, ceiling = 0xc0000000;
+#endif
     uint64_t best = 0, best_size = 0;
     if (!d->has_initrd_start || !d->has_initrd_end || d->initrd_end <= d->initrd_start)
         return false;

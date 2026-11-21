@@ -5,8 +5,9 @@ PYTHON ?= python3
 # Public interface. Internal build rules use file paths, not command aliases.
 # ARCH=arm64 builds and runs QEMU's AArch64 system (tools/arch.py). The
 # devices have one architecture each, so their targets set ARCH themselves:
-# phone ARM32 (the Redmi 2), tablet arm64 (the Galaxy Tab A7 Lite).
-DEVICE_ARCH := $(sort $(if $(filter phone,$(MAKECMDGOALS)),arm32) \
+# phone ARM32 (the Redmi 2), tablet arm64 (the Galaxy Tab A7 Lite), nexus5
+# ARM32.
+DEVICE_ARCH := $(sort $(if $(filter phone nexus5,$(MAKECMDGOALS)),arm32) \
                       $(if $(filter tablet,$(MAKECMDGOALS)),arm64))
 ifneq ($(word 2,$(DEVICE_ARCH)),)
 $(error phone is ARM32 and tablet arm64: run them separately)
@@ -14,7 +15,7 @@ endif
 ifneq ($(DEVICE_ARCH),)
 ifeq ($(origin ARCH),command line)
 ifneq ($(ARCH),$(DEVICE_ARCH))
-$(error $(filter phone tablet,$(MAKECMDGOALS)) builds for $(DEVICE_ARCH): leave out ARCH=$(ARCH))
+$(error $(filter phone tablet nexus5,$(MAKECMDGOALS)) builds for $(DEVICE_ARCH): leave out ARCH=$(ARCH))
 endif
 endif
 ARCH := $(DEVICE_ARCH)
@@ -34,11 +35,12 @@ REDMI2_ADRENO_FIRMWARE ?= $(if $(wildcard build/redmi2-adreno/a300_pm4.fw),build
 # The tablet's touch firmware (docs/gta7lite.md): without it there is no touch.
 GTA7LITE_TOUCH_FIRMWARE ?= $(if $(GTA7LITE_STOCK),$(GTA7LITE_STOCK)/touch-firmware)
 GTA7LITE_WIFI_FIRMWARE ?= $(if $(GTA7LITE_STOCK),$(GTA7LITE_STOCK)/wifi-firmware)
+NEXUS5_WIFI_FIRMWARE ?= $(if $(NEXUS5_STOCK),$(NEXUS5_STOCK)/wifi-firmware)
 include tools/build.mk
 export SOS2_ARCH := $(ARCH)
-export ARM32_PREFIX ARM64_PREFIX REDMI2_WIFI_FIRMWARE REDMI2_WIFI_PROFILE REDMI2_ADRENO_FIRMWARE REDMI2_JSC GTA7LITE_STOCK GTA7LITE_TOUCH_FIRMWARE GTA7LITE_WIFI_FIRMWARE GTA7LITE_WIFI_PROFILE GTA7LITE_JSC PUBLISH
+export ARM32_PREFIX ARM64_PREFIX REDMI2_WIFI_FIRMWARE REDMI2_WIFI_PROFILE REDMI2_ADRENO_FIRMWARE REDMI2_JSC GTA7LITE_STOCK GTA7LITE_TOUCH_FIRMWARE GTA7LITE_WIFI_FIRMWARE GTA7LITE_WIFI_PROFILE GTA7LITE_JSC NEXUS5_STOCK NEXUS5_WIFI_FIRMWARE NEXUS5_WIFI_PROFILE NEXUS5_JSC PUBLISH
 
-.PHONY: all help fetch engine run phone publish tablet clean
+.PHONY: all help fetch engine run phone publish tablet nexus5 clean
 all: build/resources-$(ARCH)/kernel.img build/host/mkfs build/host/fs-image
 
 help:
@@ -70,8 +72,14 @@ phone: build/redmi2-protected-arm32/kernel.img build/redmi2/boot.dtb
 tablet: build/gta7lite-arm64/kernel.img
 	$(PYTHON) tools/project.py tablet --engine "$(ENGINE)"
 
-# Publishing is explicit and pushes only what make phone and make tablet last
-# wrote; PUBLISH=gta7lite (or redmi2) limits it to that device.
+# The Nexus 5 (LG hammerhead), ARM32: a RAM image for fastboot boot and the
+# installed system.
+nexus5: build/nexus5-arm32/kernel.img build/nexus5/boot.dtb
+	$(PYTHON) tools/project.py nexus5 --engine "$(ENGINE)"
+
+# Publishing is explicit and pushes only what make phone, make tablet and
+# make nexus5 last wrote; PUBLISH=gta7lite (redmi2, nexus5) limits it to that
+# device.
 publish:
 	$(PYTHON) tools/project.py publish
 

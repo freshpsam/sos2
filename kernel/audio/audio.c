@@ -48,7 +48,7 @@ static void close_stream(struct stream *s) {
 }
 
 void audio_init(const struct platform_devices *devices) {
-#if defined(SOS2_BOARD_REDMI2)
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
     (void)devices;
 #elif defined(SOS2_BOARD_GTA7LITE)
     (void)devices;

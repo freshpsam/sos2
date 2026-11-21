@@ -24,6 +24,9 @@ struct platform_devices {
     bool has_initrd_start, has_initrd_end;
     char bootargs[256]; /* the sos2.* arguments alone (kernel/fdt.c) */
     bool redmi2_wt88047;
+    /* The Nexus 5's own tree (boards/nexus5/boot.dts), which its stock
+     * bootloader completed. */
+    bool nexus5_hammerhead;
     struct memory_region ram_regions[MAX_RAM_REGIONS];
     size_t ram_region_count;
     struct memory_region reserved_regions[MAX_RESERVED_REGIONS];

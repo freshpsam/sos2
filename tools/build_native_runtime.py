@@ -152,25 +152,30 @@ def libstdcxx(jobs):
     print('Native C++ library:',SYSROOT/'lib/libstdc++.a',flush=True)
 
 
-# The browser's ICU data for SOS2's languages, English and Chinese. Whole, it
-# takes 33 MB, a quarter of the engine; trimmed, 8 MB. Kept: Unicode
-# properties, normalization and IDNA, the break rules with the Chinese and
-# Japanese word dictionary, time zones and the other supplemental data, the
-# converters WebKit's TextCodecICU decodes with (WebCore/PAL/pal/text/
-# TextCodecICU.cpp, by the names ICU 78 gives them; WebKit decodes the rest
-# itself), and in every locale tree the data of root, English and Chinese,
-# which its index then lists alone. Dropped: transliteration, spelled-out
-# numbers, the Southeast Asian word dictionaries, the other converters and
-# locales; dates, numbers and collation in other languages fall back to the
-# root locale's.
-ICU_LOCALES={'root','en','en_001','en_US','en_US_POSIX','zh','zh_CN','zh_Hans','zh_Hans_CN'}
-ICU_DROPPED_ITEMS={'brkitr/burmesedict.dict','brkitr/khmerdict.dict','brkitr/laodict.dict',
-    'brkitr/thaidict.dict'}
+# The browser's ICU data for SOS2's language, English. Whole, it takes 33 MB,
+# a quarter of the engine; trimmed, 4 MB. Kept: Unicode properties,
+# normalization and IDNA, the break rules, time zones and the other
+# supplemental data, the converters WebKit's TextCodecICU decodes with
+# (WebCore/PAL/pal/text/TextCodecICU.cpp, by the names ICU 78 gives them;
+# WebKit decodes the rest itself) but EUC-TW's, and in every locale tree, the
+# break rules' included, the data of root and English, which its index then
+# lists alone. Dropped: transliteration, spelled-out numbers, the word
+# dictionaries (Chinese and Japanese, Southeast Asian), the line rules of
+# Chinese and Japanese and the sentence rules of Greek, whose locales go, the
+# other converters and locales; dates, numbers and collation in other
+# languages fall back to the root locale's, and text in EUC-TW decodes to
+# nothing. English alone keeps the Nexus 5's system within its 22 MiB boot
+# partition (docs/nexus5.md).
+ICU_LOCALES={'root','en','en_001','en_US','en_US_POSIX'}
+ICU_DROPPED_ITEMS={'brkitr/burmesedict.dict','brkitr/cjdict.dict','brkitr/khmerdict.dict',
+    'brkitr/laodict.dict','brkitr/thaidict.dict','brkitr/line_cj.brk','brkitr/line_loose_cj.brk',
+    'brkitr/line_loose_phrase_cj.brk','brkitr/line_normal_cj.brk',
+    'brkitr/line_normal_phrase_cj.brk','brkitr/line_phrase_cj.brk','brkitr/sent_el.brk'}
 ICU_CONVERTERS={'ibm-912_P100-1995','ibm-914_P100-1995','ibm-915_P100-1995','iso-8859_10-1998',
     'ibm-921_P100-1995','iso-8859_14-1998','ibm-923_P100-1998','ibm-878_P100-1996','macos-0_2-10.2',
     'ibm-5346_P100-1998','ibm-5347_P100-1998','ibm-5350_P100-1998','ibm-9448_X100-2005',
-    'ibm-5354_P100-1998','macos-7_3-10.2','macos-6_2-10.4','macos-29-10.2','macos-35-10.2','euc-tw-2014'}
-ICU_LOCALE_TREES=('','coll/','curr/','lang/','region/','unit/','zone/')
+    'ibm-5354_P100-1998','macos-7_3-10.2','macos-6_2-10.4','macos-29-10.2','macos-35-10.2'}
+ICU_LOCALE_TREES=('','brkitr/','coll/','curr/','lang/','region/','unit/','zone/')
 ICU_DROPPED_TREES=('rbnf/','translit/')
 
 
@@ -206,8 +211,8 @@ def trim_icu_data():
         # The bundles naming what goes are rewritten from derb's dumps: each
         # index keeps only the locales left, with the nofallback flag the
         # dump loses (without it ICU would look for a parent), and the break
-        # rules' root forgets the dropped dictionaries.
-        dictionaries=[item[len('brkitr/'):] for item in ICU_DROPPED_ITEMS]
+        # rules' root forgets the dropped dictionaries and rules.
+        dropped=[item[len('brkitr/'):] for item in ICU_DROPPED_ITEMS]
         rewritten=indexes+['brkitr/root.res']
         (work/'rewritten.lst').write_text('\n'.join(rewritten)+'\n')
         tool('icupkg','-x','rewritten.lst','-d','bundles',data)
@@ -220,7 +225,7 @@ def trim_icu_data():
                 lines=[line for line in text.splitlines() if not (
                     m:=re.fullmatch(r'\s+([A-Za-z0-9_]+) \{ "" \}',line)) or m.group(1) in ICU_LOCALES]
             else:
-                lines=[line for line in text.splitlines() if not any(item in line for item in dictionaries)]
+                lines=[line for line in text.splitlines() if not any(item in line for item in dropped)]
             (folder/(name+'.txt')).write_text('\n'.join(lines)+'\n')
             tool('genrb','-s',folder,'-d',folder,name+'.txt')
         # One pass: the rewritten bundles replace their originals, whose

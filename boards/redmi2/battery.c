@@ -1,5 +1,5 @@
 #include "redmi2_battery.h"
-#include "msm8916_i2c.h"
+#include "qup_i2c.h"
 
 /* WT88047: SMB1360 at 0x14 on BLSP1 QUP4 (GPIO14/15, mux 2).
  * Only read the already-configured gauge's shadow SOC, its charging status
@@ -33,7 +33,7 @@ static void write32(uintptr_t p, uint32_t value) {
     mmio_write32(p, value);
     barrier();
 }
-static struct msm8916_i2c bus = {.base = 0x078b8000};
+static struct qup_i2c bus = {.base = 0x078b8000};
 
 static bool wait_bits(uintptr_t address, uint32_t mask, uint32_t value) {
     uint64_t start = time_us();
@@ -59,18 +59,18 @@ static bool prepare(void) {
         write32(address, (read32(address) & ~0x3ffu) | (2u << 2));
         if ((read32(address) & 0x3ffu) != (2u << 2)) return false;
     }
-    return msm8916_i2c_bus_init(&bus);
+    return qup_i2c_init(&bus);
 }
 
 static bool read8(uint8_t reg, uint8_t *value) {
-    return msm8916_i2c_bus_read(&bus, SMB1360, reg, value, 1);
+    return qup_i2c_read(&bus, SMB1360, reg, value, 1);
 }
 
 bool redmi2_battery_read(struct battery_view *out) {
     if (!out || (!bus.ready && !prepare())) return false;
     uint8_t revision, status, input, soc, voltage[2];
     if (!read8(REVISION, &revision) || revision == 0xff || !read8(MSYS_SOC, &soc) ||
-        !msm8916_i2c_bus_read(&bus, SMB1360, VTG_NOW, voltage, 2) || !read8(STATUS_3, &status) ||
+        !qup_i2c_read(&bus, SMB1360, VTG_NOW, voltage, 2) || !read8(STATUS_3, &status) ||
         !read8(IRQ_E, &input))
         return false;
     /* A missing/uninitialized gauge can return a flat 0/0xff register bank.

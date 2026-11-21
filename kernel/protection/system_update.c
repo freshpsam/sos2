@@ -16,26 +16,38 @@
 #include "redmi2_power.h"
 #elif defined(SOS2_BOARD_GTA7LITE)
 #include "gta7lite.h"
+#elif defined(SOS2_BOARD_NEXUS5)
+#include "nexus5.h"
+#endif
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE) || defined(SOS2_BOARD_NEXUS5)
+#define SYSTEM_INSTALLS 1 /* QEMU's machines install nothing */
 #endif
 
 /* The formats are in include/system_store.h, written by
- * tools/package_redmi2.py and tools/package_gta7lite.py. A system update is a
- * whole boot image: kernel, device tree and compressed resources. It arrives
- * in RAM and is checked against its SHA-256 and the shape the device's
- * loader starts (lk2nd on the phone, Samsung's LK on the tablet); then the
- * boot partition's first sector, which the loader needs to start an image,
- * is cleared, the rest is written and read back, and the first sector is
- * written last. Until it is cleared the old image is untouched; from then
+ * tools/package_redmi2.py, tools/package_gta7lite.py and
+ * tools/package_nexus5.py. A system update is a whole boot image: kernel,
+ * device tree and compressed resources. It arrives in RAM and is checked
+ * against its SHA-256 and the shape the device's loader starts (lk2nd on the
+ * phone, Samsung's LK on the tablet, the stock bootloader on the Nexus 5);
+ * then the boot partition's first sector, which the loader needs to start an
+ * image, is cleared, the rest is written and read back, and the first sector
+ * is written last. Until it is cleared the old image is untouched; from then
  * until the last write, which a closed updater does not stop, an
  * interruption leaves no image to start: the phone falls back to lk2nd's
- * fastboot, the tablet to download mode. An app's package
+ * fastboot, the tablet to download mode, the Nexus 5 to its bootloader's
+ * fastboot. An app's package
  * (include/app_store.h) arrives whole in RAM, is checked, and goes to its app
  * store position. Nothing is signed: the SHA-256s guard against damage, not
  * against whoever publishes the files. */
 enum {
     ANDROID_PAGE = 2048,
+#ifdef SOS2_BOARD_NEXUS5
+    KERNEL_ADDRESS = 0x00008000,
+    TAGS_ADDRESS = 0x02700000,
+#else
     KERNEL_ADDRESS = 0x80008000,
     TAGS_ADDRESS = 0x81e00000,
+#endif
     /* The boot image's RAM, in pieces the page allocator finds. */
     IMAGE_CHUNK = 1024 * 1024,
     IMAGE_CHUNKS = (SYSTEM_BOOT_LIMIT + IMAGE_CHUNK - 1) / IMAGE_CHUNK,
@@ -45,9 +57,12 @@ enum {
 
 #ifdef SOS2_BOARD_GTA7LITE
 static const char board[16] = "gta7litewifi";
+#elif defined(SOS2_BOARD_NEXUS5)
+static const char board[16] = "lge-hammerhead";
 #else
 static const char board[16] = "redmi2-wt88047";
 #endif
+_Static_assert(sizeof(board) == sizeof(((struct user_update_info *)0)->board), "INFO's board");
 
 static struct {
     uint32_t state, owner; /* owner: the receiving process */
@@ -64,10 +79,10 @@ static struct {
 
 static char release[SYSTEM_RELEASE_MAX + 1];
 static bool restart_due; /* an installed system update waits for a restart */
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE)
+#ifdef SYSTEM_INSTALLS
 static bool installed; /* started from the installed system */
 #endif
-#ifndef SOS2_BOARD_REDMI2
+#if !defined(SOS2_BOARD_REDMI2) && !defined(SOS2_BOARD_NEXUS5)
 static enum cpu_boot_method psci_method; /* QEMU and the tablet restart through PSCI */
 #endif
 static uint64_t worked_at;
@@ -113,10 +128,10 @@ static bool storage_installed(const char *args, size_t length) {
 }
 
 void system_update_init(const struct platform_devices *d) {
-#ifndef SOS2_BOARD_REDMI2
+#if !defined(SOS2_BOARD_REDMI2) && !defined(SOS2_BOARD_NEXUS5)
     psci_method = d->psci_method;
 #endif
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE)
+#ifdef SYSTEM_INSTALLS
     /* The installed system's boot image says so; the cache partition holds
      * its app store and data volume. Without the eMMC it runs as a RAM
      * session. */
@@ -129,7 +144,7 @@ void system_update_init(const struct platform_devices *d) {
         release[f->size] = 0;
     }
     update = (__typeof__(update)){0};
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE)
+#ifdef SYSTEM_INSTALLS
     /* Installed on the eMMC, it installs there; BEGIN tells a failed card. */
     update.installs = installed;
 #endif
@@ -199,6 +214,7 @@ int32_t system_update_info(struct vm_space *space, user_ptr address, uint32_t si
     }
     memcpy(info.release, release, sizeof(release));
     memcpy(info.message, update.message, sizeof(update.message));
+    memcpy(info.board, board, sizeof(board));
     if (size != sizeof(info)) return USER_EINVAL;
     return vm_copy_to_user(space, address, &info, sizeof(info)) ? 0 : USER_EFAULT;
 }
@@ -305,11 +321,13 @@ static int32_t receive(uint32_t pid, struct vm_space *space, user_ptr address, u
 }
 
 #ifndef SOS2_BOARD_GTA7LITE
-/* An image lk2nd starts as the installed system: the kernel at its address
- * with the DTB after it, the compressed resources as the ramdisk, where lk2nd
- * puts one, no second stage, and a command line that keeps data on the eMMC,
- * parsed as the next boot will: it fits the 255 bytes of sos2.* arguments
- * the kernel keeps, and nothing else may join it. */
+/* An image the phone's loader (lk2nd on the Redmi 2, the stock bootloader
+ * on the Nexus 5) starts as the installed system: the kernel at its address
+ * with the DTB after it, the compressed resources as the ramdisk, where the
+ * loader puts one, no second stage, and a command
+ * line that keeps data on the eMMC, parsed as the next boot will: it fits
+ * the 255 bytes of sos2.* arguments the kernel keeps, and nothing else may
+ * join it. */
 static bool boot_image_valid(void) {
     const unsigned char *image = update.image[0];
     uint32_t kernel = le32(image + 8), ramdisk = le32(image + 16);
@@ -408,7 +426,7 @@ static int32_t install_step(void) {
             update.done += n * 512;
             work();
         }
-        /* The first sector last: from here lk2nd starts the new image. */
+        /* The first sector last: from here the loader starts the new image. */
         if (!system_store_write(SYSTEM_BOOT, 0, update.image[0], 1) || !system_store_sync() ||
             !system_store_read(SYSTEM_BOOT, 0, scratch, 1) || memcmp(scratch, update.image[0], 512))
             return failure(boot_failed, USER_EIO);
@@ -451,6 +469,8 @@ static int32_t restart(void) {
 #ifdef SOS2_BOARD_REDMI2
     (void)redmi2_power_restart();
     say("Did not restart; hold Power for 10 s");
+#elif defined(SOS2_BOARD_NEXUS5)
+    nexus5_restart(false);
 #else
     if (psci_method == CPU_BOOT_HVC || psci_method == CPU_BOOT_SMC)
         (void)arm_psci_call(psci_method, 0x84000009 /* PSCI SYSTEM_RESET */, 0, 0);

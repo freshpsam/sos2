@@ -213,14 +213,18 @@ static void vm_switch(const struct vm_space *space) {
 static bool enable_translation(bool secondary) {
     uint32_t control = arm_cache_control(), zero = 0, domain = 1, cpacr = 0x00f00000;
     if (control & 5) return false; /* Boot contract: MMU and data cache off. */
+#ifndef SOS2_BOARD_NEXUS5
     /* ARM32 A15/A53 ACTLR.SMP, matching the vendor's __v7_ca53mp_setup.
-     * Shared user mappings participate in CPU coherency; DMA is kept separate. */
+     * Shared user mappings participate in CPU coherency; DMA is kept separate.
+     * Krait (the Nexus 5) has no such bit: Linux's __krait_proc_info setup
+     * leaves its implementation-defined ACTLR alone. */
     uint32_t auxiliary;
     __asm__ volatile("mrc p15, 0, %0, c1, c0, 1" : "=r"(auxiliary));
     if (!(auxiliary & 64)) {
         auxiliary |= 64;
         __asm__ volatile("mcr p15, 0, %0, c1, c0, 1\n isb" : : "r"(auxiliary) : "memory");
     }
+#endif
     if (secondary) arm_dcache_invalidate_local();
     else arm_dcache_invalidate_all();
     arm_instruction_sync();
@@ -239,8 +243,8 @@ static bool enable_translation(bool secondary) {
     /* AFE, TRE and WXN off: the JIT window is writable and executable; vm_map
      * and vm_protect keep W^X everywhere else, and every kernel RW mapping is XN. */
     control &= ~((1u << 29) | (1u << 28) | (1u << 19));
-    /* XP, I-cache, D-cache, MMU. */
-    control |= (1u << 23) | (1u << 12) | 5;
+    /* XP, I-cache, branch prediction, D-cache, MMU. */
+    control |= (1u << 23) | (1u << 12) | (1u << 11) | 5;
     __asm__ volatile("dsb sy\n mcr p15, 0, %0, c1, c0, 0\n isb" : : "r"(control) : "memory");
     return true;
 }
@@ -251,7 +255,7 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
     const struct arm_machine *machine = arm_machine_get();
     uintptr_t start = (uintptr_t)__image_start, end = (uintptr_t)__image_end;
     uintptr_t pool_start = (uintptr_t)__page_pool_start, pool_end = (uintptr_t)__page_pool_end;
-#ifdef SOS2_BOARD_REDMI2
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
     if (runtime_files_size()) {
         size_t size;
         if (!redmi2_browser_arena(d, dtb, start, end, &pool_start, &size)) return false;
@@ -278,7 +282,7 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
         if ((r->start < end && start < finish) || (r->start < pool_end && pool_start < finish))
             return false;
     }
-#ifdef SOS2_BOARD_REDMI2
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
     uintptr_t fb = (uintptr_t)d->framebuffer.pixels;
     uint64_t fb_end = (uint64_t)fb + d->framebuffer_size;
     if (!d->has_framebuffer || !d->framebuffer_size || d->framebuffer_size > UINT32_MAX ||
@@ -315,7 +319,7 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
         const struct arm_mapping *r = &machine->devices[i];
         if (!kernel_map(r->start, r->size, DEVICE | KERNEL_RW | XN)) return false;
     }
-#ifdef SOS2_BOARD_REDMI2
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
     if (!kernel_map(fb, (uint32_t)d->framebuffer_size, NORMAL | KERNEL_RW | XN)) return false;
 #endif
     kernel_unmap((uintptr_t)__stack_guard);

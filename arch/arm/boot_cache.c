@@ -1,7 +1,7 @@
 #include "arm_cache.h"
 #include "platform.h"
 
-#ifdef SOS2_BOARD_REDMI2
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
 /* Only the decoder uses these tables. Afterwards vm_init installs the normal
  * restrictive mappings. RAM is mapped at its physical address, with no alias.
  * Default sections retain Device attributes for early touch/PMIC MMIO.
@@ -67,7 +67,8 @@ bool arm_boot_cache_begin(const struct platform_devices *d, uintptr_t dtb, uintp
                      : "r"(zero), "r"(domain), "r"(ttbr)
                      : "memory");
     uint32_t control =
-        (saved_control & ~((1u << 29) | (1u << 28))) | (1u << 23) | (1u << 19) | (1u << 12) | 5;
+        (saved_control & ~((1u << 29) | (1u << 28))) | (1u << 23) | (1u << 19) | (1u << 12) |
+        (1u << 11) | 5;
     __asm__ volatile("mcr p15, 0, %0, c1, c0, 0\n isb" : : "r"(control) : "memory");
     enabled = true;
     return true;

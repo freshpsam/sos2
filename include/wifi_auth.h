@@ -22,6 +22,9 @@ struct wifi_auth;
 bool wifi_auth_credential(struct wifi_profile *, const unsigned char *, unsigned);
 bool wifi_rsn_select(struct wifi_rsn *, unsigned security, const unsigned char *, unsigned,
                      const unsigned char *, unsigned);
+/* Without management frame protection in the radio, networks are selected
+ * as if no access point offered it (the default is with it). */
+void wifi_rsn_pmf(bool supported);
 bool wifi_rsn_response(const struct wifi_rsn *, unsigned security, const unsigned char *, unsigned);
 struct wifi_auth *wifi_auth_create(const struct wifi_profile *, const unsigned char bssid[6],
                                    const struct wifi_rsn *,

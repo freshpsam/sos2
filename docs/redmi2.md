@@ -32,10 +32,56 @@ data last until reboot.
 3. Enter an address such as `https://example.com/` and tap **Open**. The
    right-hand key below the screen is Back.
 
-If Wi-Fi fails the desktop says why ([details](redmi2-wifi.md)). Randomness
+If Wi-Fi fails the desktop says why ([Wi-Fi](#wi-fi)). Randomness
 comes from CPU jitter, which seeds a generator (as on the
 [tablet](gta7lite.md)); if its self-test fails, pages, Wi-Fi and HTTPS stay
 unavailable. Power toggles standby, which lasts about two weeks.
+
+## Wi-Fi
+
+The native WCN3620 (Pronto v2) [driver](#loader-and-hardware) passes Ethernet
+frames to lwIP. Firmware startup, scanning, association, DHCP and browsing
+work on the handset; router interoperability and long-running recovery still
+need qualification (see the [roadmap](roadmap.md)).
+
+**WI-FI → Scan Networks** lists up to 128 networks across pages; pick one,
+enter its password and tap **Connect**. The saved network has its own row at
+the top, which the list leaves out. If more networks are discovered,
+the list says **Some networks could not be listed**. The keyboard is ASCII,
+and without a saved profile the radio stays idle until you scan.
+
+- Supported: open, WPA2-Personal (CCMP) and WPA3-SAE, with no silent
+  downgrade, on 2.4 GHz channels 1–11.
+- Not supported: Enterprise, OWE, TKIP, hidden networks and roaming.
+- A profile is saved only after it connects; a wrong password keeps the
+  previous one. The saved network's page shows its password (**Show**) and
+  offers **Forget**.
+- A RAM session keeps the profile until reboot; persistent storage, an
+  [installed](#installing) phone's included, keeps it in `/settings/wifi`,
+  unencrypted, outside every profile.
+
+Failures show their reason on the Wi-Fi screen; transport, DMA or entropy
+failures need a reboot.
+
+### Power save
+
+Standby leaves the network and puts the firmware in idle-mode power save, as
+Linux's `wcn36xx` does; waking rejoins within a few seconds.
+
+### Provisioning
+
+An optional bootstrap profile can be built into the image. The tool prompts
+for the password without echo and never overwrites a file:
+
+```sh
+python3 tools/redmi2_wifi.py --ssid 'browser lab' --security wpa3-sae \
+  --output "$HOME/sos2-wifi.json"
+make phone REDMI2_WIFI_PROFILE="$HOME/sos2-wifi.json"
+```
+
+The profile is imported once it connects and only when no desktop record
+exists, so **Forget** survives reboot. Keep the profile and any image
+containing it private.
 
 ## Installing
 
@@ -80,7 +126,7 @@ needs Wi-Fi and the network time.
 
 1. **CHECK FOR UPDATES** reads the published release and app list.
 2. **INSTALL SYSTEM** (**REINSTALL** for the running release) downloads the
-   boot image, about 29 MB, into RAM. The kernel checks it, clears the boot
+   boot image, about 24 MB, into RAM. The kernel checks it, clears the boot
    image's first sector, writes the rest and reads it back, and writes the
    first sector last.
 3. **RESTART** restarts the phone into the new release.
@@ -114,11 +160,13 @@ position not in use, so an interrupted install keeps the previous version.
 ## Packaging options
 
 - `REDMI2_WIFI_FIRMWARE=folder` supplies `wcnss.mdt`, its `wcnss.bXX`
-  segments and `WCNSS_qcom_wlan_nv.bin`; the default,
+  segments and the board calibration `WCNSS_qcom_wlan_nv.bin`; the default,
   `third_party/redmi2-firmware`, holds this project's handset files. Another
-  handset must use its own files, never another phone's NV calibration.
+  handset must use its own files, never another phone's NV calibration. The
+  packager checks the signed MDT's layout; the secure monitor verifies its
+  signatures at boot.
 - `REDMI2_WIFI_PROFILE=file` adds a bootstrap Wi-Fi profile
-  ([provisioning](redmi2-wifi.md#provisioning)).
+  ([provisioning](#provisioning)).
 - The [Adreno path](gpu.md#redmi-2-adreno) is on once `make fetch` has put
   its firmware in `build/redmi2-adreno`; `REDMI2_ADRENO_FIRMWARE` names
   another folder, or none (empty) for CPU composition.
@@ -161,8 +209,20 @@ failure stops storage for the boot, and writes are never retried.
   desktop. Menu is unused.
 - **Devices:** FT5x06 touch; PM8916 power key, backlight, vibrator, RTC and
   restart; SMB1360 battery gauge; CPU-jitter entropy; WCN3620
-  [Wi-Fi](redmi2-wifi.md); the eMMC; an optional Adreno 306. All four cores
+  [Wi-Fi](#wi-fi); the eMMC; an optional Adreno 306. All four cores
   start; a core that does not is skipped.
+- **Wi-Fi:** the stock
+  [WT88047 kernel](https://github.com/LineageOS/android_kernel_wingtech_msm8916/tree/beb5692ed25808aebce7b57e318cf8bd33e645d8)
+  (its WCNSS, prima/DXE and SCM sources) defines the board contract, and
+  Linux v6.12's
+  [wcn36xx driver](https://github.com/torvalds/linux/tree/v6.12/drivers/net/wireless/ath/wcn36xx)
+  adds wire definitions; where they differ, the stock driver wins. The driver
+  loads the firmware through the secure monitor, talks to it over SMEM, SMP2P
+  and SMD, and drops its start-up power requests once the firmware is ready.
+  Radio work is polled on the kernel service worker, with no interrupts.
+  Authentication uses vendored hostap 2.12 and Mbed TLS 3.6.7 with no Linux
+  daemon. When the firmware rejects a calibration upload fragment after
+  accepting the first (`status=00000005`), SOS2 restarts the upload once.
 - **Restart:** a PMIC hard reset through PS_HOLD, as lk2nd's `reboot_device`
   does.
 - **Battery:** the header's icon shows the SMB1360 gauge's level and its

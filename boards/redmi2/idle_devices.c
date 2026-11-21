@@ -1,5 +1,5 @@
 #include "redmi2_idle_devices.h"
-#include "msm8916_i2c.h"
+#include "qup_i2c.h"
 #include "platform.h"
 
 /* Devices SOS2 does not use, left as the boot chain leaves them, put into
@@ -65,7 +65,7 @@ enum {
     INT_ENABLE = 0x38,
     WAIT_US = 10000,
 };
-static struct msm8916_i2c sensors = {.base = 0x078b6000};
+static struct qup_i2c sensors = {.base = 0x078b6000};
 
 static bool wait_bits_for(uintptr_t address, uint32_t mask, uint32_t value, uint32_t limit) {
     uint64_t start = time_us();
@@ -96,13 +96,13 @@ static bool sensor_bus(void) {
         write32(cfg, (read32(cfg) & ~(uint32_t)GPIO_CFG_MASK) | I2C2_FUNCTION);
         if ((read32(cfg) & GPIO_CFG_MASK) != I2C2_FUNCTION) return false;
     }
-    return msm8916_i2c_bus_init(&sensors);
+    return qup_i2c_init(&sensors);
 }
 
 static bool imu_sleep(void) {
     if (!sensor_bus()) return false;
     uint8_t id = 0, power = 0;
-    bool ok = msm8916_i2c_bus_read(&sensors, IMU, WHO_AM_I, &id, 1);
+    bool ok = qup_i2c_read(&sensors, IMU, WHO_AM_I, &id, 1);
     /* InvenSense MPU-6000/6050 (0x68), 6500 (0x70), 9250 (0x71), 9255 (0x73),
      * 6515 (0x74), 6880 (0x78). */
     if (ok && id != 0x68 && id != 0x70 && id != 0x71 && id != 0x73 && id != 0x74 && id != 0x78)
@@ -111,11 +111,11 @@ static bool imu_sleep(void) {
         /* Its interrupt as at reset, push-pull active high and off, so the
          * line rests low on the pin's pull-down whatever a previous OS set;
          * sleep is tried even if this does not take. */
-        (void)msm8916_i2c_bus_write(&sensors, IMU, INT_ENABLE, 0);
-        (void)msm8916_i2c_bus_write(&sensors, IMU, INT_PIN_CFG, 0);
-        if (msm8916_i2c_bus_read(&sensors, IMU, PWR_MGMT_1, &power, 1) && !(power & SLEEP))
-            ok = msm8916_i2c_bus_write(&sensors, IMU, PWR_MGMT_1, SLEEP) &&
-                 msm8916_i2c_bus_read(&sensors, IMU, PWR_MGMT_1, &power, 1) && (power & SLEEP);
+        (void)qup_i2c_write(&sensors, IMU, INT_ENABLE, 0);
+        (void)qup_i2c_write(&sensors, IMU, INT_PIN_CFG, 0);
+        if (qup_i2c_read(&sensors, IMU, PWR_MGMT_1, &power, 1) && !(power & SLEEP))
+            ok = qup_i2c_write(&sensors, IMU, PWR_MGMT_1, SLEEP) &&
+                 qup_i2c_read(&sensors, IMU, PWR_MGMT_1, &power, 1) && (power & SLEEP);
         else ok = (power & SLEEP) != 0;
     }
     (void)branch(QUP2_CBCR, false);

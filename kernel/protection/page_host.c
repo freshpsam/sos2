@@ -145,10 +145,10 @@ enum {
     ACTION_BACK
 };
 
-/* The top bar's buttons: CLOSE over a page and, on the Galaxy Tab A7 Lite,
- * which has no Home or Back key, HOME and BACK over a page or the Wi-Fi
- * screen, BACK on the right as on Samsung's navigation bar. */
-#ifdef SOS2_BOARD_GTA7LITE
+/* The top bar's buttons: CLOSE over a page and, on the Galaxy Tab A7 Lite
+ * and the Nexus 5, which have no Home or Back key, HOME and BACK over a page
+ * or the Wi-Fi screen, BACK on the right as on Samsung's navigation bar. */
+#if defined(SOS2_BOARD_GTA7LITE) || defined(SOS2_BOARD_NEXUS5)
 enum { NAVIGATION_BUTTONS = 1 };
 #else
 enum { NAVIGATION_BUTTONS = 0 };

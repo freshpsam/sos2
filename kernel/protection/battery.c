@@ -5,6 +5,9 @@
 #elif defined(SOS2_BOARD_GTA7LITE)
 #include "gta7lite.h"
 #define board_battery_read gta7lite_battery_read
+#elif defined(SOS2_BOARD_NEXUS5)
+#include "nexus5.h"
+#define board_battery_read nexus5_battery_read
 #endif
 /* The battery icon's level and charger, read every 30 s with the screen on,
  * at once when it comes on, and never while it is off, when nothing shows

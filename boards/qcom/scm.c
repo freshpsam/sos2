@@ -92,7 +92,7 @@ static bool call_once(unsigned service, unsigned command, unsigned arguments, co
     uint32_t original[8] = {0}, r[8];
     /* Legacy responses have a 12-byte header, plus an optional u32 result
      * for availability/PAS. Boot-address registration has no result payload.
-     * See the wt88047 SCM ABI reference linked in docs/redmi2-wifi.md. */
+     * See the wt88047 SCM ABI reference linked in docs/redmi2.md. */
     const unsigned header_size = 12, result_size = result ? sizeof(*result) : 0,
                    response_size = header_size + result_size;
     unsigned response = 16 + 4 * count;

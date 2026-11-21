@@ -2,7 +2,7 @@
 #include "page_host.h"
 #include "page_alloc.h"
 #include "platform.h"
-#if !defined(SOS2_BOARD_REDMI2) && !defined(SOS2_BOARD_GTA7LITE)
+#if !defined(SOS2_BOARD_REDMI2) && !defined(SOS2_BOARD_GTA7LITE) && !defined(SOS2_BOARD_NEXUS5)
 #include "virtio_gpu.h"
 #endif
 
@@ -21,7 +21,7 @@
  * backing bytes per page, 128 MiB in all, and 16 MiB of RAM always left free.
  * Backing is uncached kernel memory, freed only after the device detached it
  * or a confirmed reset; after an unconfirmed reset it stays quarantined. */
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE)
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE) || defined(SOS2_BOARD_NEXUS5)
 int gpu_client_call(struct gpu_client **state, const struct vm_space *space, unsigned slot,
                     uint32_t op, user_ptr address, uint32_t size) {
     (void)state;

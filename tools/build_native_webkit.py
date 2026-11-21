@@ -121,8 +121,8 @@ def configure():
     # Both architectures compile JavaScriptCore's baseline and DFG tiers;
     # sos2.jsc= picks them at run time (programs/browser/web_main.cpp). FTL's
     # B3 backend needs WebAssembly in this WebKit.
-    # -O2 rather than Release's -O3: smaller code, so that the system fits a
-    # 32 MiB boot partition on both devices.
+    # -O2 rather than Release's -O3: smaller code, so that the system fits
+    # each device's boot partition (the Nexus 5's 22 MiB, docs/nexus5.md).
     options={
         'PORT':'SOS2','CMAKE_BUILD_TYPE':'Release','CMAKE_C_FLAGS_RELEASE':'-O2 -DNDEBUG',
         'CMAKE_CXX_FLAGS_RELEASE':'-O2 -DNDEBUG','ENABLE_JIT':'ON','ENABLE_DFG_JIT':'ON',
@@ -165,7 +165,7 @@ def configure():
 def pack_web():
     from runtime_bundle import bundle
     from build_native_render import RECORDS,prepare as prepare_dependency
-    from browser_fonts import resources as font_resources
+    from browser_fonts import resources as font_resources, subset
     fonts=prepare_dependency(next(x for x in RECORDS if x['name']=='fonts'))
     linked=BASE/'webcore-build/bin/sos2-web.elf'
     executable=BASE/'sos2-web.elf'
@@ -176,9 +176,11 @@ def pack_web():
     if digest(roots)!='427c064216761a1e72a8b30f0d954d08cb6e4435a82091fb865afd20c8497285':raise RuntimeError('Unexpected Mozilla trust bundle digest')
     # Web content and runtime configuration cannot change trust anchors.
     files['/certs/roots.pem']=roots
-    for family,slant in (('DejaVuSans','Oblique'),('DejaVuSerif','Italic'),('DejaVuSansMono','Oblique')):
-        for style in ('','-Bold','-'+slant,'-Bold'+slant):
-            name=family+style+'.ttf';files['/fonts/'+name]=fonts/'ttf'/name
+    # DejaVu's upright faces cut to English text (tools/browser_fonts.py):
+    # WebKit slants them for italics (FontCacheSkia.cpp's synthetic oblique).
+    for family in ('DejaVuSans','DejaVuSerif','DejaVuSansMono'):
+        for style in ('','-Bold'):
+            name=family+style+'.ttf';files['/fonts/'+name]=subset(fonts/'ttf'/name,'latin')
     files.update(font_resources())
     from build_native_apps import files as app_files
     files.update(app_files())

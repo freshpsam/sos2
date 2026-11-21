@@ -3,7 +3,7 @@
 #include "boot_progress.h"
 #include "platform.h"
 #include "LzmaDec.h"
-#if defined(SOS2_BOARD_REDMI2) || defined(__aarch64__)
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5) || defined(__aarch64__)
 #include "arm_cache.h"
 #endif
 
@@ -275,12 +275,12 @@ bool boot_bundle_prepare(struct platform_devices *d, uintptr_t dtb, uintptr_t ks
     expanded.initrd_start = destination;
     expanded.initrd_end = destination + word(source + 16);
     if (!redmi2_browser_arena(&expanded, dtb, ks, ke, &arena, &arena_size)) return false;
-#ifdef SOS2_BOARD_REDMI2
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
     if (!arm_boot_cache_begin(d, dtb, (uintptr_t)source, size, destination, word(source + 16)))
         return false;
 #endif
     bool decoded = boot_bundle_decode(source, size, (void *)destination, word(source + 16));
-#ifdef SOS2_BOARD_REDMI2
+#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
     /* This includes failure paths: no dirty output or cached alias survives. */
     arm_boot_cache_end();
 #endif

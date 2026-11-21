@@ -6,6 +6,10 @@
 #elif defined(SOS2_BOARD_GTA7LITE)
 #define SOS2_RAM_START 0x40000000
 #define SOS2_RAM_END   0x100000000ull
+#elif defined(SOS2_BOARD_NEXUS5)
+/* Two 1 GiB banks from address 0. */
+#define SOS2_RAM_START 0x00000000
+#define SOS2_RAM_END   0x80000000
 #else
 #define SOS2_RAM_START 0x40000000
 #ifdef __aarch64__

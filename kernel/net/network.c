@@ -16,6 +16,10 @@
 #include "gta7lite.h"
 #include "wifi_device.h"
 #define network_entropy_read wifi_device_random
+#elif defined(SOS2_BOARD_NEXUS5)
+#include "nexus5.h"
+#include "wifi_device.h"
+#define network_entropy_read wifi_device_random
 #else
 #define network_entropy_read entropy_read
 #endif
@@ -265,6 +269,9 @@ void network_init(const struct platform_devices *devices) {
 #elif defined(SOS2_BOARD_GTA7LITE)
     (void)devices;
     gta7lite_wifi_init(&device);
+#elif defined(SOS2_BOARD_NEXUS5)
+    (void)devices;
+    nexus5_wifi_init(&device);
 #else
     (void)virtio_net_init(devices, &device);
     wifi_setup_init(0, 0);

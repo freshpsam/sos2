@@ -58,3 +58,14 @@ Open work; the other documents describe what exists.
     playback near 8 frames per second on the tablet. The browser saves its
     cookie and storage database (up to 6 MiB) on the page's main thread,
     which holds the page while the copy is written.
+11. **Nexus 5.** The [Nexus 5](nexus5.md) runs installed, its data in the
+    cache partition, or from RAM, on four cores at 1497.6 MHz, with touch,
+    Wi-Fi (open and WPA2 on 2.4 GHz, power saving), the battery, the
+    vibrator and standby (backlight, panel, radio). Next there: the cores'
+    power-down in standby (TrustZone's power collapse through each core's
+    SPM); faster CPU levels (the RPM's logic rail over SMD, the CPU rail,
+    and a temperature watch); Wi-Fi's 5 GHz and speed (an update downloaded
+    at about 0.2 MB/s before the driver read glommed frames, not measured
+    since); the eMMC's speed (single sectors in PIO: about
+    1.5 MB/s read, 0.6 MB/s written); the Adreno 330; sound (the WCD9320
+    behind the audio DSP).

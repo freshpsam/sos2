@@ -22,8 +22,9 @@ int32_t system_update_call(uint32_t pid, struct vm_space *, uint32_t op, user_pt
 /* A process ended: an update it was still receiving is abandoned, one
  * already writing the boot image finished. */
 void system_update_release(uint32_t pid);
-/* For the tablet's USB link (boards/gta7lite/fastboot.c), on CPU 0: whether
- * a boot image is being written, during which nothing restarts; a restart,
+/* For the USB fastboot links (boards/gta7lite/fastboot.c,
+ * boards/nexus5/fastboot.c), on CPU 0: whether a boot image is being
+ * written, during which nothing restarts or reads it; a restart,
  * into the tablet's download mode if asked, which returns only when it did
  * not happen; and the running system's release name ("" without one). */
 bool system_update_busy(void);

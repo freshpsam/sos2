@@ -97,10 +97,11 @@ emptied at every boot.
   writes a profile's files, and `tools/web_content.py` installs the local
   website.
 - **Installed mode** (`sos2.storage=installed`) is persistent mode on an
-  installed [phone](redmi2.md#installing) or [tablet](gta7lite.md#updates-and-apps),
-  whose volume follows its app store in the cache partition. The kernel formats it when it does not mount, and
-  runs as a RAM session when the eMMC fails. Removing an app deletes its
-  files.
+  installed [Redmi 2](redmi2.md#installing),
+  [tablet](gta7lite.md#updates-and-apps) or [Nexus 5](nexus5.md#installing),
+  whose volume follows its app store in the cache partition. The kernel
+  formats it when it does not mount, and runs as a RAM session when the eMMC
+  fails. Removing an app deletes its files.
 
 Web storage and cookies follow the usual browser rules (localStorage per
 origin, no third-party cookies, the pinned Public Suffix List) within fixed
@@ -109,9 +110,9 @@ limits: 5 MiB of storage, per origin and in all, in a database of at most
 
 ## Updates
 
-The updater downloads the device's update (`sos2-redmi2.update` or
-`sos2-gta7lite.update`) and app packages from GitHub Pages
-and hands them to the kernel's update service
+The updater downloads the device's update (`sos2-redmi2.update`,
+`sos2-gta7lite.update` or `sos2-nexus5.update`, by the board the kernel
+names) and app packages from GitHub Pages and hands them to the kernel's update service
 (`kernel/protection/system_update.c`) with `SYS_UPDATE`, which only it may
 call. Like the browser it is part of the system: the desktop's **UPDATES**
 button opens it, and no launcher lists it. On a device started from its
@@ -124,7 +125,10 @@ sessions show updates but install none.
 ## Networking
 
 lwIP provides IPv4, DHCP, DNS and TCP over virtio Ethernet (QEMU) or the
-devices' native Wi-Fi drivers. TCP keeps segments that arrive past a gap and
+devices' native Wi-Fi drivers. The devices share one station
+(kernel/wifi), which builds and parses 802.11 and runs WPA2/WPA3; the
+Nexus 5's FullMAC firmware joins by itself, so its radio answers the station
+from what the firmware does ([details](nexus5.md#loader-and-hardware)). TCP keeps segments that arrive past a gap and
 reports them with SACK, so a frame Wi-Fi loses costs one resend rather than a
 window; the Wi-Fi drivers hand lwIP up to 256 received frames at a time, a
 whole aggregate. HTTPS (Mbed TLS 1.2/1.3) checks hostname,
@@ -143,12 +147,14 @@ backports selected upstream security fixes. Each security patch in
 compare the tiers. Dedicated workers are supported.
 Not available: IPv6, WebSocket, file uploads, IndexedDB, service workers,
 Web Audio and WebGL/WebGPU; video plays only through Media Source Extensions
-([Video](#video)). Text uses FreeType, HarfBuzz and ICU with DejaVu, Noto
-Sans CJK and Noto Color Emoji. SOS2's languages are English and Chinese: ICU's
-data keeps theirs alone (tools/build_native_runtime.py), and the CJK font is
-cut down to GB2312's Simplified Chinese (tools/browser_fonts.py), so that the
-system, engine included, fits a 32 MiB boot partition on both devices:
-about 30 MB compressed on each, with the engine built at -O2 and its code
+([Video](#video)). Text uses FreeType, HarfBuzz and ICU with DejaVu and Noto
+Color Emoji. SOS2's language is English: ICU's data keeps its own alone
+(tools/build_native_runtime.py), DejaVu's upright faces are cut down to
+Latin, Greek and the common symbols, which WebKit slants for italics, and the
+emoji font to all but flags (tools/browser_fonts.py); other scripts draw
+nothing. So the system, engine included, fits each device's boot partition,
+the Nexus 5's 22 MiB the smallest: 22.7 MB compressed there, 23.8 MB on the
+Redmi 2 and 24.5 MB on the tablet, with the engine built at -O2 and its code
 through branch filters (include/boot_bundle.h), which make call targets
 absolute: xz's ARM64 one on AArch64, and on ARM32, whose engine is mostly
 Thumb-2 with ARM-mode libraries, an ARM and a Thumb-2 one, each over its

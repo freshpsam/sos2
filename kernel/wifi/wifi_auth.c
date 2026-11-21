@@ -64,6 +64,14 @@ struct wifi_auth {
     bool failed, authorized, associated, completion;
 };
 
+/* Whether the radio verifies and protects management frames (802.11w): a
+ * FullMAC chip whose firmware cannot (the Nexus 5's) joins every network
+ * without it, refuses those that require it, and never chooses WPA3, which
+ * requires it. */
+static bool pmf_supported = true;
+
+void wifi_rsn_pmf(bool supported) { pmf_supported = supported; }
+
 static int akm(unsigned security) {
     return security == WIFI_WPA3_SAE ? WPA_KEY_MGMT_SAE : WPA_KEY_MGMT_PSK;
 }
@@ -78,7 +86,7 @@ bool wifi_rsn_select(struct wifi_rsn *out, unsigned security, const unsigned cha
     if (parsed.group_cipher != WPA_CIPHER_CCMP || !(parsed.pairwise_cipher & WPA_CIPHER_CCMP) ||
         !(parsed.key_mgmt & akm(security)))
         return false;
-    bool pmf = parsed.capabilities & WPA_CAPABILITY_MFPC;
+    bool pmf = pmf_supported && (parsed.capabilities & WPA_CAPABILITY_MFPC);
     if ((parsed.capabilities & WPA_CAPABILITY_MFPR) && !pmf) return false;
     if (security == WIFI_WPA3_SAE && !pmf) return false;
     if (pmf && parsed.mgmt_group_cipher != WPA_CIPHER_AES_128_CMAC) return false;

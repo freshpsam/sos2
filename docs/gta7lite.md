@@ -26,7 +26,7 @@ which `zstd -d` unpacks); with it the target also writes:
   addresses, command line and device tree table (Android's DT table format,
   holding one device tree), which LK completes at boot. It holds the kernel,
   gzip-compressed; the resources, engine included, as a SORZ ramdisk (about
-  30 MB), which the kernel expands into free RAM at boot; and Samsung's
+  24 MB), which the kernel expands into free RAM at boot; and Samsung's
   `SEANDROIDENFORCE` trailer. The packager refuses an image larger than the
   boot partition, which the stock image fills up to its AVB footer.
 - `boot.tar`: that image as odin4 flashes it.
@@ -51,7 +51,7 @@ in `GTA7LITE_STOCK/wifi-firmware/`, or name another folder with
 `GTA7LITE_WIFI_FIRMWARE`; the packager checks their headers and the ramdisk
 carries them under `/firmware/connsys`. Without them the tablet has no Wi-Fi.
 With `GTA7LITE_WIFI_PROFILE=file`, a profile made by `tools/redmi2_wifi.py`
-([Redmi 2 Wi-Fi](redmi2-wifi.md)), the tablet joins that network at boot; the
+([provisioning](redmi2.md#provisioning)), the tablet joins that network at boot; the
 image then carries the network's key, so it stays private.
 `GTA7LITE_JSC=options` passes JavaScriptCore options to pages, as
 `REDMI2_JSC` does on the phone
@@ -69,7 +69,7 @@ and removes flash images whose checksums match its previous build manifest.
 Older, untracked flash images may still be present in the output directory.
 
 The boot partition holds 32 MiB (recovery 37 MiB, cache 200 MiB), of which
-`boot.img` takes about 29 MB: a RAM session, whose data is gone at the next
+`boot.img` takes about 24 MB: a RAM session, whose data is gone at the next
 start.
 
 The installed system, `flash-boot.img`, is the same image and keeps its
@@ -101,7 +101,7 @@ The installed system updates itself as the Redmi 2's does
 FOR UPDATES** reads
 `https://freshpsam.github.io/sos2/gta7lite/sos2-gta7lite.update` and the
 AArch64 apps' `apps-arm64/index.txt`; **INSTALL SYSTEM** downloads the boot
-image, about 29 MB, which the kernel checks and writes to the boot partition
+image, about 24 MB, which the kernel checks and writes to the boot partition
 as `fastboot flash boot` does (below), and **RESTART** starts it. Apps
 install, update and are removed one by one in the app store. The update file
 holds the boot image after its 4 KiB header (include/system_store.h), padded

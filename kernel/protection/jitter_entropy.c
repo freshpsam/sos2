@@ -182,7 +182,15 @@ bool entropy_init(const struct platform_devices *devices) {
 
 static bool collect(void *out, size_t size) {
     started = counter();
+#ifdef SOS2_BOARD_NEXUS5
+    /* The Nexus 5 collects slowly: 32 bytes took about 1.2 s at the 960 MHz
+     * its bootloader leaves (2026-11-20), so about 4 s once standby parks
+     * CPU 0 and the L2 at 300 MHz (boards/nexus5/cpu_clock.c), which a
+     * collection already running then meets. */
+    budget = (uint64_t)hz * 8;
+#else
     budget = hz;
+#endif
     samples = 0;
     active = true;
     phase = READ;

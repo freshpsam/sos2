@@ -29,3 +29,13 @@ build/gta7lite-arm64/third_party/wifi-mbedtls/%.o: third_party/wifi-mbedtls/%.c 
 build/gta7lite-arm64/kernel/wifi/%.o: kernel/wifi/%.c Makefile tools/build.mk tools/wifi.mk include/wifi/hostap_config.h include/wifi/mbedtls_config.h
 	@mkdir -p $(dir $@)
 	$(ARM64_CC) $(GTA7LITE_FLAGS) $(WIFI_AUTH_FLAGS) -c $< -o $@
+# The same for the Nexus 5 (tools/build.mk: NEXUS5_CFLAGS).
+build/nexus5-arm32/third_party/hostap/%.o: third_party/hostap/%.c Makefile tools/build.mk tools/wifi.mk include/wifi/hostap_config.h
+	@mkdir -p $(dir $@)
+	$(ARM32_CC) $(filter-out -Werror,$(NEXUS5_CFLAGS)) $(WIFI_AUTH_FLAGS) -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-sign-compare -c $< -o $@
+build/nexus5-arm32/third_party/wifi-mbedtls/%.o: third_party/wifi-mbedtls/%.c Makefile tools/build.mk tools/wifi.mk include/wifi/mbedtls_config.h
+	@mkdir -p $(dir $@)
+	$(ARM32_CC) $(NEXUS5_CFLAGS) $(WIFI_CRYPTO_FLAGS) -Iinclude/wifi/libc -ffunction-sections -fdata-sections -c $< -o $@
+build/nexus5-arm32/kernel/wifi/%.o: kernel/wifi/%.c Makefile tools/build.mk tools/wifi.mk include/wifi/hostap_config.h include/wifi/mbedtls_config.h
+	@mkdir -p $(dir $@)
+	$(ARM32_CC) $(NEXUS5_CFLAGS) $(WIFI_AUTH_FLAGS) -c $< -o $@
