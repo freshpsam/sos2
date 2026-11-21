@@ -193,9 +193,11 @@ formats that volume when it does not mount, as at the first start, and runs
 as a RAM session when the eMMC fails. Power loss and durability are not
 qualified.
 
-The driver adopts the eMMC controller as lk2nd leaves it and transfers single
-512-byte sectors by PIO, without DMA, erase or partition switches; any
-failure stops storage for the boot, and writes are never retried.
+The driver (boards/redmi2/emmc.c, on the SD host code it shares with the
+Nexus 5, boards/qcom/sdhci.c) adopts the eMMC controller as lk2nd leaves it
+and transfers single 512-byte sectors by PIO, without DMA, erase or
+partition switches; any failure stops storage for the boot, and writes are
+never retried.
 
 ## Loader and hardware
 

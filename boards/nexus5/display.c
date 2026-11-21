@@ -9,17 +9,17 @@
  * through layer mixer 0, CTL0, ping-pong 0 and DSI0, with the clocks
  * running. SOS2 draws into that buffer and has the display processor send it
  * to the panel by starting the pipe's CTL, as the bootloader does for each
- * splash, while the screen is on: a frame once the last has gone out, at
- * most every 16 ms. DSI0 shows a frame gone by the done flag it latches for
- * the MDP's command-mode frames (CMD_MDP_DONE, which the stock
+ * splash, while the screen is on and has changed (display damage from
+ * kernel/display.c), or a second has passed: a frame once the last has gone
+ * out, at most every 16 ms. DSI0 shows a frame gone by the done flag it
+ * latches for the MDP's command-mode frames (CMD_MDP_DONE, which the stock
  * mdss_dsi_host.c waits on), cleared as each starts, or by its status (its
  * command-mode engine busy, then idle again), which a slow pass of the main
  * loop can miss; after 250 ms a frame is taken as gone, however DSI0 looks
  * (a busy that never ends included). A start that meets a frame still going
- * out leaves the panel showing what it
- * had (lk2nd waits 20 ms after each start). The MDP's own interrupt status
- * is not touched: every start-up that read or cleared it reset the phone or
- * stalled it (2026-11-20).
+ * out leaves the panel showing what it had (lk2nd waits 20 ms after each
+ * start). The MDP's own interrupt status is not touched: every start-up that
+ * read or cleared it reset the phone or stalled it (2026-11-20).
  * Addresses: Linux mmcc-msm8974.c (the MDSS power domain and clocks),
  * mdp5.xml.h with mdp5_cfg.c's msm8x74v2 offsets, which count from the MDP
  * block at MDSS + 0x100, the stock kernel's mdss_mdp_hwio.h (the interrupt
@@ -75,13 +75,11 @@ enum {
     DSI_ENABLE = 1,
     DSI_VIDEO = 2,
     DSI_COMMAND = 4,
-    WIDTH = 1080,
-    HEIGHT = 1920,
-    STRIDE = WIDTH * 3,
     FORMAT_RGB888 = 0x0002243f, /* 8 bits a component, 3 bytes, unpacked tight */
     UNPACK_BGR = 0x00020001,    /* bytes: blue, green, red */
     FRAME_US = 16000,
-    FRAME_TIMEOUT_US = 250000
+    FRAME_TIMEOUT_US = 250000,
+    REFRESH_US = 1000000 /* a frame even without damage: what a missed one would hide */
 };
 
 #define GDSC_ON   (1u << 31)
@@ -89,7 +87,9 @@ enum {
 
 static uintptr_t start_register;
 static uint64_t last_frame;
-static bool asleep, sending, busy_seen;
+static bool asleep, sending, busy_seen, damaged = true;
+
+void nexus5_display_damage(void) { damaged = true; }
 
 const char *nexus5_display_handoff(uint32_t *scanout) {
     start_register = 0;
@@ -99,10 +99,10 @@ const char *nexus5_display_handoff(uint32_t *scanout) {
     if ((mmio_read32(DSI0_CTRL) & (DSI_ENABLE | DSI_VIDEO | DSI_COMMAND)) !=
         (DSI_ENABLE | DSI_COMMAND))
         return "the panel is not in command mode";
-    if (mmio_read32(RGB0 + SRC_SIZE) != ((uint32_t)HEIGHT << 16 | WIDTH) ||
+    if (mmio_read32(RGB0 + SRC_SIZE) != ((uint32_t)NEXUS5_HEIGHT << 16 | NEXUS5_WIDTH) ||
         mmio_read32(RGB0 + SRC_FORMAT) != FORMAT_RGB888 ||
         mmio_read32(RGB0 + SRC_UNPACK) != UNPACK_BGR ||
-        (mmio_read32(RGB0 + SRC_STRIDE) & 0xffff) != STRIDE)
+        (mmio_read32(RGB0 + SRC_STRIDE) & 0xffff) != NEXUS5_STRIDE)
         return "the splash is not 1080x1920 RGB888";
     for (unsigned ctl = 0; ctl < CTLS && !start_register; ++ctl)
         for (unsigned mixer = 0; mixer < MIXERS; ++mixer)
@@ -136,7 +136,12 @@ static bool sent(void) {
 }
 
 void nexus5_display_poll(void) {
-    if (start_register && !asleep && sent() && time_us() - last_frame >= FRAME_US) send();
+    if (!start_register || asleep || !sent()) return;
+    uint64_t age = time_us() - last_frame;
+    if (age >= (damaged ? FRAME_US : REFRESH_US)) {
+        damaged = false;
+        send();
+    }
 }
 
 void nexus5_display_flush(void) {

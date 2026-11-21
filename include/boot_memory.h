@@ -5,10 +5,14 @@
 bool boot_memory_available(const struct platform_devices *, uint64_t start, uint64_t size,
                            uintptr_t dtb, uintptr_t kernel_start, uintptr_t kernel_end,
                            bool avoid_initrd);
-bool redmi2_browser_arena(const struct platform_devices *, uintptr_t dtb, uintptr_t kernel_start,
-                          uintptr_t kernel_end, uintptr_t *start, size_t *size);
-bool redmi2_resource_arena(const struct platform_devices *, uintptr_t dtb, uintptr_t kernel_start,
-                           uintptr_t kernel_end, size_t size, uintptr_t *start);
+#ifdef SOS2_PHONE
+/* In the phones' arena (include/board.h): the browser's, of 256 MiB to the
+ * page pool's size, and the expanded resources', of size bytes. */
+bool phone_browser_arena(const struct platform_devices *, uintptr_t dtb, uintptr_t kernel_start,
+                         uintptr_t kernel_end, uintptr_t *start, size_t *size);
+bool phone_resource_arena(const struct platform_devices *, uintptr_t dtb, uintptr_t kernel_start,
+                          uintptr_t kernel_end, size_t size, uintptr_t *start);
+#endif
 #ifdef __aarch64__
 /* arm64's page pool: up to BOOT_POOL_REGIONS free stretches of RAM below
  * 4 GiB, the largest of at least 1 MiB, in address order and within `span`

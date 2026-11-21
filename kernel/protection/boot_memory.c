@@ -1,4 +1,5 @@
 #include "boot_memory.h"
+#include "board.h"
 #include "page_alloc.h"
 
 static struct memory_region obstacle(const struct platform_devices *d, unsigned i, uintptr_t dtb,
@@ -38,20 +39,12 @@ bool boot_memory_available(const struct platform_devices *d, uint64_t start, uin
     return true;
 }
 
+#ifdef SOS2_PHONE
+/* The largest free stretch of the arena window (include/board.h), at least
+ * minimum and at most maximum bytes. */
 static bool arena(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks, uintptr_t ke,
                   uint64_t minimum, uint64_t maximum, uintptr_t *out, size_t *size) {
-#ifdef SOS2_BOARD_NEXUS5
-    /* The Nexus 5's second bank: identity-mapped kernel memory must stay
-     * clear of ARM32 user space (0x10000000-0x40000000, include/user_abi.h),
-     * and the first bank below it holds the boot data and the firmware. */
-    const uint64_t floor = 0x40000000, ceiling = 0x80000000;
-#else
-    /* Stay above the MSM8916 firmware allocation window (TZ/SMEM/modem/
-     * WCNSS/venus/MBA), even if the minimal handoff omits its reservations.
-     * Also respect every reservation supplied by firmware and the live FB.
-     * Source: upstream qcom/msm8916.dtsi reserved-memory + alloc-ranges. */
-    const uint64_t floor = 0x90000000, ceiling = 0xc0000000;
-#endif
+    const uint64_t floor = SOS2_ARENA_START, ceiling = SOS2_ARENA_END;
     uint64_t best = 0, best_size = 0;
     if (!d->has_initrd_start || !d->has_initrd_end || d->initrd_end <= d->initrd_start)
         return false;
@@ -96,10 +89,18 @@ static bool arena(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
     return true;
 }
 
-bool redmi2_browser_arena(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
-                          uintptr_t ke, uintptr_t *out, size_t *size) {
+bool phone_browser_arena(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
+                         uintptr_t ke, uintptr_t *out, size_t *size) {
     return arena(d, dtb, ks, ke, 256ull << 20, (uint64_t)PAGE_POOL_PAGES * PAGE_SIZE, out, size);
 }
+
+bool phone_resource_arena(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
+                          uintptr_t ke, size_t size, uintptr_t *out) {
+    size_t ignored;
+    uint64_t aligned = ((uint64_t)size + 4095) & ~4095ull;
+    return size && arena(d, dtb, ks, ke, aligned, aligned, out, &ignored);
+}
+#endif
 
 #ifdef __aarch64__
 /* Calls visit for each free stretch of RAM below 4 GiB, clear of the
@@ -217,10 +218,3 @@ bool boot_memory_resources(const struct platform_devices *d, uintptr_t dtb, uint
     return true;
 }
 #endif
-
-bool redmi2_resource_arena(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
-                           uintptr_t ke, size_t size, uintptr_t *out) {
-    size_t ignored;
-    uint64_t aligned = ((uint64_t)size + 4095) & ~4095ull;
-    return size && arena(d, dtb, ks, ke, aligned, aligned, out, &ignored);
-}

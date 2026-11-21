@@ -3,9 +3,10 @@
 #include "boot_progress.h"
 #include "platform.h"
 #include "LzmaDec.h"
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5) || defined(__aarch64__)
+/* Only where the loader hands the resources over as a SORZ ramdisk: the
+ * phones and arm64 (runtime_files.c). */
+#if defined(SOS2_PHONE) || defined(__aarch64__)
 #include "arm_cache.h"
-#endif
 
 static uint32_t word(const unsigned char *p) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
@@ -257,7 +258,7 @@ bool boot_bundle_prepare(struct platform_devices *d, uintptr_t dtb, uintptr_t ks
     d->initrd_end = destination + word(source + 16);
     return true;
 }
-#else
+#elif defined(SOS2_PHONE)
 bool boot_bundle_prepare(struct platform_devices *d, uintptr_t dtb, uintptr_t ks, uintptr_t ke) {
     /* After the installed system's read from the eMMC, if any. */
     boot_progress_report(BOOT_CHECK_ENGINE, 0, 0);
@@ -270,23 +271,20 @@ bool boot_bundle_prepare(struct platform_devices *d, uintptr_t dtb, uintptr_t ks
     if (!header(source, size)) return false;
     uintptr_t destination, arena;
     size_t arena_size;
-    if (!redmi2_resource_arena(d, dtb, ks, ke, word(source + 16), &destination)) return false;
+    if (!phone_resource_arena(d, dtb, ks, ke, word(source + 16), &destination)) return false;
     struct platform_devices expanded = *d;
     expanded.initrd_start = destination;
     expanded.initrd_end = destination + word(source + 16);
-    if (!redmi2_browser_arena(&expanded, dtb, ks, ke, &arena, &arena_size)) return false;
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
+    if (!phone_browser_arena(&expanded, dtb, ks, ke, &arena, &arena_size)) return false;
     if (!arm_boot_cache_begin(d, dtb, (uintptr_t)source, size, destination, word(source + 16)))
         return false;
-#endif
     bool decoded = boot_bundle_decode(source, size, (void *)destination, word(source + 16));
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
     /* This includes failure paths: no dirty output or cached alias survives. */
     arm_boot_cache_end();
-#endif
     if (!decoded) return false;
     d->initrd_start = expanded.initrd_start;
     d->initrd_end = expanded.initrd_end;
     return true;
 }
+#endif
 #endif

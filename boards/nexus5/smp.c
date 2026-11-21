@@ -38,11 +38,6 @@ enum {
 static unsigned cores, released;
 static bool phases_set;
 
-static void store(uintptr_t address, uint32_t value) {
-    mmio_write32(address, value);
-    barrier();
-}
-
 unsigned nexus5_smp_prepare(uint32_t boot_mpidr, uintptr_t entry) {
     /* The cores' clocks first: each starts at CPU 0's rate (cpu_clock.c). */
     if (boot_mpidr || !nexus5_cpu_clock_init()) return 1;
@@ -56,21 +51,21 @@ bool nexus5_smp_release(unsigned cpu) {
     released |= 1u << cpu; /* never a partial sequence twice */
     if (!nexus5_cpu_clock_start(cpu)) return false;
     uintptr_t acc = ACC + STRIDE * cpu;
-    store(acc + APC_PWR_GATE_CTL, GATE_BHS);
+    nexus5_store(acc + APC_PWR_GATE_CTL, GATE_BHS);
     delay_us(1);
-    store(acc + APC_PWR_GATE_CTL, GATE_BHS | GATE_SEGMENTS);
+    nexus5_store(acc + APC_PWR_GATE_CTL, GATE_BHS | GATE_SEGMENTS);
     delay_us(1);
-    store(acc + APC_PWR_GATE_CTL, GATE_BHS | GATE_SEGMENTS | GATE_BYPASS);
+    nexus5_store(acc + APC_PWR_GATE_CTL, GATE_BHS | GATE_SEGMENTS | GATE_BYPASS);
     if (!phases_set) {
         phases_set = true;
-        store(L2_SAW_VCTL, FOUR_PHASES);
+        nexus5_store(L2_SAW_VCTL, FOUR_PHASES);
         delay_us(50);
     }
-    store(acc + CPU_PWR_CTL, RESET | CLAMP);
+    nexus5_store(acc + CPU_PWR_CTL, RESET | CLAMP);
     delay_us(2);
-    store(acc + CPU_PWR_CTL, RESET);
+    nexus5_store(acc + CPU_PWR_CTL, RESET);
     delay_us(2);
-    store(acc + CPU_PWR_CTL, 0);
-    store(acc + CPU_PWR_CTL, POWERED_UP);
+    nexus5_store(acc + CPU_PWR_CTL, 0);
+    nexus5_store(acc + CPU_PWR_CTL, POWERED_UP);
     return true;
 }

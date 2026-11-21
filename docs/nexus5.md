@@ -128,8 +128,9 @@ download ran before the driver read the chip's glommed frames
 ## USB link
 
 While SOS2 runs, its USB port is a fastboot device for the computer it is
-plugged into (boards/nexus5/usb.c and fastboot.c), with fastboot's generic
-IDs (18d1:d00d) and the serial number `nexus5`. It comes up once the desktop
+plugged into (boards/nexus5/usb.c and fastboot.c, with the protocol the
+tablet shares in kernel/usb/fastboot.c), with fastboot's generic IDs
+(18d1:d00d) and the serial number `nexus5`. It comes up once the desktop
 is drawn, and stays up in a panic; when it cannot start, the desktop says
 why (USB UNAVAILABLE). While a system update writes the boot partition it
 neither restarts the phone nor reads the partition; after a panic it always
@@ -195,13 +196,19 @@ management frames (the firmware has neither).
   (0x02600000) and LG's area at the start of the second bank.
 - **CPU:** four Krait 400 cores (ARMv7, without LPAE or virtualization);
   the generic timer (19.2 MHz) through the QGIC2 at 0xF9000000. With the MMU
-  off nothing is
-  execute-never, and Krait fetched instructions ahead along predicted paths
-  into memory TrustZone guards, which answered with a watchdog reset
-  (`bootreason=wdog_reset` in Android's command line afterwards); which
-  builds did it depended on their code layout. The kernel keeps the
-  instruction cache and branch prediction off until an MMU is on: the boot
-  cache's while the resources expand, then its own (arch/arm/boot.S). Under
+  off nothing is execute-never, and Krait fetched instructions ahead along
+  predicted paths into memory TrustZone guards, which answered with a
+  watchdog reset (`bootreason=wdog_reset` in Android's command line
+  afterwards); which builds did it depended on their code layout. So the
+  kernel's entry (arch/arm/boot.S), once BSS is clear, turns translation on
+  behind tables of the kernel alone (arch/arm/boot_cache.c): its text
+  executable, everything else Device memory and execute-never, which is
+  never fetched ahead. Only then do the instruction cache and branch
+  prediction come on, which brings the main loop about 0.4 s sooner than
+  waiting for the resources' expansion. The data cache is on only while the
+  resources expand, behind the boot cache's ranges added to the same
+  tables; the kernel's own tables replace them when the protected processes
+  start (vm_init). Under
   load the cores read a spurious interrupt ID (1023) a few times in 10 s,
   which the scheduler takes as a preemption point (arch/arm/timer.c).
 - **Other cores:** started as the stock kernel starts them
@@ -235,9 +242,10 @@ management frames (the firmware has neither).
   is MDP pipe RGB0, RGB888 at 0x0D200000, and becomes the screen, drawn at
   full resolution. A command-mode panel shows a new picture only when the
   display processor sends a frame: the kernel starts the splash's control
-  path (CTL0's start register) at most every 16 ms, once DSI0 shows the
-  last frame sent (the done flag it latches for the display processor's
-  frames, or its status) or after 250 ms (boards/nexus5/display.c). Standby
+  path (CTL0's start register) when the screen has changed, at most every
+  16 ms, and otherwise once a second, once DSI0 shows the last frame sent
+  (the done flag it latches for the display processor's frames, or its
+  status) or after 250 ms (boards/nexus5/display.c). Standby
   turns the backlight off, sends a black frame, then puts the panel to
   sleep as the stock driver's off commands do (display off, 50 ms, sleep
   in, 100 ms) and wakes it before frames go again (sleep out, 120 ms,
@@ -269,7 +277,9 @@ management frames (the firmware has neither).
   PM8941 L19 at 3.3 V, feeds nothing else; the stock kernel asks the RPM
   for it, here it is switched on directly over SPMI, which the arbiter
   allows. A tap drives it at full forward duty for 15 ms, then brakes it
-  for 15 ms. The I2C buses' clocks and pins come up through one helper
+  for 15 ms, both timed by the main loop's haptics polls
+  (kernel/protection/haptics.c). The I2C buses' clocks and pins come up
+  through one helper
   (boards/nexus5/i2c.c).
 - **Touch:** a Synaptics S3350 (product ID PLG218) at 0x70 on BLSP1 QUP2
   (0xF9924000, GPIO 6 and 7) at 355 kHz, as Linux runs it; its attention
@@ -316,28 +326,37 @@ management frames (the firmware has neither).
   load), each holding a frame of its own.
 - **Wi-Fi's radio:** the firmware is FullMAC: it scans, authenticates and
   associates by itself, where SOS2's station (kernel/wifi) builds and parses
-  those frames. So the radio (boards/nexus5/wifi.c) answers the station from
-  what the firmware does, as brcmfmac runs it with a host supplicant: each
+  those frames. So the radio (boards/nexus5/wifi.c) tells the station what
+  the firmware does through the station's FullMAC calls
+  (include/wifi_station.h), as brcmfmac runs it with a host supplicant: each
   channel's scan is an escan whose results become the beacons they
   describe; the station's authentication is answered at once; its
   association request becomes the firmware's join, with the station's RSN
-  element, answered when the firmware reports the network joined; WPA2's
-  handshake runs in SOS2 over EAPOL data frames, its keys go to the
-  firmware; data moves as Ethernet, converted to and from 802.11 data
-  frames; and a link the firmware loses becomes a deauthentication. Without
+  element, and the station is associated when the firmware reports the
+  network joined; WPA2's handshake runs in SOS2 over EAPOL data frames, its
+  keys go to the firmware; data moves as Ethernet, converted to and from
+  802.11 data frames; a link the firmware loses, or a deauthentication it
+  reports, disconnects the station; and while the firmware holds the link,
+  the station's probes of a quiet network count as the network heard.
+  Frames and calls reach the station in the order they came. Without
   protected management frames in the firmware, the station never negotiates
   them and never chooses WPA3 (wifi_rsn_pmf in kernel/wifi/wifi_auth.c).
 - **eMMC:** a 16 GB card (15028 MiB, EXT_CSD revision 6: eMMC 4.5) on SDCC1
   (0xF9824000, its SDHCI at 0xF9824900), with 8 bits at 50 MHz in high
-  speed (boards/nexus5/emmc.c), on the same controller code as Wi-Fi's bus
-  (boards/nexus5/sdhci.c). The bootloader leaves the controller in legacy
+  speed (boards/nexus5/emmc.c), on the SD host code that Wi-Fi's bus and the
+  Redmi 2's eMMC share (boards/qcom/sdhci.c). The bootloader leaves the
+  controller in legacy
   mode with its SDHCI registers as after a reset, so the card starts cold, as
   Linux's MMC core starts an eMMC: CMD0, CMD1 until it is ready with sector
   addressing, its address, selected, its EXT_CSD, then high-speed timing, the
   clock and the 8-bit bus, checked by reading the EXT_CSD again. Its I/O is
   fixed at 1.8 V, so unlike SDCC2 the wrapper asks for no signalling
-  confirmation (MCI_GENERICS' switchable bit). Sectors move one at a time in
-  PIO: about 1.5 MB/s read, the boot partition in 15.6 s over the USB link.
+  confirmation (MCI_GENERICS' switchable bit). Transfers run in PIO. A read
+  of several sectors is one CMD18 of up to 256, which the host ends with
+  its own CMD12 (auto CMD12): the boot partition reads in about 4.5 s over
+  the USB link, against 15.6 s a sector at a time. One sector is CMD17: a
+  CMD18 for one, never stopped, left the card sending, and the next command
+  timed out. Writes move a sector at a time, about 0.6 MB/s.
 - **Randomness:** jitterentropy's CPU timing jitter seeding an HMAC_DRBG, as
   on the other devices. At the bootloader's 960 MHz 32 bytes of it took
   about 1.2 s, so about 4 s with CPU 0 and the L2 parked at 300 MHz in
@@ -347,5 +366,10 @@ management frames (the firmware has neither).
   run first); the GPU (an Adreno 330, the Redmi 2's family); CPU levels
   above 1497.6 MHz (the RPM, and a temperature watch); the cores'
   power-down in standby (TrustZone's power collapse through each core's
-  SPM, as on the Redmi 2). The vibrator's buzz and the backlight's and
-  panel's return are checked on their registers, not yet by hand.
+  SPM, as on the Redmi 2); the Wi-Fi chip's own sleep in standby
+  (brcmfmac's KSO, with the HT clock released); the panel's sleep and wake
+  commands run in steps rather than holding CPU 0's loop (about 150 ms
+  entering standby, 120 ms leaving); and a received frame read in one
+  CMD53 rather than its header first. The vibrator's buzz and the
+  backlight's and panel's return are checked on their registers, not yet by
+  hand.

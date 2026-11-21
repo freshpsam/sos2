@@ -15,25 +15,26 @@
  * PM8941 GPIO17 a plain input beside it (wl-reg-active-state).
  * The firmware is FullMAC: it scans, authenticates and associates itself,
  * where the shared station (kernel/wifi/wifi_station.c) builds and parses
- * those 802.11 frames. So this radio answers the station in its terms,
- * from what the firmware does, as Linux's brcmfmac drives it with a host
- * supplicant (cfg80211.c): a channel's scan is an escan there, each result
- * handed on as the beacon it describes; the station's authentication is
- * answered at once (open system); its association request becomes the
- * firmware's join, with the station's RSN element as the firmware's own,
- * and is answered when the firmware reports the network joined; WPA2's
- * handshake is EAPOL in data frames, and its keys go to the firmware;
- * data moves as Ethernet, converted to and from 802.11 data frames; a
- * link lost or a deauthentication reported becomes a deauthentication for
- * the station, and its probes of a quiet network are answered while the
- * firmware holds the link. The firmware has no management frame
- * protection, so the station never negotiates it (no_pmf). In standby,
- * once the station has left its network or has none, the firmware takes
- * its radio down, as for an interface brought down, and nothing polls the
- * chip until standby ends. A failure turns the chip's supply off. */
+ * those 802.11 frames for a SoftMAC radio. So this radio gives the station
+ * the firmware's news through its FullMAC calls (wifi_station.h), as
+ * Linux's brcmfmac drives this firmware with a host supplicant
+ * (cfg80211.c): a channel's scan is an escan there, each result handed on
+ * as the beacon it describes; the station's authentication is answered at
+ * once (open system); its association request becomes the firmware's
+ * join, with the station's RSN element as the firmware's own, and the
+ * station associated when the firmware reports the network joined; WPA2's
+ * handshake is EAPOL in data frames, and its keys go to the firmware; data
+ * moves as Ethernet, converted to and from 802.11 data frames; a link lost
+ * or a deauthentication reported disconnects the station, and its probes of
+ * a quiet network count as the network heard while the firmware holds the
+ * link. Frames and news reach the station in the order they came. The
+ * firmware has no management frame protection, so the station never
+ * negotiates it (no_pmf). In standby, once the station has left its network
+ * or has none, the firmware takes its radio down, as for an interface
+ * brought down, and nothing polls the chip until standby ends. A failure
+ * turns the chip's supply off. */
 
 enum {
-    TLMM_GPIO = 0xfd511000, /* GPIO_CFG n at 0x10 n, GPIO_IN_OUT n at 0x10 n + 4 */
     REG_ON = 26,
     PIN_OUTPUT = 1 << 9,
     PIN_OUT = 2,
@@ -67,16 +68,14 @@ enum {
     E_LINK = 16,
     E_ESCAN_RESULT = 69,
     ESCAN_PARTIAL = 8,
-    /* Frames waiting for the station, each at most FRAME bytes: a poll reads
-     * no more than fit, and the shared device takes up to 64 a step. */
+    /* Frames and news waiting for the station, each frame at most FRAME
+     * bytes: a poll reads no more than fit, and the shared device takes up
+     * to 64 a step. */
     QUEUE = 64,
     FRAME = 2048,
-    CACHE = 8,
     EAPOL_GUARD_US = 50000,
     SCAN_END_US = 1000000,
 };
-
-static uintptr_t pin(unsigned gpio) { return TLMM_GPIO + 0x10u * gpio; }
 
 static bool pmic_gpio(uint16_t base, uint8_t mode, bool output) {
     return nexus5_pmic_write(base + SUPPLY, 2) && (output || nexus5_pmic_write(base + PULL, 5)) &&
@@ -87,10 +86,10 @@ const char *nexus5_wifi_power(void) {
     if (!pmic_gpio(SLEEP_CLOCK, 1u << 4 | 3u << 1 | 1, true) || !pmic_gpio(BESIDE, 0, false))
         return "Wi-Fi sleep clock unavailable";
     /* Off first, so the chip starts from reset. */
-    mmio_write32(pin(REG_ON) + 4, 0);
-    mmio_write32(pin(REG_ON), PIN_OUTPUT);
+    mmio_write32(nexus5_gpio(REG_ON) + 4, 0);
+    mmio_write32(nexus5_gpio(REG_ON), PIN_OUTPUT);
     delay_us(10000);
-    mmio_write32(pin(REG_ON) + 4, PIN_OUT);
+    mmio_write32(nexus5_gpio(REG_ON) + 4, PIN_OUT);
     for (uint64_t start = time_us(); time_us() - start < POWER_UP_MS * 1000ull;) kernel_io_wait();
     return 0;
 }
@@ -99,8 +98,13 @@ static bool radio_ready, radio_down;
 static unsigned char mac[6];
 static uint32_t io_type; /* chanspec format: 1 802.11n, 2 802.11ac */
 
+/* What waits for the station: a frame, or the firmware's news. */
+enum entry { FRAME_ENTRY, AUTHENTICATED, ASSOCIATED, DISCONNECTED, HEARD };
+
 static struct {
+    enum entry entry;
     unsigned length;
+    uint16_t reason; /* a disconnection's */
     struct wifi_rx_status status;
     uint8_t data[FRAME];
 } queue[QUEUE];
@@ -109,14 +113,12 @@ static unsigned queue_head, queue_count;
 static uint16_t sequence;
 
 /* The station's view of the network being joined; deauth_waiting: a
- * deauthentication the queue had no room for yet. */
+ * disconnection the queue had no room for yet. */
 static struct {
     bool joining, associated, pairwise, deauth_waiting;
     uint16_t deauth_reason;
     int group; /* the group key's index, -1 without */
     unsigned char bssid[6];
-    uint8_t rates[24];
-    unsigned rate_length;
     uint64_t last_eapol;
 } link;
 
@@ -124,14 +126,6 @@ static struct {
     bool running, abort_sent;
     uint64_t started;
 } scan;
-
-/* The networks last seen, as the beacons handed to the station. */
-static struct {
-    unsigned length;
-    uint8_t frame[FRAME];
-} cache[CACHE];
-
-static unsigned cache_next;
 
 static uint16_t be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
 
@@ -144,9 +138,19 @@ static unsigned room(void) { return QUEUE - queue_count; }
 static uint8_t *enqueue(unsigned length, const struct wifi_rx_status *status) {
     if (length > FRAME || queue_count == QUEUE) return 0;
     unsigned slot = (queue_head + queue_count++) % QUEUE;
+    queue[slot].entry = FRAME_ENTRY;
     queue[slot].length = length;
     queue[slot].status = *status;
     return queue[slot].data;
+}
+
+/* The firmware's news, in line with the frames: false when the queue is full. */
+static bool tell(enum entry entry, uint16_t reason) {
+    if (queue_count == QUEUE) return false;
+    unsigned slot = (queue_head + queue_count++) % QUEUE;
+    queue[slot].entry = entry;
+    queue[slot].reason = reason;
+    return true;
 }
 
 static const struct wifi_rx_status management = {.management = true};
@@ -159,12 +163,6 @@ static void header(uint8_t *f, unsigned type, const unsigned char *to, const uns
     memcpy(f + 10, bssid, 6);
     memcpy(f + 16, bssid, 6);
     put16(f + 22, (uint16_t)(sequence++ << 4));
-}
-
-static int cached(const unsigned char *bssid) {
-    for (unsigned i = 0; i < CACHE; ++i)
-        if (cache[i].length && !memcmp(cache[i].frame + 16, bssid, 6)) return (int)i;
-    return -1;
 }
 
 /* An escan result (brcmf_bss_info_le) as the beacon it describes: BSSID,
@@ -181,21 +179,10 @@ static void scanned(const uint8_t *bss, unsigned size) {
     put16(f + 32, le16(bss + 14));
     put16(f + 34, le16(bss + 16));
     memcpy(f + 36, bss + offset, ies);
-    int slot = cached(bss + 8);
-    if (slot < 0) {
-        slot = (int)cache_next;
-        cache_next = (cache_next + 1) % CACHE;
-    }
-    memcpy(cache[slot].frame, f, 36 + ies);
-    cache[slot].length = 36 + ies;
 }
 
 static void queue_deauth(void) {
-    uint8_t *f = enqueue(26, &management);
-    if (!f) return;
-    header(f, 0xc0, mac, link.bssid);
-    put16(f + 24, link.deauth_reason);
-    link.deauth_waiting = false;
+    if (tell(DISCONNECTED, link.deauth_reason)) link.deauth_waiting = false;
 }
 
 /* The link gone: the station told now, or as soon as the queue has room. */
@@ -208,18 +195,9 @@ static void deauthenticate(unsigned reason) {
     queue_deauth();
 }
 
-/* The station's association answered: success, the network's capability,
- * an association ID, and the station's own rates. */
-static void answer_association(void) {
-    int beacon = cached(link.bssid);
-    uint8_t *f = enqueue(30 + link.rate_length, &management);
-    if (!f) return;
-    header(f, 0x10, mac, link.bssid);
-    put16(f + 24, beacon >= 0 ? le16(cache[beacon].frame + 34) : 1);
-    put16(f + 26, 0);
-    put16(f + 28, 0xc001);
-    memcpy(f + 30, link.rates, link.rate_length);
-}
+/* The station associated: lost with a full queue, its association request
+ * comes again and is answered at once while the firmware holds the link. */
+static void answer_association(void) { (void)tell(ASSOCIATED, 0); }
 
 static void event(const uint8_t *m, unsigned length) {
     static const uint8_t oui[3] = {0x00, 0x10, 0x18};
@@ -319,14 +297,8 @@ static void abort_scan(void) {
  * firmware's supplicant off, then a join of that BSSID on its channel. */
 static bool join(const struct wifi_station *s, const uint8_t *f, unsigned n) {
     const uint8_t *rsn = 0;
-    link.rate_length = 0;
-    for (unsigned at = 28; at + 2 <= n && at + 2 + f[at + 1] <= n; at += 2u + f[at + 1]) {
+    for (unsigned at = 28; at + 2 <= n && at + 2 + f[at + 1] <= n; at += 2u + f[at + 1])
         if (f[at] == 48) rsn = f + at;
-        if ((f[at] == 1 || f[at] == 50) && link.rate_length + 2 + f[at + 1] <= sizeof link.rates) {
-            memcpy(link.rates + link.rate_length, f + at, 2u + f[at + 1]);
-            link.rate_length += 2u + f[at + 1];
-        }
-    }
     bool secured = s->profile.security != WIFI_OPEN;
     if (secured && !rsn) return false;
     if (nexus5_bcm_iovar("wpaie", true, (void *)rsn, rsn ? 2u + rsn[1] : 0u) ||
@@ -425,7 +397,7 @@ static int configure(enum wifi_action action, const struct wifi_station *s, uint
 
 /* An 802.11 frame from the station: a data frame goes out as Ethernet;
  * authentication is answered here, association starts the join, and a
- * probe of the joined network is answered from its last beacon while the
+ * probe of the joined network counts as the network heard while the
  * firmware holds the link. */
 static bool send(const void *frame_data, unsigned size, bool data) {
     const uint8_t *f = frame_data;
@@ -441,15 +413,7 @@ static bool send(const void *frame_data, unsigned size, bool data) {
         return nexus5_bcm_send(e, size - 32 + 14, 0);
     }
     unsigned type = le16(f) & 0xfc;
-    if (type == 0xb0) {
-        uint8_t *r = enqueue(30, &management);
-        if (!r) return false;
-        header(r, 0xb0, mac, s->bssid);
-        put16(r + 24, 0);
-        put16(r + 26, 2);
-        put16(r + 28, 0);
-        return true;
-    }
+    if (type == 0xb0) return tell(AUTHENTICATED, 0);
     if (type == 0x00) {
         if (link.associated && !memcmp(link.bssid, s->bssid, 6)) {
             answer_association();
@@ -457,17 +421,7 @@ static bool send(const void *frame_data, unsigned size, bool data) {
         }
         return link.joining || join(s, f, size);
     }
-    if (type == 0x40) {
-        int beacon = cached(s->bssid);
-        if (link.associated && beacon >= 0) {
-            uint8_t *r = enqueue(cache[beacon].length, &management);
-            if (r) {
-                memcpy(r, cache[beacon].frame, cache[beacon].length);
-                header(r, 0x50, mac, s->bssid);
-            }
-        }
-        return true;
-    }
+    if (type == 0x40 && link.associated && !memcmp(link.bssid, s->bssid, 6)) (void)tell(HEARD, 0);
     return true;
 }
 
@@ -512,7 +466,7 @@ static void stop(void) {
     radio_ready = false;
     nexus5_bcm_stop();
     nexus5_sdio_stop();
-    mmio_write32(pin(REG_ON) + 4, 0);
+    mmio_write32(nexus5_gpio(REG_ON) + 4, 0);
     barrier();
 }
 
@@ -530,6 +484,20 @@ static bool radio_awake(void) {
         radio_down = quiet;
     }
     return !radio_down;
+}
+
+/* A queue entry to the station: a frame, or the firmware's news. */
+static void deliver(unsigned slot) {
+    struct wifi_station *s = wifi_device_station();
+    switch (queue[slot].entry) {
+        case FRAME_ENTRY:
+            wifi_device_receive(queue[slot].data, queue[slot].length, &queue[slot].status);
+            break;
+        case AUTHENTICATED: wifi_station_authenticated(s, time_us()); break;
+        case ASSOCIATED: wifi_station_associated(s, time_us()); break;
+        case DISCONNECTED: wifi_station_disconnected(s, queue[slot].reason, time_us()); break;
+        case HEARD: wifi_station_heard(s, time_us()); break;
+    }
 }
 
 static uint64_t service(void) {
@@ -557,8 +525,7 @@ static uint64_t service(void) {
      * station's sends and ioctls read more frames into the queue meanwhile. */
     while (queue_count || link.deauth_waiting) {
         if (!queue_count) queue_deauth();
-        unsigned slot = queue_head;
-        wifi_device_receive(queue[slot].data, queue[slot].length, &queue[slot].status);
+        deliver(queue_head);
         queue_head = (queue_head + 1) % QUEUE;
         --queue_count;
     }

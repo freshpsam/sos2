@@ -209,7 +209,6 @@ static bool reset_known, reset_held, restarted;
  * is identity-mapped and uncached, so it needs no cache maintenance. */
 static volatile uint32_t packet[8] __attribute__((aligned(8)));
 
-
 static bool until(uint32_t bit) {
     uint64_t start = time_us();
     while (!(read32(DSI + DSI_INTR_CTRL) & bit))

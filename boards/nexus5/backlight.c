@@ -25,7 +25,6 @@ enum {
     LOWEST = 5, /* the stock driver's least brightness */
     SDA = 83,
     SCL = 84,
-    TLMM = 0xfd511000, /* GPIO_CFG n at 0x10 n, GPIO_IN_OUT n at 0x10 n + 4 */
     ENABLE = 90,
     PIN_OUTPUT = 1 << 9,
     DRIVE_8MA = 3 << 6,
@@ -37,8 +36,6 @@ static struct qup_i2c bus = {.base = 0xf9967000, .khz = 100};
 static uint8_t brightness; /* the bootloader's, read at the first standby */
 static bool dark;
 
-static uintptr_t pin(void) { return TLMM + 0x10u * ENABLE; }
-
 bool nexus5_backlight(bool on) {
     if (on == !dark) return true;
     if (!bus.ready && !nexus5_i2c_start(&bus, SDA, SCL)) return false;
@@ -46,13 +43,13 @@ bool nexus5_backlight(bool on) {
         if (!brightness && !qup_i2c_read(&bus, ADDRESS, BRIGHTNESS_A, &brightness, 1)) return false;
         if (brightness < LOWEST) brightness = LOWEST;
         if (!qup_i2c_write(&bus, ADDRESS, CONTROL, 0)) return false;
-        mmio_write32(pin() + 4, 0);
+        mmio_write32(nexus5_gpio(ENABLE) + 4, 0);
         barrier();
         dark = true;
         return true;
     }
-    mmio_write32(pin(), PIN_OUTPUT | DRIVE_8MA);
-    mmio_write32(pin() + 4, PIN_HIGH);
+    mmio_write32(nexus5_gpio(ENABLE), PIN_OUTPUT | DRIVE_8MA);
+    mmio_write32(nexus5_gpio(ENABLE) + 4, PIN_HIGH);
     barrier();
     delay_us(SETTLE_US);
     if (!qup_i2c_write(&bus, ADDRESS, BOOST, BOOST_LIMITS) ||

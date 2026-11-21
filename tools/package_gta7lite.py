@@ -74,10 +74,6 @@ BOARD = b'gta7litewifi'  # the kernel's (kernel/protection/system_update.c)
 INSTALL_FILES = ('flash-boot.img', 'sos2-gta7lite.update')
 
 
-def align(value):
-    return (value + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
-
-
 def kernel_image(kernel):
     """The arm64 Image, checked against LK's load address, gzip-compressed."""
     if len(kernel) < 64 or kernel[56:60] != b'ARM\x64':
@@ -183,23 +179,13 @@ def tablet_resources(bundle, release, touch=None, wifi=None, profile=None):
 
 
 def install_files(release, image, profile):
-    """The installed system for publishing (tools/publish_pages.py): its boot
-    image, and the updater's file, the same image after its 4 KiB header,
-    padded with zeros to whole 2 KiB pages as the kernel's header check wants
-    (kernel/protection/system_update.c); and install.json with their sizes
-    and SHA-256s and the commands of a first install."""
+    """The installed system for publishing (tools/package_redmi2.py's
+    install_outputs); the updater's file carries the image padded with zeros
+    to whole 2 KiB pages, as the kernel's header check wants
+    (kernel/protection/system_update.c)."""
     padded = image + bytes(-len(image) % PAGE_SIZE)
-    outputs = dict(zip(INSTALL_FILES, (image, resources.update_header(release, padded, BOARD) + padded)))
-    manifest = {
-        'release': release,
-        'board': BOARD.decode('ascii'),
-        'wifi_profile': profile is not None,
-        'files': {name: {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
-                  for name, data in outputs.items()},
-        'flash': ['fastboot flash boot flash-boot.img', 'fastboot reboot'],
-    }
-    outputs['install.json'] = (json.dumps(manifest, indent=2) + '\n').encode()
-    return outputs
+    return resources.install_outputs(release, BOARD, INSTALL_FILES, image, profile is not None,
+                                     update_image=padded)
 
 
 def check_device_trees(section):
@@ -249,7 +235,7 @@ def stock_boot(image):
         raise PackagingError('stock command line lacks ' + BOOTOPT.decode())
     if not dtb_size or second_size or dtbo_size:
         raise PackagingError('stock boot.img must hold a device tree and no second stage')
-    offset = PAGE_SIZE + align(kernel_size) + align(ramdisk_size)
+    offset = PAGE_SIZE + resources.align(kernel_size, PAGE_SIZE) + resources.align(ramdisk_size, PAGE_SIZE)
     dtb = image[offset:offset + dtb_size]
     if len(dtb) != dtb_size:
         raise PackagingError('stock boot.img ends inside its device tree section')
@@ -270,7 +256,7 @@ def stock_boot(image):
 def boot_image(stock, kernel, ramdisk):
     """A header v2 image as mkbootimg writes it, then Samsung's trailer."""
     sections = (kernel, ramdisk, b'', b'', stock['dtb'])
-    size = PAGE_SIZE + sum(align(len(section)) for section in sections) + len(SEANDROID)
+    size = PAGE_SIZE + sum(resources.align(len(section), PAGE_SIZE) for section in sections) + len(SEANDROID)
     if size > stock['partition']:
         raise PackagingError(f'boot.img needs {size} bytes; the boot partition holds '
                              f'{stock["partition"]}')
@@ -285,7 +271,7 @@ def boot_image(stock, kernel, ramdisk):
                          stock['dtb_address'])
     image = header.ljust(PAGE_SIZE, b'\0')
     for section in sections:
-        image += section.ljust(align(len(section)), b'\0')
+        image += section.ljust(resources.align(len(section), PAGE_SIZE), b'\0')
     image += SEANDROID
     return image
 

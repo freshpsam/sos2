@@ -104,10 +104,14 @@ static struct radio_job {
 } job;
 
 static uint32_t rd(uintptr_t a) { return mmio_read32(a); }
-static void wr(uintptr_t a, uint32_t v) { mmio_write32(a, v); }
-static void dma_barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
-static uintptr_t ring(uintptr_t base, unsigned n, unsigned field) { return base + 0x10 * n + 4 * field; }
 
+static void wr(uintptr_t a, uint32_t v) { mmio_write32(a, v); }
+
+static void dma_barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
+
+static uintptr_t ring(uintptr_t base, unsigned n, unsigned field) {
+    return base + 0x10 * n + 4 * field;
+}
 
 /* Bytes into and out of the pool (Device memory) as aligned words. */
 static void copy_out(uintptr_t to, const uint8_t *from, unsigned n) {
@@ -125,7 +129,8 @@ static void copy_in(uint8_t *to, uintptr_t from, unsigned n) {
     }
 }
 
-static bool wait_bits(uintptr_t address, uint32_t mask, uint32_t value, unsigned timeout_us, unsigned step_us) {
+static bool wait_bits(uintptr_t address, uint32_t mask, uint32_t value, unsigned timeout_us,
+                      unsigned step_us) {
     uint64_t start = time_us();
     while ((rd(address) & mask) != value) {
         if (time_us() - start > timeout_us) return false;
@@ -139,7 +144,8 @@ static bool wait_bits(uintptr_t address, uint32_t mask, uint32_t value, unsigned
  * index as the doorbell (kalDevPortWrite). */
 static bool tx_command(unsigned hw_ring, uintptr_t descs, const uint8_t *p, unsigned n) {
     uint32_t idx = rd(ring(TX_RING, hw_ring, 2));
-    if (idx >= TX_CELLS || n > CMD_BUF_SIZE || (idx + 1) % TX_CELLS == rd(ring(TX_RING, hw_ring, 3)))
+    if (idx >= TX_CELLS || n > CMD_BUF_SIZE ||
+        (idx + 1) % TX_CELLS == rd(ring(TX_RING, hw_ring, 3)))
         return false;
     uintptr_t buffer = CMD_BUF + idx * CMD_BUF_SIZE, d = descs + 16 * idx;
     copy_out(buffer, p, n);
@@ -192,7 +198,8 @@ static unsigned init_packet(uint8_t cid, const uint8_t *payload, unsigned n) {
 
 /* An INIT command on TX ring 3 and its event on RX ring 1 within 3 s:
  * event ID eid, the same sequence and, for a command result, status 0. */
-static bool init_command(uint8_t cid, const uint8_t *payload, unsigned n, uint8_t eid, uint8_t *event) {
+static bool init_command(uint8_t cid, const uint8_t *payload, unsigned n, uint8_t eid,
+                         uint8_t *event) {
     unsigned length = init_packet(cid, payload, n);
     uint8_t seq = packet[0x27];
     if (!tx_command(3, TX3_DESC, packet, length)) return false;
@@ -254,12 +261,15 @@ static const char *hif_init(void) {
     wr(HIF_RST, 0x20);
     wr(HIF_RST, 0x30);
     wr(SLP_PROT, rd(SLP_PROT) & ~1u);
+
     /* TX rings 0, 15 and 3 (their extension registers by software index, as
      * gen4m writes them), RX rings 0 and 1 owning all but one descriptor. */
     static const struct {
         unsigned hw;
         uintptr_t descs, ext;
-    } tx[] = {{0, TX0_DESC, TX_EXT + 0x0}, {15, TX15_DESC, TX_EXT + 0xc}, {3, TX3_DESC, TX_EXT + 0x10}};
+    } tx[] = {
+        {0, TX0_DESC, TX_EXT + 0x0}, {15, TX15_DESC, TX_EXT + 0xc}, {3, TX3_DESC, TX_EXT + 0x10}};
+
     for (unsigned i = 0; i < 3; ++i) {
         wr(ring(TX_RING, tx[i].hw, 0), (uint32_t)tx[i].descs);
         wr(ring(TX_RING, tx[i].hw, 2), 0);
@@ -291,7 +301,8 @@ static const char *hif_init(void) {
  * in 2 KiB packets on TX ring 3, EMI regions copied, then WIFI_START and
  * the ready bits. */
 static const char *firmware(void) {
-    const struct runtime_file *f = runtime_file_find("/firmware/connsys/WIFI_RAM_CODE_soc1_0_1_1.bin");
+    const struct runtime_file *f =
+        runtime_file_find("/firmware/connsys/WIFI_RAM_CODE_soc1_0_1_1.bin");
     if (!f || f->size < 36 + 40) return "Wi-Fi firmware missing";
     const uint8_t *data = runtime_file_data(f), *common = data + f->size - 36;
     unsigned regions = common[2];
@@ -310,7 +321,8 @@ static const char *firmware(void) {
         offset += length;
         if (feature & 0x40) continue;
         if (feature & 0x80) {
-            if ((address & 0xffffff) + length > GTA7LITE_CONNSYS_EMI_SIZE) return "Wi-Fi firmware invalid";
+            if ((address & 0xffffff) + length > GTA7LITE_CONNSYS_EMI_SIZE)
+                return "Wi-Fi firmware invalid";
             copy_out(GTA7LITE_CONNSYS_EMI + (address & 0xffffff), payload, length);
             continue;
         }
@@ -320,7 +332,8 @@ static const char *firmware(void) {
         put32(config, address);
         put32(config + 4, length);
         put32(config + 8, mode);
-        if (!init_command(1, config, sizeof(config), 1, 0)) return "Wi-Fi firmware download refused";
+        if (!init_command(1, config, sizeof(config), 1, 0))
+            return "Wi-Fi firmware download refused";
         for (uint32_t at = 0; at < length; at += FW_CHUNK) {
             unsigned n = length - at < FW_CHUNK ? length - at : FW_CHUNK;
             if (!tx_command(3, TX3_DESC, packet, init_packet(0, payload + at, n)))
@@ -363,6 +376,7 @@ static void expect(int seq) {
 
 /* Events and frames until the awaited answer arrives, within timeout_ms. */
 static void pump(void (*deliver)(const unsigned char *, unsigned, const struct wifi_rx_status *));
+
 static bool await(unsigned timeout_ms) {
     uint64_t start = time_us();
     while (!answered && time_us() - start < (uint64_t)timeout_ms * 1000) pump(0);
@@ -386,13 +400,16 @@ const char *gta7lite_wifi_radio_start(const unsigned char mac[6], void (*yield)(
      * the station's BSS 0 with this MAC (nicActivateNetworkEx). */
     int seq = command(CMD_CAPABILITY, false, 0, 0);
     expect(seq);
-    if (seq < 0 || !await(3000) || answered_eid != EVENT_CAPABILITY) return "Wi-Fi firmware not answering";
+    if (seq < 0 || !await(3000) || answered_eid != EVENT_CAPABILITY)
+        return "Wi-Fi firmware not answering";
     static const uint8_t basic[12] = {0, 0, 0, 0, 7, 0, 7, 0, 0, 0, 0, 0};
     uint8_t domain[56] = {0};
-    static const uint8_t passive[6][5] = {{81, 1, 1, 1, 0},     {82, 1, 1, 14, 0},    {115, 2, 4, 36, 0},
-                                          {118, 2, 4, 52, 4},   {121, 2, 4, 100, 12}, {125, 2, 4, 149, 0}};
-    static const uint8_t active[6][5] = {{81, 1, 1, 1, 11},  {115, 2, 4, 36, 4},  {118, 2, 4, 52, 4},
-                                         {121, 2, 4, 100, 12}, {125, 2, 4, 149, 5}, {0, 0, 0, 0, 0}};
+    static const uint8_t passive[6][5] = {{81, 1, 1, 1, 0},     {82, 1, 1, 14, 0},
+                                          {115, 2, 4, 36, 0},   {118, 2, 4, 52, 4},
+                                          {121, 2, 4, 100, 12}, {125, 2, 4, 149, 0}};
+    static const uint8_t active[6][5] = {{81, 1, 1, 1, 11},   {115, 2, 4, 36, 4},
+                                         {118, 2, 4, 52, 4},  {121, 2, 4, 100, 12},
+                                         {125, 2, 4, 149, 5}, {0, 0, 0, 0, 0}};
     put16(domain, 'U' << 8 | 'S');
     domain[2] = 1;
     for (unsigned i = 0; i < 6; ++i) memcpy(domain + 4 + 8 * i, passive[i], 5);
@@ -431,7 +448,8 @@ static void rate_sets(const struct wifi_station *s, uint16_t *rates, uint16_t *b
 /* The lowest basic rate as a fixed-rate code: CCK 1-11 Mb/s 0x00-0x03 or
  * OFDM 6 Mb/s and up (0x4B, 0x4F, 0x4A, 0x4E, ...: wlan_def.h). */
 static unsigned lowest_rate(const struct wifi_station *s) {
-    static const uint16_t codes[] = {0x00, 0x01, 0x02, 0x03, 0, 0, 0x4b, 0x4f, 0x4a, 0x4e, 0x49, 0x4d, 0x48, 0x4c};
+    static const uint16_t codes[] = {0x00, 0x01, 0x02, 0x03, 0,    0,    0x4b,
+                                     0x4f, 0x4a, 0x4e, 0x49, 0x4d, 0x48, 0x4c};
     uint16_t rates, basic;
     rate_sets(s, &rates, &basic);
     if (!basic) basic = rates;
@@ -565,10 +583,12 @@ static int finish(int result) {
     return result;
 }
 
-int gta7lite_wifi_radio_configure(enum wifi_action action, const struct wifi_station *s, uint64_t now) {
+int gta7lite_wifi_radio_configure(enum wifi_action action, const struct wifi_station *s,
+                                  uint64_t now) {
     if (!started) return -1;
     if (asleep) return 0; /* wifi.c wakes it for a station with work */
-    if (!job.active || job.action != action) job = (struct radio_job){.action = action, .active = true};
+    if (!job.active || job.action != action)
+        job = (struct radio_job){.action = action, .active = true};
     switch (action) {
         case WIFI_SCAN_INIT:
         case WIFI_SCAN_FINISH:
@@ -704,8 +724,8 @@ static bool send_data(const uint8_t *f, unsigned n, unsigned rate) {
     put16(frame + 0x20, token | 0x8000);
     put32(frame + 0x28, (uint32_t)(buffer + 64));
     put16(frame + 0x2c, length | 0x8000);
-    memcpy(frame + 64, f + 16, 6);     /* destination: address 3 */
-    memcpy(frame + 70, f + 10, 6);     /* source: address 2 */
+    memcpy(frame + 64, f + 16, 6);      /* destination: address 3 */
+    memcpy(frame + 70, f + 10, 6);      /* source: address 2 */
     memcpy(frame + 76, f + 30, n - 30); /* EtherType and payload */
     copy_out(buffer, frame, 64 + length);
     token_used[token] = true;
@@ -817,7 +837,8 @@ static void pump(void (*deliver)(const unsigned char *, unsigned, const struct w
     }
 }
 
-void gta7lite_wifi_radio_poll(void (*deliver)(const unsigned char *, unsigned, const struct wifi_rx_status *)) {
+void gta7lite_wifi_radio_poll(void (*deliver)(const unsigned char *, unsigned,
+                                              const struct wifi_rx_status *)) {
     if (!started || asleep) return;
     for (unsigned i = 0; i < 32; ++i) pump(deliver);
 }

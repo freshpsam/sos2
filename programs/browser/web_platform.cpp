@@ -198,6 +198,7 @@ public:
     ResourceError interruptedForPolicyChangeError(const ResourceRequest &request) const final {
         return cancelledError(request);
     }
+
     ResourceError cannotShowMIMETypeError(const ResourceResponse &) const final {
         return unavailable();
     }

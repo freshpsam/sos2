@@ -23,8 +23,7 @@
  * Polled: the attention line is read, it raises no interrupt. */
 
 enum {
-    TLMM = 0xfd511000, /* GPIO_CFG n at 0x10 n, GPIO_IN_OUT n at 0x10 n + 4 */
-    PIN_PULL_UP = 3,   /* pull in bits 1:0, drive (mA / 2 - 1) in 8:6 */
+    PIN_PULL_UP = 3, /* pull in bits 1:0, drive (mA / 2 - 1) in 8:6 */
     PIN_OUTPUT = 1 << 9,
     PIN_IN = 1,
     PIN_OUT = 2,
@@ -94,8 +93,6 @@ static struct touch_state {
     uint32_t x, y;
     uint64_t retry_after;
 } touch;
-
-static uintptr_t pin(unsigned gpio) { return TLMM + 0x10u * gpio; }
 
 static bool select_page(unsigned page) {
     if (page == touch.page) return true;
@@ -258,16 +255,16 @@ const char *nexus5_touch_init(uint32_t width, uint32_t height) {
      * (left an output driving low), and reset driven high (released, as
      * left); then the bus (i2c.c: the bootloader leaves its pins plain
      * GPIOs and its core clock off). */
-    mmio_write32(pin(ATTENTION), 0);
-    mmio_write32(pin(RESET) + 4, PIN_OUT);
-    mmio_write32(pin(RESET), PIN_OUTPUT | PIN_PULL_UP);
+    mmio_write32(nexus5_gpio(ATTENTION), 0);
+    mmio_write32(nexus5_gpio(RESET) + 4, PIN_OUT);
+    mmio_write32(nexus5_gpio(RESET), PIN_OUTPUT | PIN_PULL_UP);
     barrier();
     if (!nexus5_i2c_start(&bus, SDA, SCL)) return "touch screen: its I2C bus does not start";
     if (!answers()) {
         /* Held in reset until now, or stuck: a reset pulse, then its start. */
-        mmio_write32(pin(RESET) + 4, 0);
+        mmio_write32(nexus5_gpio(RESET) + 4, 0);
         delay_us(RESET_US);
-        mmio_write32(pin(RESET) + 4, PIN_OUT);
+        mmio_write32(nexus5_gpio(RESET) + 4, PIN_OUT);
         bool up = false;
         for (uint64_t start = time_us(); !up && time_us() - start < START_US;) {
             uint64_t wait = time_us();
@@ -346,7 +343,7 @@ bool nexus5_touch_poll(struct pointer_event *event) {
         touch.waking = false;
         (void)status(state);
     }
-    if (mmio_read32(pin(ATTENTION) + 4) & PIN_IN) return false;
+    if (mmio_read32(nexus5_gpio(ATTENTION) + 4) & PIN_IN) return false;
     if (!status(state)) return failed(event);
     touch.failures = 0;
     if (state[0] & F01_UNCONFIGURED) {

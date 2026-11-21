@@ -13,7 +13,8 @@ int gta7lite_wifi_radio_configure(enum wifi_action, const struct wifi_station *,
 bool gta7lite_wifi_radio_send(const void *frame, unsigned size, bool data);
 /* Received frames for the station: management frames as they arrive, data
  * frames rebuilt from the hardware's Ethernet form. */
-void gta7lite_wifi_radio_poll(void (*deliver)(const unsigned char *, unsigned, const struct wifi_rx_status *));
+void gta7lite_wifi_radio_poll(void (*deliver)(const unsigned char *, unsigned,
+                                              const struct wifi_rx_status *));
 /* No data frame left to send (the station installs keys only then). */
 bool gta7lite_wifi_radio_drained(void);
 /* The firmware's beacon-timeout report since the last call. */

@@ -10,8 +10,13 @@ art scaled to 48x48: "# " starts a comment, "color <character> <RRGGBB>"
 defines a cell color, "." is transparent, and the other lines are the rows of
 cells. The bundle gets /apps/<id>/program, /apps/<id>/icon and
 /apps/<id>/name. Both link the SDK runtime (libsos2 and Newlib, from `make
-engine`) and the desktop's drawing code, kernel/graphics.c.
+engine`) and the desktop's drawing code, kernel/graphics.c. Only `make
+engine` builds them, so the bundle carries signature(), a digest of their
+sources, beside it (SOURCES_SUFFIX), which packaging checks against the
+checkout (tools/project.py): a kernel whose ABI moved on without the engine
+would otherwise ship an updater it refuses.
 """
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -26,6 +31,7 @@ APPS = ROOT/'apps'
 OUT = runtime.BASE/'apps'
 UPDATER = ROOT/'programs/updater'
 UPDATER_LIBRARIES = ['mbedtls', 'mbedx509', 'mbedcrypto']
+SOURCES_SUFFIX = '.sources'
 # The kernel's limits: APP_LIMIT, APP_ID_MAX, APP_NAME_MAX and APP_ICON_SIZE.
 LIMITS = dict(re.findall(r'#define APP_(\w+)\s+(\d+)u?\b', (ROOT/'include/apps.h').read_text()))
 APP_LIMIT, ID_MAX, NAME_MAX, ICON_SIZE = (int(LIMITS[name]) for name in ('LIMIT', 'ID_MAX', 'NAME_MAX', 'ICON_SIZE'))
@@ -96,11 +102,40 @@ def build(directory):
             f'/apps/{app}/name': name.encode()}
 
 
+def program_directories():
+    return [UPDATER, *sorted(path for path in APPS.iterdir() if path.is_dir())]
+
+
+def sources():
+    """The files the programs come from: what the compiler reads for the
+    updater and each app (its -MM list, system headers aside), the apps'
+    app.json and icon.txt, and the SDK, libsos2's sources included."""
+    found = set()
+    for directory in program_directories():
+        inputs = [*sorted(directory.glob('*.c')), ROOT/'kernel/graphics.c']
+        listed = subprocess.run([arch.tool('gcc'), *runtime.sdk_flags(), '-MM', *map(str, inputs)],
+                                cwd=ROOT, check=True, capture_output=True, text=True).stdout
+        found.update((ROOT/word).resolve() for word in listed.replace('\\\n', ' ').split()
+                     if not word.endswith(':'))
+        found.update(directory/name for name in ('app.json', 'icon.txt') if (directory/name).is_file())
+    found.update(path.resolve() for path in (ROOT/'sdk').rglob('*') if path.is_file())
+    return sorted(found)
+
+
+def signature():
+    """A digest of sources(): their paths in the checkout and their bytes."""
+    digest = hashlib.sha256()
+    for path in sources():
+        name, content = str(path.relative_to(ROOT)).encode(), path.read_bytes()
+        digest.update(len(name).to_bytes(4, 'little') + name + len(content).to_bytes(8, 'little') + content)
+    return digest.hexdigest()
+
+
 def files():
     """Bundle entries for the updater and every app; needs the SDK from `make engine`."""
     if not (runtime.BASE/'sdk/libsos2.a').exists():
         raise RuntimeError('Build the native SDK first (make engine)')
-    directories = sorted(path for path in APPS.iterdir() if path.is_dir())
+    directories = program_directories()[1:]
     if len(directories) > APP_LIMIT:
         raise RuntimeError(f'at most {APP_LIMIT} apps fit the launcher')
     entries = {'/bin/sos2-updater': program(UPDATER, runtime.BASE/'updater', UPDATER_LIBRARIES)}

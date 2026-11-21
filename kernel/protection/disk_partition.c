@@ -25,7 +25,8 @@ static bool header(const unsigned char *p, uint64_t sectors) {
         le32(p + 20))
         return false;
     if (le64(p + 24) != 1 || le64(p + 32) != sectors - 1) return false;
-    if (le64(p + 40) < 34 || le64(p + 40) > le64(p + 48) || le64(p + 48) >= sectors - 33) return false;
+    if (le64(p + 40) < 34 || le64(p + 40) > le64(p + 48) || le64(p + 48) >= sectors - 33)
+        return false;
     if (zero(p + 56, 16)) return false;
     if (le64(p + 72) != 2 || !le32(p + 80) || le32(p + 80) > ENTRIES || le32(p + 84) != ENTRY)
         return false;

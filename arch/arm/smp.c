@@ -130,8 +130,9 @@ static char *hex(char *out, uint32_t value) {
  * it came from SVC mode, the mode, and for an abort the faulting address and
  * the fault status, which locate it in kernel.elf. */
 static const char *kernel_trap_text(const struct arm_trap *trap) {
-    static const char *const kinds[] = {"reset", "undefined instruction", "SVC", "prefetch abort",
-                                        "data abort", "reserved", "IRQ", "FIQ"};
+    static const char *const kinds[] = {
+        "reset", "undefined instruction", "SVC", "prefetch abort", "data abort", "reserved", "IRQ",
+        "FIQ"};
     static char text[160];
     uint32_t lr = 0;
     if ((trap->context.cpsr & 31) == 0x13)
@@ -171,8 +172,8 @@ bool arm_trap_dispatch(struct arm_trap *trap) {
      * process (vm_icache_sync), and the JIT calls it for every code patch,
      * so it returns to user code without ending the slice. */
     if (trap->vector == 2 && trap->context.r[7] == SYS_ICACHE_SYNC) {
-        trap->context.r[0] = (uint32_t)vm_icache_sync(cpu->space, trap->context.r[0],
-                                                       trap->context.r[1]);
+        trap->context.r[0] =
+            (uint32_t)vm_icache_sync(cpu->space, trap->context.r[0], trap->context.r[1]);
         return true;
     }
 #endif
@@ -181,7 +182,7 @@ bool arm_trap_dispatch(struct arm_trap *trap) {
     cpu->trap = *trap;
     return false;
 }
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE)
+#ifdef SOS2_CPU_SLEEP
 /* Standby power-down of idle secondary CPUs. A CPU the firmware keeps on
  * waits instead; either way it is ASLEEP meanwhile, STARTING while it
  * restarts and IDLE once awake. On the phone the wake re-sends SGI 0 to CPUs
@@ -267,7 +268,7 @@ _Noreturn void arm_cpu_secondary(struct arm_cpu *cpu) {
     /* Also the warm entry after a standby power-down. A failed restart then
      * leaves the CPU asleep, out of service, rather than failing the system. */
     uint32_t failed = cpu->mmu_enabled ? CPU_ASLEEP : CPU_FAILED;
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE)
+#ifdef SOS2_CPU_SLEEP
     if (cpu->mmu_enabled) {
         publish(&cpu->state, CPU_STARTING);
 #ifdef SOS2_BOARD_REDMI2
@@ -291,7 +292,7 @@ _Noreturn void arm_cpu_secondary(struct arm_cpu *cpu) {
     for (;;) {
         uint32_t state = load(&cpu->state);
         if (state == CPU_BUSY) execute(cpu);
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE)
+#ifdef SOS2_CPU_SLEEP
         else if (state == CPU_IDLE && load(&sleep_request) && (sleepers & (1u << cpu->index)))
             cpu_sleep(cpu);
 #endif

@@ -42,7 +42,6 @@ static bool asleep;
 static uint32_t layers[2];
 static uint64_t slept_at;
 
-
 /* True once DSI0 has sent the command, within a few frames. */
 static bool dcs(uint8_t command) {
     mmio_write32(DSI0 + DSI_INTSTA, ~(uint32_t)VM_CMD_DONE);

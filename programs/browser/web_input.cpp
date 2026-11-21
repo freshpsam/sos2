@@ -408,11 +408,10 @@ class PointerEvent final : public PlatformMouseEvent {
 public:
     PointerEvent(DoublePoint point, Type type, bool pressed, unsigned clicks,
                  OptionSet<Modifier> modifiers)
-        : PlatformMouseEvent(point, point,
-                             pressed || type == Type::MouseReleased ? MouseButton::Left
-                                                                    : MouseButton::None,
-                             type, clicks, modifiers, MonotonicTime::now(), 0,
-                             SyntheticClickType::NoTap) {
+        : PlatformMouseEvent(
+              point, point,
+              pressed || type == Type::MouseReleased ? MouseButton::Left : MouseButton::None, type,
+              clicks, modifiers, MonotonicTime::now(), 0, SyntheticClickType::NoTap) {
         m_buttons = pressed ? 1 : 0;
     }
 };

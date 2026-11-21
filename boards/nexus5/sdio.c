@@ -5,12 +5,12 @@
 
 /* The Wi-Fi chip's SDIO bus: the BCM4339 on SDCC2, as Linux's
  * qcom-msm8974-lge-nexus5-hammerhead.dts describes it (sdhc_2: 4 bits, not
- * removable), the controller run by sdhci.c. The card comes up as Linux's
- * MMC core brings up an SDIO card (drivers/mmc/core/sdio.c, sdio_ops.c):
- * CMD5's operating conditions, CMD3's address, CMD7's selection, the CIS's
- * identity, then high speed at 50 MHz and a 4-bit bus through the CCCR.
- * Transfers are CMD52 (a byte) and CMD53 (bytes, or blocks of the
- * function's block size). */
+ * removable), the controller run by boards/qcom/sdhci.c. The card comes up
+ * as Linux's MMC core brings up an SDIO card (drivers/mmc/core/sdio.c,
+ * sdio_ops.c): CMD5's operating conditions, CMD3's address, CMD7's
+ * selection, the CIS's identity, then high speed at 50 MHz and a 4-bit bus
+ * through the CCCR. Transfers are CMD52 (a byte) and CMD53 (bytes, or
+ * blocks of the function's block size). */
 
 enum {
     GCC = 0xfc400000,

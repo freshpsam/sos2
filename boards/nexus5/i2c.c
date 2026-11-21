@@ -28,16 +28,9 @@ enum {
     CLOCK_OFF = 1u << 31,
     BLSP1_QUP = 0xf9923000,
     BLSP2_QUP = 0xf9963000,
-    TLMM = 0xfd511000, /* GPIO_CFG n at 0x10 n */
-    I2C_FUNCTION = 3,  /* shifted by 2; drive 2 mA and no pull are 0 */
+    I2C_FUNCTION = 3, /* shifted by 2; drive 2 mA and no pull are 0 */
     WAIT_US = 1000,
 };
-
-static bool wait_clear(uintptr_t address, uint32_t bits) {
-    for (uint64_t start = time_us(); mmio_read32(address) & bits;)
-        if (time_us() - start >= WAIT_US) return false;
-    return true;
-}
 
 bool nexus5_i2c_start(struct qup_i2c *bus, unsigned sda, unsigned scl) {
     bool second = bus->base >= BLSP2_QUP;
@@ -52,14 +45,16 @@ bool nexus5_i2c_start(struct qup_i2c *bus, unsigned sda, unsigned scl) {
         mmio_write32(core + RCG_CFG, mmio_read32(core + RCG_CFG) & ~RCG_SOURCE_DIVIDER);
         mmio_write32(core + RCG_CMD, mmio_read32(core + RCG_CMD) | RCG_UPDATE);
         barrier();
-        if (!wait_clear(core + RCG_CMD, RCG_UPDATE)) return false;
+        if (!nexus5_wait_bits(core + RCG_CMD, RCG_UPDATE, false, WAIT_US)) return false;
     }
     mmio_write32(CLOCK_VOTE, mmio_read32(CLOCK_VOTE) | (second ? 1u << 15 : 1u << 17));
     mmio_write32(core, mmio_read32(core) | BRANCH_ENABLE);
     barrier();
-    if (!wait_clear(ahb, CLOCK_OFF) || !wait_clear(core, CLOCK_OFF)) return false;
-    mmio_write32(TLMM + 0x10u * sda, I2C_FUNCTION << 2);
-    mmio_write32(TLMM + 0x10u * scl, I2C_FUNCTION << 2);
+    if (!nexus5_wait_bits(ahb, CLOCK_OFF, false, WAIT_US) ||
+        !nexus5_wait_bits(core, CLOCK_OFF, false, WAIT_US))
+        return false;
+    mmio_write32(nexus5_gpio(sda), I2C_FUNCTION << 2);
+    mmio_write32(nexus5_gpio(scl), I2C_FUNCTION << 2);
     barrier();
     return qup_i2c_init(bus);
 }

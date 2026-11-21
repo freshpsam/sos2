@@ -99,12 +99,16 @@ def align(value, alignment):
     return (value + alignment - 1) & ~(alignment - 1)
 
 
-def validate_arm32_kernel(kernel, elf):
+def validate_arm32_kernel(kernel, elf, base=ARM32_KERNEL_ADDRESS, limit=TAGS_ADDRESS, device="Redmi 2"):
     """Validate a flat ARM-state image with the zImage header used to locate its DTB.
 
-    lk2nd 23.1 forces DDR_START+0x8000 for ARM32 and reads the appended
-    DTB offset at 0x2c (platform/msm8916/include/platform/iomap.h and
-    platform/msm_shared/dev_tree.c). The payload has no decompressor.
+    The image is the ELF's file contents linked at base, and its memory ends
+    below limit, where the loader copies the DTB. lk2nd 23.1 forces
+    DDR_START+0x8000 for ARM32 and reads the appended DTB offset at 0x2c
+    (platform/msm8916/include/platform/iomap.h and
+    platform/msm_shared/dev_tree.c); the Nexus 5's bootloader, also LK, the
+    same at 0x8000. The payload has no decompressor. Returns the kernel's
+    allocation in whole pages.
     """
     if len(kernel) < 64 or struct.unpack_from("<I", kernel, 0x24)[0] != 0x016F2818:
         raise PackagingError("kernel must contain an ARM32 zImage-shaped header")
@@ -123,28 +127,28 @@ def validate_arm32_kernel(kernel, elf):
     fields = struct.unpack_from("<HHIIIIIHHHHHH", elf, 16)
     elf_type, machine, version, entry, phoff = fields[:5]
     flags, ehsize, phentsize, phnum = fields[6:10]
-    if (elf_type, machine, version, entry, ehsize) != (2, 40, 1, ARM32_KERNEL_ADDRESS, 52):
-        raise PackagingError("ELF is not an ARM executable linked for Redmi 2 at 0x80008000")
+    if (elf_type, machine, version, entry, ehsize) != (2, 40, 1, base, 52):
+        raise PackagingError(f"ELF is not an ARM executable linked for the {device} at 0x{base:08x}")
     if flags & 0xFF000000 != 0x05000000 or flags & 0x400:
         raise PackagingError("ARM32 ELF must use EABI5 without the hard-float calling convention")
     if phentsize != 32 or not 1 <= phnum <= 64 or phoff + phentsize * phnum > len(elf):
         raise PackagingError("invalid ELF program header table")
     expected = bytearray(len(kernel))
     written = bytearray(len(kernel))
-    first, file_end, memory_end = None, 0, ARM32_KERNEL_ADDRESS
+    first, file_end, memory_end = None, 0, base
     for index in range(phnum):
         kind, offset, vaddr, paddr, filesz, memsz, _, _ = struct.unpack_from(
             "<8I", elf, phoff + index * phentsize
         )
         if kind != 1 or memsz == 0:
             continue
-        if (vaddr != paddr or paddr < ARM32_KERNEL_ADDRESS or filesz > memsz
-                or paddr + memsz > TAGS_ADDRESS or offset + filesz > len(elf)):
+        if (vaddr != paddr or paddr < base or filesz > memsz
+                or paddr + memsz > limit or offset + filesz > len(elf)):
             raise PackagingError("ARM32 ELF load segment is outside the kernel's reserved allocation")
         memory_end = max(memory_end, paddr + memsz)
         if not filesz:
             continue
-        start = paddr - ARM32_KERNEL_ADDRESS
+        start = paddr - base
         end = start + filesz
         if end > len(kernel) or any(written[start:end]):
             raise PackagingError("ELF file segments overlap or exceed the raw image")
@@ -152,9 +156,9 @@ def validate_arm32_kernel(kernel, elf):
         written[start:end] = b"\x01" * filesz
         first = paddr if first is None else min(first, paddr)
         file_end = max(file_end, end)
-    if first != ARM32_KERNEL_ADDRESS or file_end != len(kernel) or expected != kernel:
-        raise PackagingError("raw kernel does not match the supplied Redmi 2 ELF")
-    return align(memory_end - ARM32_KERNEL_ADDRESS, PAGE_SIZE)
+    if first != base or file_end != len(kernel) or expected != kernel:
+        raise PackagingError(f"raw kernel does not match the supplied {device} ELF")
+    return align(memory_end - base, PAGE_SIZE)
 
 
 def parse_dtb(data, *, max_size=MAX_DTB_SIZE):
@@ -611,8 +615,11 @@ def boot_payload(kernel, elf, dtb):
     return payload, image_size
 
 
-def android_image(payload, cmdline, ramdisk):
-    """An Android boot v0 image of 2 KiB pages: header, payload, ramdisk."""
+def android_image(payload, cmdline, ramdisk, kernel_address=ARM32_KERNEL_ADDRESS,
+                  ramdisk_address=RAMDISK_ADDRESS, second_address=0x80F00000,
+                  tags_address=TAGS_ADDRESS, name=b"sos2-redmi2"):
+    """An Android boot v0 image of 2 KiB pages: header, payload, ramdisk,
+    with the addresses the loader puts them at (the Redmi 2's by default)."""
     if len(cmdline) >= 512:
         raise PackagingError("boot command line exceeds the Android header's 512 bytes")
     digest = hashlib.sha1()
@@ -622,9 +629,9 @@ def android_image(payload, cmdline, ramdisk):
     digest.update(struct.pack("<I", len(ramdisk)))
     digest.update(struct.pack("<I", 0))  # Empty second-stage payload.
     header = struct.pack(
-        "<8s10I16s512s32s1024s", b"ANDROID!", len(payload), ARM32_KERNEL_ADDRESS,
-        len(ramdisk), RAMDISK_ADDRESS, 0, 0x80F00000, TAGS_ADDRESS, PAGE_SIZE, 0, 0,
-        b"sos2-redmi2", cmdline, digest.digest(), b"",
+        "<8s10I16s512s32s1024s", b"ANDROID!", len(payload), kernel_address,
+        len(ramdisk), ramdisk_address, 0, second_address, tags_address, PAGE_SIZE, 0, 0,
+        name, cmdline, digest.digest(), b"",
     )
     image = header.ljust(PAGE_SIZE, b"\0") + payload
     image = image.ljust(align(len(image), PAGE_SIZE), b"\0")
@@ -742,6 +749,26 @@ def update_header(release, boot, board=BOARD):
     return (fields + struct.pack("<I", zlib.crc32(fields))).ljust(UPDATE_HEADER, b"\0")
 
 
+def install_outputs(release, board, names, boot, profile, cmdline=None, update_image=None):
+    """What tools/publish_pages.py publishes of a device's installed system:
+    names' boot image, the updater's file (update_header, then update_image,
+    the boot image unless given) and install.json, which lists both with
+    their sizes and SHA-256s, the boot command line when given, whether a
+    Wi-Fi profile is inside, and the commands of a first install from the
+    loader's fastboot."""
+    image = boot if update_image is None else update_image
+    outputs = dict(zip(names, (boot, update_header(release, image, board) + image)))
+    manifest = {"release": release, "board": board.decode("ascii")}
+    if cmdline is not None:
+        manifest["boot_cmdline"] = cmdline.decode("ascii")
+    manifest["wifi_profile"] = profile
+    manifest["files"] = {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                         for name, data in outputs.items()}
+    manifest["flash"] = ["fastboot flash boot flash-boot.img", "fastboot reboot"]
+    outputs["install.json"] = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
+    return outputs
+
+
 def make_install_files(kernel, elf, dtb, ramdisk, release, jsc=None):
     """The installed system from a RAM image's compressed resources: lk2nd's
     boot partition gets the same boot image with sos2.storage=installed, which
@@ -767,18 +794,7 @@ def make_install_files(kernel, elf, dtb, ramdisk, release, jsc=None):
     if len(boot) > BOOT_PARTITION_SPACE:
         raise PackagingError(f"flash-boot.img needs {len(boot)} bytes; the boot partition holds "
                              f"{BOOT_PARTITION_SPACE} after lk2nd")
-    update = update_header(release, boot) + boot
-    outputs = dict(zip(INSTALL_FILES, (boot, update)))
-    manifest = {
-        "release": release,
-        "board": BOARD.decode("ascii"),
-        "boot_cmdline": cmdline.decode("ascii"),
-        "wifi_profile": b"/system/wifi-profile" in files,
-        "files": {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-                  for name, data in outputs.items()},
-        "flash": ["fastboot flash boot flash-boot.img", "fastboot reboot"],
-    }
-    return outputs, manifest
+    return install_outputs(release, BOARD, INSTALL_FILES, boot, b"/system/wifi-profile" in files, cmdline)
 
 
 def write_outputs(outputs):
@@ -879,12 +895,9 @@ def main(argv=None):
         outputs = [(args.output, image),
                    (manifest_path, (json.dumps(manifest, indent=2) + "\n").encode("utf-8"))]
         if args.install_dir:
-            files, install_manifest = make_install_files(kernel, elf, dtb, android_ramdisk(image),
-                                                         args.release, args.jsc)
+            files = make_install_files(kernel, elf, dtb, android_ramdisk(image), args.release, args.jsc)
             args.install_dir.mkdir(parents=True, exist_ok=True)
             outputs += [(args.install_dir/name, data) for name, data in files.items()]
-            outputs.append((args.install_dir/'install.json',
-                            (json.dumps(install_manifest, indent=2) + "\n").encode("utf-8")))
         packages = {}
         if args.apps_dir:
             packages = app_packages(bundle_files(resources))

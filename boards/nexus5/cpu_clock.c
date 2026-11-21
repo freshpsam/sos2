@@ -111,29 +111,18 @@ static void mux(uint32_t cpmr, uint32_t mask, uint32_t value) {
     delay_us(1);
 }
 
-static void store(uintptr_t address, uint32_t value) {
-    mmio_write32(address, value);
-    barrier();
-}
-
-static bool wait_set(uintptr_t address, uint32_t bits) {
-    for (uint64_t start = time_us(); !(mmio_read32(address) & bits);)
-        if (time_us() - start >= LOCK_US) return false;
-    return true;
-}
-
 static bool pll_start(uintptr_t pll, unsigned l) {
-    store(pll + PLL_MODE, 0);
-    store(pll + PLL_CONFIG, PLL_CONFIG_VALUE);
-    store(pll + PLL_M, 0);
-    store(pll + PLL_N, 1);
-    store(pll + PLL_USER, PLL_USER_VALUE | (l > 65 ? PLL_HIGH_VCO : 0));
-    store(pll + PLL_L, l);
-    store(pll + PLL_MODE, PLL_BYPASS_OFF);
+    nexus5_store(pll + PLL_MODE, 0);
+    nexus5_store(pll + PLL_CONFIG, PLL_CONFIG_VALUE);
+    nexus5_store(pll + PLL_M, 0);
+    nexus5_store(pll + PLL_N, 1);
+    nexus5_store(pll + PLL_USER, PLL_USER_VALUE | (l > 65 ? PLL_HIGH_VCO : 0));
+    nexus5_store(pll + PLL_L, l);
+    nexus5_store(pll + PLL_MODE, PLL_BYPASS_OFF);
     delay_us(10);
-    store(pll + PLL_MODE, PLL_RESET_OFF);
-    if (!wait_set(pll + PLL_STATUS, PLL_LOCKED)) return false;
-    store(pll + PLL_MODE, PLL_OUTPUT_ON);
+    nexus5_store(pll + PLL_MODE, PLL_RESET_OFF);
+    if (!nexus5_wait_bits(pll + PLL_STATUS, PLL_LOCKED, true, LOCK_US)) return false;
+    nexus5_store(pll + PLL_MODE, PLL_OUTPUT_ON);
     return true;
 }
 
@@ -142,7 +131,7 @@ static bool pll_start(uintptr_t pll, unsigned l) {
 static void park(uint32_t cpmr, uintptr_t pll) {
     mux(cpmr, SECONDARY, SECONDARY_AUX);
     mux(cpmr, PRIMARY, PRIMARY_SECONDARY);
-    store(pll + PLL_MODE, 0);
+    nexus5_store(pll + PLL_MODE, 0);
 }
 
 /* From the auxiliary source onto its HFPLL at l x 19.2 MHz. */
@@ -159,8 +148,8 @@ bool nexus5_cpu_clock_init(void) {
     if ((mmio_read32(HFPLL0 + PLL_L) & 0xff) != BOOT_CPU_L ||
         (mmio_read32(HFPLL_L2 + PLL_L) & 0xff) != BOOT_L2_L)
         return false;
-    store(GPLL0_VOTE, mmio_read32(GPLL0_VOTE) | 1);
-    if (!wait_set(GPLL0_STATUS, GPLL0_ACTIVE)) return false;
+    nexus5_store(GPLL0_VOTE, mmio_read32(GPLL0_VOTE) | 1);
+    if (!nexus5_wait_bits(GPLL0_STATUS, GPLL0_ACTIVE, true, LOCK_US)) return false;
     cpu_l = rail(FAST_VOLTAGE) ? FAST_L : RAIL_L;
     /* A new rate that does not lock gives the bootloader's back. */
     park(CPMR0, HFPLL0);

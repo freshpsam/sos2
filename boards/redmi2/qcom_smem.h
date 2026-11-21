@@ -26,6 +26,7 @@ struct smem_item {
 enum smem_status { SMEM_INVALID = -1, SMEM_ABSENT = 0, SMEM_FOUND = 1, SMEM_BUSY = 2 };
 
 enum { SMEM_HOST_GLOBAL = 0xffff, SMEM_HOST_WCNSS = 4, SMEM_HOST_RPM = 6 };
+
 /* 1 = found/allocated, 0 = not ready/lock busy, -1 = malformed. */
 int smem_get(struct smem_region *, unsigned id, struct smem_item *);
 /* Stock peer-scoped, uncached items. Use the APPS/peer partition when present;

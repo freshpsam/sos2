@@ -7,6 +7,21 @@
 /* The Nexus 5 (LG hammerhead, MSM8974 with Krait CPUs), started by its stock
  * bootloader: its drivers (boards/nexus5) and their kernel hooks. */
 
+/* The splash the bootloader leaves, which becomes the screen: 1080x1920
+ * RGB888, rows 3240 bytes apart (board.c, display.c). */
+enum { NEXUS5_WIDTH = 1080, NEXUS5_HEIGHT = 1920, NEXUS5_STRIDE = NEXUS5_WIDTH * 3 };
+
+/* What the drivers share (board.c): TLMM GPIO n's configuration register
+ * (function, drive, pull, output enable; its input and output follow at
+ * + 4), a register store completed before what follows, and a wait of up
+ * to us microseconds for bits of a register to read set, or clear. */
+enum { NEXUS5_TLMM = 0xfd511000 };
+
+static inline uintptr_t nexus5_gpio(unsigned n) { return NEXUS5_TLMM + 0x10u * n; }
+
+void nexus5_store(uintptr_t address, uint32_t value);
+bool nexus5_wait_bits(uintptr_t address, uint32_t bits, bool set, uint64_t us);
+
 /* Checks the bootloader's handoff (board.c): RAM, the kernel, the device
  * tree and the ramdisk, and takes the splash as the screen. NULL when all
  * is well, else why not; the screen is set whenever the splash was found,
@@ -19,7 +34,9 @@ const char *nexus5_handoff(struct platform_devices *d, uint64_t kernel_start, ui
 /* The splash scanout the bootloader left: NULL with its address, or why it
  * cannot be used. */
 const char *nexus5_display_handoff(uint32_t *scanout);
-/* Sends a frame when the last is at least a frame's time old. */
+/* Sends a frame when the screen changed (damage) and the last is at least a
+ * frame's time old, or once a second regardless. */
+void nexus5_display_damage(void);
 void nexus5_display_poll(void);
 /* Sends a frame of what the screen holds now, once the last has gone. */
 void nexus5_display_flush(void);
@@ -67,8 +84,10 @@ bool nexus5_i2c_start(struct qup_i2c *bus, unsigned sda, unsigned scl);
 
 /* The vibrator (vibrator.c) for the shared touch feedback (haptics.c): init
  * powers its supply and pins, false if it cannot; run starts a pulse at
- * full drive, or brakes the motor for 15 ms and stops it. */
+ * full drive, or stops the motor; brake drives it backwards after a pulse
+ * and says for how long (0 when it cannot), haptics.c then stopping it. */
 bool nexus5_vibrator_init(void);
+uint32_t nexus5_vibrator_brake(void);
 bool nexus5_vibrator_run(bool on);
 
 /* The cores' and L2's clocks (cpu_clock.c), on CPU 0: init moves CPU 0 and
@@ -138,16 +157,16 @@ bool nexus5_sdio_function(unsigned function, bool on, unsigned wait_ms);
  * waits inside a transfer, when the main loop must leave the card alone. */
 bool nexus5_emmc_idle(void);
 
-/* The USB port as a fastboot device (usb.c, fastboot.c). init sets the
- * controller up (NULL, or why not); connect lets the host see it, from
+/* The USB port as a fastboot device (usb.c, with the shared protocol in
+ * kernel/usb/fastboot.c and the phone's commands in fastboot.c). init sets
+ * the controller up (NULL, or why not); connect lets the host see it, from
  * when poll runs often. rescue keeps the link up in a panic, started then
- * if it was not yet: false if the controller does not start. fastboot_panic
- * tells the commands that the main loop and the service worker are gone. */
+ * if it was not yet: false if the controller does not start. send is one
+ * transfer to the host. fastboot_init registers the phone's commands. */
 const char *nexus5_usb_init(void);
 void nexus5_usb_connect(void);
 void nexus5_usb_poll(void);
 bool nexus5_usb_rescue(void);
 bool nexus5_usb_send(const void *data, uint32_t length);
-void nexus5_fastboot(const char *command, unsigned length);
-void nexus5_fastboot_panic(void);
+void nexus5_fastboot_init(void);
 #endif

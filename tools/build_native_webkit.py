@@ -182,10 +182,11 @@ def pack_web():
         for style in ('','-Bold'):
             name=family+style+'.ttf';files['/fonts/'+name]=subset(fonts/'ttf'/name,'latin')
     files.update(font_resources())
-    from build_native_apps import files as app_files
-    files.update(app_files())
+    from build_native_apps import SOURCES_SUFFIX,files as app_files,signature
+    programs=signature();files.update(app_files())
     destination=BASE/'native-web.bundle'
     bundle(destination,files)
+    destination.with_name(destination.name+SOURCES_SUFFIX).write_text(programs+'\n')
     print('Native WebKit bundle:',destination,flush=True)
 
 

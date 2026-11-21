@@ -54,52 +54,11 @@ INSTALL_FILES = ('flash-boot.img', 'sos2-nexus5.update')
 WIFI_FIRMWARE = ('fw_bcmdhd.bin', 'bcmdhd.cal')
 
 
-def align(value):
-    return (value + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
-
-
-def kernel_allocation(kernel, elf):
-    """Checks the raw kernel against its ELF, linked at 0x8000 with a
-    zImage-shaped header whose end word is the file's size, and returns the
-    memory it takes, which must end below the device tree's copy."""
-    if len(kernel) < 64 or struct.unpack_from('<I', kernel, 0x24)[0] != 0x016F2818:
-        raise PackagingError('kernel must contain an ARM32 zImage-shaped header')
-    if struct.unpack_from('<II', kernel, 0x28) != (0, len(kernel)):
-        raise PackagingError("the kernel header's end word must be the raw file's size")
-    if struct.unpack_from('<I', kernel)[0] >> 24 != 0xEA:
-        raise PackagingError('the kernel must start with an ARM-state branch')
-    if len(elf) < 52 or elf[:7] != b'\x7fELF\x01\x01\x01':
-        raise PackagingError('--elf must be a little-endian ELF32 file')
-    elf_type, machine, _, entry, phoff = struct.unpack_from('<HHIII', elf, 16)
-    phentsize, phnum = struct.unpack_from('<HH', elf, 42)
-    if (elf_type, machine, entry) != (2, 40, KERNEL_ADDRESS) or phentsize != 32 or not 1 <= phnum <= 64:
-        raise PackagingError('ELF is not an ARM executable linked for the Nexus 5 at 0x8000')
-    if phoff + phnum * 32 > len(elf):
-        raise PackagingError("the ELF's program headers run past its end")
-    expected = bytearray(len(kernel))
-    memory_end = KERNEL_ADDRESS
-    for index in range(phnum):
-        kind, offset, vaddr, paddr, filesz, memsz, _, _ = struct.unpack_from('<8I', elf, phoff + index * 32)
-        if kind != 1 or not memsz:
-            continue
-        if vaddr != paddr or paddr < KERNEL_ADDRESS or filesz > memsz or paddr + memsz > TAGS_ADDRESS:
-            raise PackagingError("an ELF load segment lies outside the kernel's room below 0x02700000")
-        if offset + filesz > len(elf):
-            raise PackagingError("an ELF load segment runs past the file's end")
-        memory_end = max(memory_end, paddr + memsz)
-        start = paddr - KERNEL_ADDRESS
-        if start + filesz > len(kernel):
-            raise PackagingError('an ELF file segment exceeds the raw image')
-        expected[start:start + filesz] = elf[offset:offset + filesz]
-    if expected != kernel:
-        raise PackagingError('raw kernel does not match the supplied ELF')
-    return memory_end - KERNEL_ADDRESS
-
-
 def check_dtb(dtb):
-    if len(dtb) < 40 or struct.unpack_from('>I', dtb)[0] != 0xD00DFEED or struct.unpack_from('>I', dtb, 4)[0] != len(dtb):
-        raise PackagingError('--dtb is not a flattened device tree')
-    if b'lge,hammerhead\0' not in dtb or MSM_ID not in dtb:
+    """One FDT v17 blob (tools/package_redmi2.py's parse_dtb) whose root names
+    hammerhead and its qcom,msm-id, by which the bootloader picks it."""
+    root = resources.parse_dtb(dtb)['/']
+    if b'lge,hammerhead' not in root.get('compatible', b'').split(b'\0') or root.get('qcom,msm-id') != MSM_ID:
         raise PackagingError("--dtb lacks hammerhead's compatible or qcom,msm-id")
 
 
@@ -122,43 +81,13 @@ def wifi_firmware(folder):
 
 
 def boot_image(payload, cmdline, ramdisk):
-    """An Android boot v0 image: header, kernel with its device tree, ramdisk;
-    the boot partition must hold it."""
-    if len(cmdline) >= 512:
-        raise PackagingError("boot command line exceeds the Android header's 512 bytes")
-    digest = hashlib.sha1()
-    for part in (payload, ramdisk, b''):
-        digest.update(part)
-        digest.update(struct.pack('<I', len(part)))
-    header = struct.pack('<8s10I16s512s32s1024s', b'ANDROID!', len(payload), KERNEL_ADDRESS,
-                         len(ramdisk), RAMDISK_ADDRESS, 0, SECOND_ADDRESS, TAGS_ADDRESS, PAGE_SIZE, 0, 0,
-                         b'sos2-nexus5', cmdline, digest.digest(), b'')
-    image = header.ljust(PAGE_SIZE, b'\0') + payload
-    image = image.ljust(align(len(image)), b'\0') + ramdisk
-    image = image.ljust(align(len(image)), b'\0')
+    """An Android boot v0 image (tools/package_redmi2.py's android_image) with
+    hammerhead's addresses; the boot partition must hold it."""
+    image = resources.android_image(payload, cmdline, ramdisk, KERNEL_ADDRESS, RAMDISK_ADDRESS,
+                                    SECOND_ADDRESS, TAGS_ADDRESS, b'sos2-nexus5')
     if len(image) > BOOT_PARTITION_SIZE:
         raise PackagingError(f'the {len(image)}-byte boot image exceeds the {BOOT_PARTITION_SIZE}-byte boot partition')
     return image
-
-
-def install_files(release, image, cmdline, profile):
-    """The installed system for publishing (tools/publish_pages.py): its boot
-    image, and the updater's file, the same image after its 4 KiB header
-    (kernel/protection/system_update.c); and install.json with their sizes
-    and SHA-256s and the commands of a first install, from the stock
-    bootloader's fastboot."""
-    outputs = dict(zip(INSTALL_FILES, (image, resources.update_header(release, image, BOARD) + image)))
-    manifest = {
-        'release': release,
-        'board': BOARD.decode('ascii'),
-        'boot_cmdline': cmdline.decode('ascii'),
-        'wifi_profile': profile,
-        'files': {name: {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
-                  for name, data in outputs.items()},
-        'flash': ['fastboot flash boot flash-boot.img', 'fastboot reboot'],
-    }
-    outputs['install.json'] = (json.dumps(manifest, indent=2) + '\n').encode()
-    return outputs
 
 
 def main(argv=None):
@@ -180,8 +109,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         kernel, elf, dtb = args.kernel.read_bytes(), args.elf.read_bytes(), args.dtb.read_bytes()
-        allocation = kernel_allocation(kernel, elf)
+        allocation = resources.validate_arm32_kernel(kernel, elf, KERNEL_ADDRESS, TAGS_ADDRESS, 'Nexus 5')
         check_dtb(dtb)
+        # The bootloader copies the kernel and its appended DTB, in whole
+        # pages, into the kernel's allocation.
+        if resources.align(len(kernel) + len(dtb), PAGE_SIZE) > allocation:
+            raise PackagingError("the kernel's allocation must hold the bootloader's copy of it and its DTB")
         bundle = args.resources.read_bytes()
         expanded = resources.resource_bundle(bundle, ram_only=True, release=args.release, strip_apps=True)
         if args.wifi_profile and not args.wifi_firmware:
@@ -201,7 +134,7 @@ def main(argv=None):
                     raise PackagingError(f'{args.wifi_profile}: {error}') from error
             expanded = resources.sorb(files)
         ramdisk = resources.sorz(expanded)
-        if RAMDISK_ADDRESS + align(len(ramdisk)) > RAMDISK_LIMIT:
+        if RAMDISK_ADDRESS + resources.align(len(ramdisk), PAGE_SIZE) > RAMDISK_LIMIT:
             raise PackagingError(f'the {len(ramdisk)}-byte ramdisk does not fit between 0x{RAMDISK_ADDRESS:08x} '
                                  f'and the firmware at 0x{RAMDISK_LIMIT:08x}')
         cmdline = resources.with_jsc_options(CMDLINE, args.jsc)
@@ -231,8 +164,11 @@ def main(argv=None):
         outputs = [(args.output_dir / 'boot.img', image),
                    (args.output_dir / 'boot.img.json', json.dumps(manifest, indent=2).encode() + b'\n')]
         if args.install_dir:
+            # The updater's file is the image after its 4 KiB header
+            # (kernel/protection/system_update.c).
             outputs += [(args.install_dir / name, data) for name, data in
-                        install_files(args.release, installed, installed_cmdline, bool(args.wifi_profile)).items()]
+                        resources.install_outputs(args.release, BOARD, INSTALL_FILES, installed,
+                                                  bool(args.wifi_profile), installed_cmdline).items()]
         packages = {}
         if args.apps_dir:
             packages = resources.app_packages(resources.bundle_files(bundle))

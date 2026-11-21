@@ -17,7 +17,22 @@ COMMON_FLAGS := -marm -mfloat-abi=soft -mgeneral-regs-only -mno-unaligned-access
     -Ithird_party/littlefs -DLFS_CONFIG=sos2_lfs_config.h \
     -Iinclude/lwip -Ithird_party/lwip/src/include
 QEMU_FLAGS := $(COMMON_FLAGS) -mcpu=cortex-a15
-REDMI2_PROTECTED_CFLAGS := $(COMMON_FLAGS) -mcpu=cortex-a53 -DSOS2_BOARD_REDMI2=1 -Iboards/redmi2 -Iboards/qcom -Ithird_party/jitterentropy
+# What sets the devices apart, for the code they share (QEMU's machines have
+# none of these):
+#   SOS2_DEVICE              a device, not a QEMU machine
+#   SOS2_PHONE               the ARM32 Qualcomm phones: an LK bootloader starts an
+#                            Android boot image whose ramdisk holds the resources,
+#                            expanded under the boot cache's MMU into the browser's
+#                            arena, beside a framebuffer the kernel maps; the PMIC
+#                            keeps the time
+#   SOS2_LOADER_FRAMEBUFFER  the bootloader's framebuffer is the screen, which the
+#                            CPU draws
+#   SOS2_NAVIGATION_BUTTONS  no Home or Back key: the top bar has HOME and BACK
+#   SOS2_CPU_SLEEP           idle secondary CPUs power down in standby
+REDMI2_FAMILY := -DSOS2_DEVICE=1 -DSOS2_PHONE=1 -DSOS2_CPU_SLEEP=1
+GTA7LITE_FAMILY := -DSOS2_DEVICE=1 -DSOS2_LOADER_FRAMEBUFFER=1 -DSOS2_NAVIGATION_BUTTONS=1 -DSOS2_CPU_SLEEP=1
+NEXUS5_FAMILY := -DSOS2_DEVICE=1 -DSOS2_PHONE=1 -DSOS2_LOADER_FRAMEBUFFER=1 -DSOS2_NAVIGATION_BUTTONS=1
+REDMI2_PROTECTED_CFLAGS := $(COMMON_FLAGS) -mcpu=cortex-a53 -DSOS2_BOARD_REDMI2=1 $(REDMI2_FAMILY) -Iboards/redmi2 -Iboards/qcom -Ithird_party/jitterentropy
 include tools/wifi.mk
 REDMI2_PROTECTED_CFLAGS += $(WIFI_CRYPTO_FLAGS)
 
@@ -31,11 +46,16 @@ ARM_SOURCES := arch/arm/mmu.c arch/arm/machine.c arch/arm/timer.c arch/arm/boot_
 QEMU_SOURCES := $(wildcard kernel/*.c) \
     $(filter-out kernel/protection/jitter_entropy.c kernel/protection/emmc_store.c,$(wildcard kernel/protection/*.c kernel/net/*.c)) \
     kernel/audio/audio.c kernel/audio/virtio_snd.c $(ARM_SOURCES) $(LIBRARIES)
-PHONE_SOURCES := $(filter-out kernel/ramfb.c kernel/input.c kernel/virtio_gpu.c,$(wildcard kernel/*.c)) \
+# An ARM32 phone's kernel ($(call PHONE_KERNEL,board)): the shared kernel
+# without QEMU's virtio devices, the board's drivers, the Qualcomm ones the
+# phones share (boards/qcom), Wi-Fi on the shared station and CPU-jitter
+# randomness.
+PHONE_KERNEL = $(filter-out kernel/ramfb.c kernel/input.c kernel/virtio_gpu.c kernel/qemu_board.c,$(wildcard kernel/*.c)) \
     $(filter-out kernel/protection/block.c kernel/protection/entropy.c,$(wildcard kernel/protection/*.c)) \
-    $(wildcard boards/redmi2/*.c) boards/qcom/qup_i2c.c boards/qcom/scm.c kernel/net/network.c kernel/net/network_time.c kernel/net/strings.c kernel/audio/audio.c \
+    $(wildcard boards/$(1)/*.c) boards/qcom/qup_i2c.c boards/qcom/scm.c boards/qcom/sdhci.c kernel/net/network.c kernel/net/network_time.c kernel/net/strings.c kernel/audio/audio.c \
     $(ARM_SOURCES) $(LIBRARIES) $(wildcard third_party/jitterentropy/src/*.c) $(WIFI_SOURCES) \
     $(HOSTAP_SOURCES) $(WIFI_MBEDTLS_SOURCES)
+PHONE_SOURCES := $(call PHONE_KERNEL,redmi2)
 QEMU_OBJECTS := $(patsubst %.c,build/resources-arm32/%.o,$(QEMU_SOURCES)) \
     build/resources-arm32/arch/arm/boot.o build/resources-arm32/arch/arm/process.o build/resources-arm32/arch/arm/cache_ops.o build/resources-arm32/arch/arm/psci.o
 PHONE_OBJECTS := $(patsubst %.c,build/redmi2-protected-arm32/%.o,$(PHONE_SOURCES)) \
@@ -86,13 +106,13 @@ build/resources-arm64/kernel.img: build/resources-arm64/kernel.elf
 # The Galaxy Tab A7 Lite (SM-T220): the arm64 kernel with the tablet's
 # interrupt controller, LK's framebuffer and its watchdog, its eMMC in place
 # of virtio's disk (boards/gta7lite), and the phone's CPU-jitter randomness.
-GTA7LITE_FLAGS := $(ARM64_FLAGS) -DSOS2_BOARD_GTA7LITE=1 -Iboards/gta7lite -Ithird_party/jitterentropy \
+GTA7LITE_FLAGS := $(ARM64_FLAGS) -DSOS2_BOARD_GTA7LITE=1 $(GTA7LITE_FAMILY) -Iboards/gta7lite -Ithird_party/jitterentropy \
     $(WIFI_CRYPTO_FLAGS)
-GTA7LITE_SOURCES := $(filter-out kernel/ramfb.c kernel/input.c kernel/virtio_gpu.c \
+GTA7LITE_SOURCES := $(filter-out kernel/ramfb.c kernel/input.c kernel/virtio_gpu.c kernel/qemu_board.c \
     kernel/protection/entropy.c kernel/protection/block.c kernel/net/virtio_net.c \
     kernel/audio/virtio_snd.c,$(ARM64_SOURCES)) \
     kernel/protection/jitter_entropy.c kernel/protection/emmc_store.c \
-    $(wildcard boards/gta7lite/*.c third_party/jitterentropy/src/*.c) $(WIFI_SOURCES) \
+    $(wildcard boards/gta7lite/*.c third_party/jitterentropy/src/*.c) kernel/usb/fastboot.c $(WIFI_SOURCES) \
     $(HOSTAP_SOURCES) $(WIFI_MBEDTLS_SOURCES)
 GTA7LITE_OBJECTS := $(patsubst %.c,build/gta7lite-arm64/%.o,$(GTA7LITE_SOURCES)) \
     $(patsubst %,build/gta7lite-arm64/arch/arm64/%.o,boot entry cache_ops psci)
@@ -119,13 +139,9 @@ build/redmi2/boot.dtb: boards/redmi2/boot.dts tools/dtc.py
 # screen (boards/nexus5), the QUP I2C and secure-call drivers it shares with
 # the Redmi 2 (boards/qcom), Wi-Fi on the shared station (kernel/wifi), the
 # phone's CPU-jitter randomness and its eMMC.
-NEXUS5_CFLAGS := $(COMMON_FLAGS) -mcpu=cortex-a15 -DSOS2_BOARD_NEXUS5=1 -Iboards/nexus5 -Iboards/qcom -Ithird_party/jitterentropy \
+NEXUS5_CFLAGS := $(COMMON_FLAGS) -mcpu=cortex-a15 -DSOS2_BOARD_NEXUS5=1 $(NEXUS5_FAMILY) -Iboards/nexus5 -Iboards/qcom -Ithird_party/jitterentropy \
     $(WIFI_CRYPTO_FLAGS)
-NEXUS5_SOURCES := $(filter-out kernel/ramfb.c kernel/input.c kernel/virtio_gpu.c,$(wildcard kernel/*.c)) \
-    $(filter-out kernel/protection/block.c kernel/protection/entropy.c,$(wildcard kernel/protection/*.c)) \
-    $(wildcard boards/nexus5/*.c) boards/qcom/qup_i2c.c boards/qcom/scm.c kernel/net/network.c kernel/net/network_time.c kernel/net/strings.c kernel/audio/audio.c \
-    $(ARM_SOURCES) $(LIBRARIES) $(wildcard third_party/jitterentropy/src/*.c) $(WIFI_SOURCES) \
-    $(HOSTAP_SOURCES) $(WIFI_MBEDTLS_SOURCES)
+NEXUS5_SOURCES := $(call PHONE_KERNEL,nexus5) kernel/usb/fastboot.c
 NEXUS5_OBJECTS := $(patsubst %.c,build/nexus5-arm32/%.o,$(NEXUS5_SOURCES)) \
     $(patsubst %,build/nexus5-arm32/arch/arm/%.o,boot process scm cache_ops psci)
 build/nexus5-arm32/third_party/jitterentropy/%.o: third_party/jitterentropy/%.c Makefile tools/build.mk

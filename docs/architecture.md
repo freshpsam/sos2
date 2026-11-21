@@ -125,16 +125,18 @@ sessions show updates but install none.
 ## Networking
 
 lwIP provides IPv4, DHCP, DNS and TCP over virtio Ethernet (QEMU) or the
-devices' native Wi-Fi drivers. The devices share one station
-(kernel/wifi), which builds and parses 802.11 and runs WPA2/WPA3; the
-Nexus 5's FullMAC firmware joins by itself, so its radio answers the station
-from what the firmware does ([details](nexus5.md#loader-and-hardware)). TCP keeps segments that arrive past a gap and
-reports them with SACK, so a frame Wi-Fi loses costs one resend rather than a
-window; the Wi-Fi drivers hand lwIP up to 256 received frames at a time, a
-whole aggregate. HTTPS (Mbed TLS 1.2/1.3) checks hostname,
-chain and date with no fallback to HTTP; WebKit enforces CORS, CSP, mixed
-content and credentials. HTTP/1.1 and HTTP/2 are supported; bodies are
-limited to 32 MiB decoded.
+devices' native Wi-Fi drivers. The devices share one station (kernel/wifi),
+which builds and parses 802.11 and runs WPA2/WPA3; the Nexus 5's FullMAC
+firmware joins by itself, so its radio tells the station what the firmware
+did through the station's FullMAC calls (authenticated, associated,
+disconnected, heard: include/wifi_station.h;
+[details](nexus5.md#loader-and-hardware)). TCP keeps segments that arrive
+past a gap and reports them with SACK, so a frame Wi-Fi loses costs one
+resend rather than a window; the Wi-Fi drivers hand lwIP up to 256 received
+frames at a time, a whole aggregate. HTTPS (Mbed TLS 1.2/1.3) checks
+hostname, chain and date with no fallback to HTTP; WebKit enforces CORS,
+CSP, mixed content and credentials. HTTP/1.1 and HTTP/2 are supported;
+bodies are limited to 32 MiB decoded.
 
 ## Web platform and rendering
 

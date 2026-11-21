@@ -1,4 +1,5 @@
 #include "nexus5.h"
+#include "fastboot.h"
 #include "platform.h"
 
 /* The Nexus 5's USB port as a fastboot device (fastboot.c), for the computer
@@ -182,48 +183,6 @@ static bool control_ack(void) {
 
 static void stall(void) { set(ENDPTCTRL0, CTRL_TXS | CTRL_RXS); }
 
-static unsigned string(uint8_t *out, const char *text) {
-    unsigned n = 2;
-    for (; *text && n < 64; ++text, n += 2) {
-        out[n] = (uint8_t)*text;
-        out[n + 1] = 0;
-    }
-    out[0] = (uint8_t)n;
-    out[1] = 3;
-    return n;
-}
-
-static unsigned descriptor(uint16_t value, uint8_t *out) {
-    static const uint8_t device[18] = {18, 1, 0x00, 0x02, 0, 0, 0, 64, 0xd1, 0x18, 0x0d, 0xd0,
-                                       0x00, 0x01, 1, 2, 3, 1};
-    unsigned type = value >> 8, index = value & 255;
-    if (type == 1) {
-        memcpy(out, device, sizeof(device));
-        return sizeof(device);
-    }
-    if (type == 2) {
-        unsigned packet = high_speed ? 512 : 64;
-        const uint8_t config[32] = {9, 2, 32, 0, 1, 1, 0, 0x80, 0xfa,
-                                    /* the fastboot interface */
-                                    9, 4, 0, 0, 2, 0xff, 0x42, 0x03, 0,
-                                    /* bulk IN 1, bulk OUT 1 */
-                                    7, 5, 0x81, 2, (uint8_t)packet, (uint8_t)(packet >> 8), 0,
-                                    7, 5, 0x01, 2, (uint8_t)packet, (uint8_t)(packet >> 8), 0};
-        memcpy(out, config, sizeof(config));
-        return sizeof(config);
-    }
-    if (type == 3) {
-        if (index == 0) {
-            static const uint8_t languages[4] = {4, 3, 0x09, 0x04};
-            memcpy(out, languages, sizeof(languages));
-            return sizeof(languages);
-        }
-        static const char *const strings[] = {"SOS2", "Nexus 5", "nexus5"};
-        if (index <= 3) return string(out, strings[index - 1]);
-    }
-    return 0;
-}
-
 static void receive_command(void) {
     prime(EP1_OUT, dma.command, COMMAND);
     receiving = true;
@@ -251,7 +210,7 @@ static void setup(void) {
     uint16_t value = (uint16_t)(s[2] | s[3] << 8), length = (uint16_t)(s[6] | s[7] << 8);
     if (type == 0x80 && request == 6) { /* GET_DESCRIPTOR */
         uint8_t data[64];
-        unsigned n = descriptor(value, data);
+        unsigned n = fastboot_descriptor(value, high_speed, data, sizeof(data));
         if (!n) {
             stall();
             return;
@@ -279,6 +238,7 @@ static void setup(void) {
 
 const char *nexus5_usb_init(void) {
     if (started) return 0;
+    nexus5_fastboot_init();
     if ((mmio_read32(GCC_USB_HS_SYSTEM_CBCR) & CLOCK_OFF) ||
         (mmio_read32(GCC_USB_HS_AHB_CBCR) & CLOCK_OFF))
         return "USB clocks off";
@@ -337,7 +297,7 @@ void nexus5_usb_poll(void) {
         for (uint32_t i = 0; i < length; ++i)
             command[i] = (char)((volatile uint8_t *)dma.command)[i];
         command[length] = 0;
-        nexus5_fastboot(command, length);
+        fastboot_command(command, length);
     }
     if (configured && !receiving) receive_command();
 }

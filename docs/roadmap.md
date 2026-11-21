@@ -11,8 +11,9 @@ Open work; the other documents describe what exists.
    frames, key renewal, wrong passwords and reconnection across routers; then
    add radio interrupts.
 3. **Storage durability.** Validate power loss and durability of the
-   installed systems' eMMC data. Multi-block transfers would shorten the
-   phone's boot-time read.
+   installed systems' eMMC data. Multi-block reads, which the Nexus 5's
+   driver uses, would shorten the Redmi 2's boot-time read, which still
+   reads a sector at a time.
 4. **Compositing and GPU drawing.** Composited fixed and overflow-scrolling
    elements, masks and blend modes in the CPU compositor, which paints the
    last two flattened where they change; damage tracking and worker-thread
@@ -66,6 +67,7 @@ Open work; the other documents describe what exists.
     SPM); faster CPU levels (the RPM's logic rail over SMD, the CPU rail,
     and a temperature watch); Wi-Fi's 5 GHz and speed (an update downloaded
     at about 0.2 MB/s before the driver read glommed frames, not measured
-    since); the eMMC's speed (single sectors in PIO: about
-    1.5 MB/s read, 0.6 MB/s written); the Adreno 330; sound (the WCD9320
-    behind the audio DSP).
+    since); the eMMC's writes (a sector at a time in PIO, about 0.6 MB/s;
+    reads take up to 256 sectors per command); the Wi-Fi chip's own sleep
+    in standby (KSO), once the phone's standby current can be measured; the
+    Adreno 330; sound (the WCD9320 behind the audio DSP).

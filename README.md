@@ -53,18 +53,26 @@ QEMU disk.
 ## Source map
 
 - `arch/arm`, `arch/arm64`, `kernel`, `include`: the kernel (ARM32 and
-  AArch64) and the desktop.
+  AArch64) and the desktop. `kernel/main.c` starts the kernel and runs its
+  main loop, each board's part in its `kernel_board.c`
+  (`include/kernel_board.h`), QEMU's in `kernel/qemu_board.c`; the devices
+  share the bootloader handoff's checks (`kernel/boot_handoff.c`) and the
+  fastboot protocol of their USB links (`kernel/usb/fastboot.c`).
 - `boards/redmi2`: the Redmi 2's drivers, their headers and its linker script.
 - `boards/gta7lite`: the Galaxy Tab A7 Lite's drivers: bootloader handoff,
   watchdog, PMIC, touch, eMMC, USB and Wi-Fi.
 - `boards/nexus5`: the Nexus 5's drivers: bootloader handoff, display,
   backlight, touch, PMIC, battery, vibrator, the other cores and the CPU
-  clocks, USB, the SD controllers (eMMC, and Wi-Fi's SDIO with the BCM4339's
-  firmware) and its linker script.
-- `boards/qcom`: drivers the Qualcomm phones share: the QUP I2C controller
-  and the secure monitor calls (SCM).
+  clocks, USB, the eMMC, Wi-Fi's SDIO with the BCM4339's firmware, and its
+  linker script.
+- `boards/qcom`: drivers the Qualcomm phones share: the QUP I2C controller,
+  the SD host controller (the eMMC on both, Wi-Fi's SDIO on the Nexus 5) and
+  the secure monitor calls (SCM).
 - Each board's directory is on the include path only for that board's build;
-  shared code includes its headers inside `#ifdef SOS2_BOARD_*`.
+  shared code includes its headers inside `#ifdef SOS2_BOARD_*`, and asks
+  what kind of board it runs on through the family macros `tools/build.mk`
+  defines (`SOS2_DEVICE`, `SOS2_PHONE`, `SOS2_LOADER_FRAMEBUFFER`,
+  `SOS2_NAVIGATION_BUTTONS`, `SOS2_CPU_SLEEP`).
 - `sdk`: the C/C++ runtime and syscall interface for programs.
 - `programs/browser`: the engine, `/bin/sos2-web`.
 - `programs/updater`: the updater, `/bin/sos2-updater`.

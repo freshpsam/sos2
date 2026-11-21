@@ -1,4 +1,5 @@
 #include "gta7lite.h"
+#include "fastboot.h"
 #include "platform.h"
 
 /* MT6765's USB 2.0 port as a fastboot device (fastboot.c): the tablet's link
@@ -132,18 +133,11 @@ enum {
     SET_INTERFACE = 11
 };
 
-/* 18d1:d00d, fastboot's generic IDs; strings 1-3: manufacturer, product,
- * serial number. */
-static const unsigned char device_descriptor[18] = {18,   1,    0x00, 0x02, 0, 0, 0, EP0_PACKET, 0xd1,
-                                                    0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1};
-static const unsigned char qualifier_descriptor[10] = {10, 6, 0x00, 0x02, 0, 0, 0, EP0_PACKET, 1, 0};
-static const char *const strings[] = {"SOS2", "SOS2 tablet", "gta7lite"};
-
 static struct {
     const char *error;
     bool started, connected, configured, polling;
-    uint16_t packet; /* the bulk endpoints' packet size */
-    uint64_t queued_at; /* when the last bulk IN packet was queued */
+    uint16_t packet;          /* the bulk endpoints' packet size */
+    uint64_t queued_at;       /* when the last bulk IN packet was queued */
     unsigned out_at, out_end; /* a bulk OUT packet's bytes not yet read */
     unsigned char out[512] __attribute__((aligned(4)));
     char command[512 + 1];
@@ -161,7 +155,6 @@ static void write16(unsigned offset, uint16_t value) { mmio_write16(MUSB + offse
 static void phy(unsigned offset, uint32_t clear, uint32_t set) {
     mmio_write32(PHY + offset, (mmio_read32(PHY + offset) & ~clear) | set);
 }
-
 
 /* The FIFO takes and gives four bytes per 32-bit access, in order. */
 static void fifo_write(unsigned endpoint, const unsigned char *data, unsigned n) {
@@ -249,6 +242,7 @@ static const char *start(void) {
 const char *gta7lite_usb_init(void) {
     if (usb.started || usb.error) return usb.error;
     usb.packet = 512;
+    gta7lite_fastboot_init();
     usb.error = start();
     usb.started = !usb.error;
     return usb.error;
@@ -280,62 +274,6 @@ static void configure(bool on) {
     write16(RXCSR, RX_FLUSHFIFO | RX_CLRDATATOG);
     write16(RXCSR, RX_FLUSHFIFO | RX_CLRDATATOG);
     write8(INDEX, 0);
-}
-
-static unsigned configuration(unsigned char *out, bool high, unsigned char type) {
-    static const unsigned char head[18] = {9, 2, 32, 0, 1, 1, 0, 0x80, 250,
-                                           9, 4, 0, 0, 2, 0xff, 0x42, 0x03, 0};
-    unsigned packet = high ? 512 : 64;
-    memcpy(out, head, sizeof(head));
-    out[1] = type;
-    for (unsigned i = 0; i < 2; ++i) {
-        unsigned char *e = out + sizeof(head) + 7 * i;
-        e[0] = 7;
-        e[1] = 5;
-        e[2] = i ? 0x01 : 0x81;
-        e[3] = 2;
-        e[4] = (unsigned char)packet;
-        e[5] = (unsigned char)(packet >> 8);
-        e[6] = 0;
-    }
-    return 32;
-}
-
-/* A descriptor in usb.control: its size, or 0 for none. */
-static unsigned descriptor(uint16_t value) {
-    unsigned char *out = usb.control, index = (unsigned char)value;
-    switch (value >> 8) {
-    case 1:
-        memcpy(out, device_descriptor, sizeof(device_descriptor));
-        return sizeof(device_descriptor);
-    case 2:
-        return configuration(out, high_speed(), 2);
-    case 3:
-        if (!index) {
-            static const unsigned char languages[4] = {4, 3, 0x09, 0x04}; /* US English */
-            memcpy(out, languages, sizeof(languages));
-            return sizeof(languages);
-        }
-        if (index <= sizeof(strings) / sizeof(strings[0])) {
-            const char *s = strings[index - 1];
-            unsigned n = 0;
-            for (; s[n]; ++n) {
-                out[2 + 2 * n] = (unsigned char)s[n];
-                out[3 + 2 * n] = 0;
-            }
-            out[0] = (unsigned char)(2 + 2 * n);
-            out[1] = 3;
-            return 2 + 2 * n;
-        }
-        return 0;
-    case 6:
-        memcpy(out, qualifier_descriptor, sizeof(qualifier_descriptor));
-        return sizeof(qualifier_descriptor);
-    case 7:
-        return configuration(out, !high_speed(), 7);
-    default:
-        return 0;
-    }
 }
 
 /* Endpoint 0's CSR once it no longer has `bits`, within CONTROL_US. */
@@ -401,7 +339,7 @@ static void setup(void) {
     if ((type & 0x80) && length) {
         unsigned size = 0;
         if (request == GET_DESCRIPTOR && type == 0x80) {
-            size = descriptor(value);
+            size = fastboot_descriptor(value, high_speed(), usb.control, sizeof(usb.control));
         } else if (request == GET_STATUS && (type == 0x80 || (type == 0x81 && !index) ||
                                              (type == 0x82 && (bulk || !index)))) {
             usb.control[0] = usb.control[1] = 0; /* bus-powered; nothing halted */
@@ -556,7 +494,7 @@ static void command(void) {
     write8(INDEX, 0);
     abandon();
     usb.command[n] = 0;
-    gta7lite_fastboot(usb.command, n);
+    fastboot_command(usb.command, n);
 }
 
 void gta7lite_usb_poll(void) {

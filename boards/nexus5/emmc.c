@@ -6,14 +6,16 @@
 
 /* The Nexus 5's eMMC on SDCC1, as Linux's qcom-msm8974.dtsi and the
  * hammerhead device tree describe it (sdhc_1: 8 bits, its I/O at PM8941
- * S3's 1.8 V), the controller run by sdhci.c. The stock bootloader hands it
- * over with HC mode off and the SDHCI registers as after a reset (bus power
- * and card clock off, one bit wide), so the card is started afresh as
- * Linux's MMC core starts an eMMC (drivers/mmc/core/mmc.c, mmc_ops.c): CMD0
- * back to idle, CMD1 until it is ready (sector addressing, its 1.8 V I/O),
- * its CID, address 2, selected; its EXT_CSD, then high-speed timing at
- * 50 MHz and an 8-bit bus, checked by reading the EXT_CSD again. Sectors
- * move one at a time (CMD17, CMD24, then CMD13 until programming ends); the
+ * S3's 1.8 V), the controller run by boards/qcom/sdhci.c. The stock
+ * bootloader hands it over with HC mode off and the SDHCI registers as
+ * after a reset (bus power and card clock off, one bit wide), so the card
+ * is started afresh as Linux's MMC core starts an eMMC
+ * (drivers/mmc/core/mmc.c, mmc_ops.c): CMD0 back to idle, CMD1 until it is
+ * ready (sector addressing, its 1.8 V I/O), its CID, address 2, selected;
+ * its EXT_CSD, then high-speed timing at 50 MHz and an 8-bit bus, checked
+ * by reading the EXT_CSD again. A read of several sectors is one CMD18,
+ * which the host stops with its own CMD12, and of one sector CMD17; writes
+ * move a sector at a time (CMD24, then CMD13 until programming ends). The
  * card's cache stays off, so a written sector is on the flash. */
 
 enum {
@@ -40,6 +42,7 @@ static struct sdhci host = {
     .pads_mask = 0x7fff,
     .pads_value = (0u << 13 | 7u << 6) | (3u << 11 | 4u << 3) | (3u << 9 | 4u << 0),
     .busy_us = PROGRAM_US,
+    .auto_stop = true,
     .yield = kernel_io_wait,
 };
 
@@ -140,6 +143,18 @@ static bool read_sector(uint64_t sector, void *data) {
     return done || stop();
 }
 
+/* CMD18: count sectors in one transfer, which the host stops with CMD12
+ * (one sector is CMD17's: CMD18 would leave the card sending). */
+static bool read_sectors(uint64_t sector, void *data, unsigned count) {
+    if (count == 1) return read_sector(sector, data);
+    if (!ready || busy || !count || sector >= sector_count || count > sector_count - sector)
+        return false;
+    busy = true;
+    bool done = sdhci_data(&host, 18, (uint32_t)sector, R1_ERRORS, data, 512, count, false);
+    busy = false;
+    return done || stop();
+}
+
 static bool write_sector(uint64_t sector, const void *data) {
     if (!ready || busy || sector >= sector_count) return false;
     busy = true;
@@ -164,6 +179,7 @@ static bool flush(void) {
 const struct emmc_card emmc_card = {.adopt = adopt,
                                     .serving = serving,
                                     .read = read_sector,
+                                    .read_many = read_sectors,
                                     .write = write_sector,
                                     .flush = flush,
                                     .loader_sectors = 0,

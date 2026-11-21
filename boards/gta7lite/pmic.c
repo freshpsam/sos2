@@ -164,7 +164,8 @@ bool gta7lite_connsys_supplies(void) {
 
 bool gta7lite_connsys_crystal_supply(void) {
     return gta7lite_pmic_init() && pmic_write(LDO_VCN28_OP_EN_SET, VCN28_HW_MODE) &&
-           pmic_write(LDO_VCN28_OP_CFG_CLR, VCN28_HW_MODE) && ldo_on(LDO_VCN28_CON0, LDO_VCN28_CON1);
+           pmic_write(LDO_VCN28_OP_CFG_CLR, VCN28_HW_MODE) &&
+           ldo_on(LDO_VCN28_CON0, LDO_VCN28_CON1);
 }
 
 bool gta7lite_power_key_pressed(void) {

@@ -92,8 +92,7 @@ void GPUCompositor::releaseDetached() {
 Ref<CoordinatedImageBackingStore> GPUCompositor::imageBackingStore(Ref<NativeImage> &&image) {
     auto id = image->uniqueID();
     return m_imageBackingStores
-        .ensure(id,
-                [&] { return CoordinatedImageBackingStore::create(WTF::move(image)); })
+        .ensure(id, [&] { return CoordinatedImageBackingStore::create(WTF::move(image)); })
         .iterator->value;
 }
 
@@ -135,9 +134,9 @@ void GPUCompositor::resetSkiaState() {
         auto *version = reinterpret_cast<const char *>(glGetString(GL_VERSION));
         return version && !strncmp(version, "OpenGL ES ", 10) && version[10] >= '3';
     }();
-    static auto bindSampler = gles3
-        ? reinterpret_cast<void (*)(GLuint, GLuint)>(eglGetProcAddress("glBindSampler"))
-        : nullptr;
+    static auto bindSampler =
+        gles3 ? reinterpret_cast<void (*)(GLuint, GLuint)>(eglGetProcAddress("glBindSampler"))
+              : nullptr;
     if (bindSampler)
         for (GLuint unit = 0; unit < 4; ++unit) bindSampler(unit, 0);
     // These are the GLES instancing entry points Skia itself uses, including

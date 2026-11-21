@@ -30,8 +30,10 @@
  * and one of its steps, process_step, can hold CPU 0 for tens of ms (a
  * service worker job, such as a jitterentropy chunk or a PBKDF2 hash). So a
  * tap starts at the next poll, and the loop waits the pulse out, still
- * publishing the display, before process_step: no pulse spans it. A stop
- * that fails is tried again every 20 ms until it works. */
+ * publishing the display, before process_step: no pulse spans it, nor the
+ * brake that follows it where the motor has one (the Nexus 5's, driving it
+ * backwards for 15 ms), which must end on time. A stop that fails is tried
+ * again every 20 ms until it works. */
 enum { TAP_US = 15000, TAP_MV = 3000, RETRY_US = 20000 };
 #ifdef SOS2_BOARD_REDMI2
 _Static_assert(TAP_MV >= REDMI2_VIBRATOR_MIN_MV && TAP_MV <= REDMI2_VIBRATOR_MAX_MV &&
@@ -40,8 +42,9 @@ _Static_assert(TAP_MV >= REDMI2_VIBRATOR_MIN_MV && TAP_MV <= REDMI2_VIBRATOR_MAX
 #endif
 
 /* requested: a tap waits for the next poll; running: a pulse is on until
- * due; stuck: a stop failed, to be tried again at due. */
-static bool ready, requested, running, stuck;
+ * due; braking: its brake is, until due; stuck: a stop failed, to be tried
+ * again at due. */
+static bool ready, requested, running, braking, stuck;
 static uint64_t due;
 
 static bool run(bool on) {
@@ -55,8 +58,23 @@ static bool run(bool on) {
 #endif
 }
 
+/* After a pulse: how long the motor brakes before it stops, 0 for none. */
+static uint32_t brake(void) {
+#ifdef SOS2_BOARD_NEXUS5
+    return nexus5_vibrator_brake();
+#else
+    return 0;
+#endif
+}
+
+static void stop(uint64_t now) {
+    running = braking = false;
+    stuck = !run(false);
+    if (stuck) due = now + RETRY_US;
+}
+
 void haptics_init(void) {
-    requested = running = stuck = false;
+    requested = running = braking = stuck = false;
 #ifdef SOS2_BOARD_REDMI2
     ready = redmi2_vibrator_init(TAP_MV);
 #elif defined(SOS2_BOARD_NEXUS5)
@@ -77,13 +95,18 @@ void haptics_tap(void) {
 }
 
 bool haptics_poll(void) {
-    if (!running && !stuck && !requested) return false;
+    if (!running && !braking && !stuck && !requested) return false;
     uint64_t now = time_us();
-    if (running || stuck) {
-        if (now < due) return running;
-        running = false;
-        stuck = !run(false);
-        if (stuck) due = now + RETRY_US;
+    if (running || braking || stuck) {
+        if (now < due) return running || braking;
+        uint32_t us = running ? brake() : 0;
+        if (us) {
+            running = false;
+            braking = true;
+            due = now + us;
+            return true;
+        }
+        stop(now);
         return false;
     }
     if (!requested) return false;
@@ -95,18 +118,18 @@ bool haptics_poll(void) {
     return true;
 }
 
+/* At once, without the brake. */
 void haptics_stop(void) {
     requested = false;
-    if (running) due = time_us();
-    (void)haptics_poll();
+    if (running || braking) stop(time_us());
 }
 
-bool haptics_quiet(void) { return !running && !stuck; }
+bool haptics_quiet(void) { return !running && !braking && !stuck; }
 
 /* Once: a fault in this stop panics again. */
 void haptics_panic(void) {
     static bool tried;
-    if (tried || (!running && !stuck)) return;
+    if (tried || (!running && !braking && !stuck)) return;
     tried = true;
     (void)run(false);
 }

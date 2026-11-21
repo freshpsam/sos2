@@ -212,7 +212,10 @@ static void vm_switch(const struct vm_space *space) {
 
 static bool enable_translation(bool secondary) {
     uint32_t control = arm_cache_control(), zero = 0, domain = 1, cpacr = 0x00f00000;
-    if (control & 5) return false; /* Boot contract: MMU and data cache off. */
+    /* Boot contract: MMU and data cache off; on CPU 0 translation may be on
+     * already, behind the Nexus 5's early tables (arch/arm/boot_cache.c),
+     * which map the kernel where these do. */
+    if ((control & 4) || ((control & 1) && (secondary || !arm_boot_cache_early()))) return false;
 #ifndef SOS2_BOARD_NEXUS5
     /* ARM32 A15/A53 ACTLR.SMP, matching the vendor's __v7_ca53mp_setup.
      * Shared user mappings participate in CPU coherency; DMA is kept separate.
@@ -255,10 +258,10 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
     const struct arm_machine *machine = arm_machine_get();
     uintptr_t start = (uintptr_t)__image_start, end = (uintptr_t)__image_end;
     uintptr_t pool_start = (uintptr_t)__page_pool_start, pool_end = (uintptr_t)__page_pool_end;
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
+#ifdef SOS2_PHONE
     if (runtime_files_size()) {
         size_t size;
-        if (!redmi2_browser_arena(d, dtb, start, end, &pool_start, &size)) return false;
+        if (!phone_browser_arena(d, dtb, start, end, &pool_start, &size)) return false;
         pool_end = pool_start + size;
     }
 #endif
@@ -282,7 +285,7 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
         if ((r->start < end && start < finish) || (r->start < pool_end && pool_start < finish))
             return false;
     }
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
+#ifdef SOS2_PHONE
     uintptr_t fb = (uintptr_t)d->framebuffer.pixels;
     uint64_t fb_end = (uint64_t)fb + d->framebuffer_size;
     if (!d->has_framebuffer || !d->framebuffer_size || d->framebuffer_size > UINT32_MAX ||
@@ -319,7 +322,7 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
         const struct arm_mapping *r = &machine->devices[i];
         if (!kernel_map(r->start, r->size, DEVICE | KERNEL_RW | XN)) return false;
     }
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
+#ifdef SOS2_PHONE
     if (!kernel_map(fb, (uint32_t)d->framebuffer_size, NORMAL | KERNEL_RW | XN)) return false;
 #endif
     kernel_unmap((uintptr_t)__stack_guard);
@@ -504,6 +507,7 @@ void *vm_resolve(const struct vm_space *s, user_ptr address, unsigned permission
  * (the SDK splits longer ranges). */
 int32_t vm_icache_sync(const struct vm_space *s, user_ptr address, uint32_t size) {
     enum { SYNC_MAX = 256 * 1024 };
+
     if (!size) return 0;
     if (!s || size > SYNC_MAX || address < USER_JIT_BASE || address >= USER_JIT_END ||
         size > USER_JIT_END - address)
@@ -520,7 +524,7 @@ int32_t vm_icache_sync(const struct vm_space *s, user_ptr address, uint32_t size
     __asm__ volatile("dsb ish" ::: "memory");
     for (user_ptr at = address & ~(code_line - 1); at < end; at += code_line)
         __asm__ volatile("mcr p15, 0, %0, c7, c5, 1" : : "r"(at) : "memory"); /* ICIMVAU */
-    __asm__ volatile("mcr p15, 0, %0, c7, c1, 6\n dsb ish\n isb" /* BPIALLIS */
+    __asm__ volatile("mcr p15, 0, %0, c7, c1, 6\n dsb ish\n isb"              /* BPIALLIS */
                      :
                      : "r"(0)
                      : "memory");

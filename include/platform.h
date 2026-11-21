@@ -8,9 +8,13 @@
 static inline uint32_t mmio_read32(uintptr_t p) { return *(volatile uint32_t *)p; }
 
 static inline void mmio_write32(uintptr_t p, uint32_t v) { *(volatile uint32_t *)p = v; }
+
 static inline uint16_t mmio_read16(uintptr_t p) { return *(volatile uint16_t *)p; }
+
 static inline void mmio_write16(uintptr_t p, uint16_t v) { *(volatile uint16_t *)p = v; }
+
 static inline uint8_t mmio_read8(uintptr_t p) { return *(volatile uint8_t *)p; }
+
 static inline void mmio_write8(uintptr_t p, uint8_t v) { *(volatile uint8_t *)p = v; }
 struct framebuffer;
 void platform_set_framebuffer(struct framebuffer *fb);

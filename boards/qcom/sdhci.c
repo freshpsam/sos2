@@ -1,11 +1,13 @@
 #include "sdhci.h"
-#include "nexus5.h"
 #include "platform.h"
 
-/* MSM8974's SD controllers: an SDHCI 3.0 (HOST_VERSION 0x3802) behind
- * Qualcomm's wrapper, as Linux's sdhci-msm.c ("qcom,sdhci-msm-v4") runs it,
- * polled in PIO. Started cold: the bootloader leaves SDCC2 off, and SDCC1
- * with HC mode off and its SDHCI registers as after a reset. HC mode goes on
+/* Qualcomm's SD controllers, an SDHCI 3.0 behind Qualcomm's wrapper, as
+ * Linux's sdhci-msm.c ("qcom,sdhci-msm-v4") runs them, polled in PIO: the
+ * Redmi 2's MSM8916 SDCC1, which takes over lk2nd's controller
+ * (boards/redmi2/emmc.c), and the Nexus 5's MSM8974 SDCC1 and SDCC2
+ * (HOST_VERSION 0x3802), which sdhci_start brings up cold: the bootloader
+ * leaves SDCC2 off, and SDCC1 with HC mode off and its SDHCI registers as
+ * after a reset. HC mode goes on
  * with software resets kept off the feedback clock's domain, which samples
  * the card's responses; the vendor register goes to its power-on value with
  * the I/O pads switched to 1.8 V (both buses' I/O supply is PM8941 S3);
@@ -62,6 +64,8 @@ enum {
     WRITE_READY = 16,
     READ_READY = 32,
     ERRORS = 0xffff8000u,
+    ERROR_SUMMARY = 0x8000u,
+    LINE_ERRORS = 0x000f8000u, /* command timeout, CRC, end bit, index */
     GPLL0_VOTE = 0xfc401480,
     COMMAND_US = 100000,
     DATA_US = 500000,
@@ -84,10 +88,20 @@ static void wr(uintptr_t address, uint32_t value, unsigned width) {
     barrier();
 }
 
+uint32_t sdhci_read(uintptr_t address, unsigned width) { return rd(address, width); }
+
+void sdhci_write(uintptr_t address, uint32_t value, unsigned width) { wr(address, value, width); }
+
 static bool stop(struct sdhci *h) {
     h->failed = true;
     return false;
 }
+
+static uint64_t command_limit(const struct sdhci *h) {
+    return h->command_us ? h->command_us : COMMAND_US;
+}
+
+static uint64_t data_limit(const struct sdhci *h) { return h->data_us ? h->data_us : DATA_US; }
 
 /* Confirms what the wrapper asks after a power or voltage change (bus on or
  * off, I/O low or high), as sdhci_msm_handle_pwr_irq does: the request
@@ -122,15 +136,17 @@ static bool wait_branch(uintptr_t cbcr) {
 
 /* The card's clock at GCC, as clk-rcg2 sets it from the frequency table:
  * 400 kHz is the 19.2 MHz crystal / 12 with M/N 1/4 in dual-edge mode;
- * 50 MHz is GPLL0 (600 MHz) / 12. */
-static bool clock_rate(struct sdhci *h, bool fast) {
+ * 50 MHz is GPLL0 / fast_divider (MSM8974's 600 MHz / 12, MSM8916's 800 MHz
+ * / 16). */
+bool sdhci_clock_rate(struct sdhci *h, bool fast) {
     uintptr_t source = h->clock_source;
     if (!fast) {
         wr(source + 8, (rd(source + 8, 4) & ~0xffu) | 1, 4);
         wr(source + 12, (rd(source + 12, 4) & ~0xffu) | (~3u & 0xff), 4);
         wr(source + 16, (rd(source + 16, 4) & ~0xffu) | (~4u & 0xff), 4);
     }
-    uint32_t config = fast ? 1u << 8 | (2 * 12 - 1) : 2u << 12 | (2 * 12 - 1);
+    unsigned divider = h->fast_divider ? h->fast_divider : 12;
+    uint32_t config = fast ? 1u << 8 | (2 * divider - 1) : 2u << 12 | (2 * 12 - 1);
     wr(source + 4, (rd(source + 4, 4) & ~0x371fu) | config, 4);
     wr(source, rd(source, 4) | 1, 4);
     for (uint64_t start = time_us(); rd(source, 4) & 1;)
@@ -142,7 +158,7 @@ static bool clock_rate(struct sdhci *h, bool fast) {
  * for at least the card's 74 cycles before a command. */
 bool sdhci_clock(struct sdhci *h, bool fast) {
     wr(h->hc + CLOCK, rd(h->hc + CLOCK, 2) & ~4u, 2);
-    if (!clock_rate(h, fast)) return false;
+    if (!sdhci_clock_rate(h, fast)) return false;
     h->slow = !fast;
     for (uint64_t start = time_us(); !(rd(h->hc + CLOCK, 2) & 2);)
         if (time_us() - start >= 10000) return stop(h);
@@ -157,7 +173,9 @@ void sdhci_bus(struct sdhci *h, unsigned bits, bool high_speed) {
     wr(h->hc + HOST1, host, 1);
 }
 
-static uint64_t busy_limit(const struct sdhci *h) { return h->busy_us ? h->busy_us : DATA_US; }
+static uint64_t busy_limit(const struct sdhci *h) {
+    return h->busy_us ? h->busy_us : data_limit(h);
+}
 
 static bool wait_status(struct sdhci *h, uint32_t mask, uint64_t limit) {
     uint64_t start = time_us();
@@ -177,7 +195,7 @@ static void recover(struct sdhci *h) {
     clear(h, 0xffffffffu);
     wr(h->hc + RESET, 6, 1);
     for (uint64_t start = time_us(); rd(h->hc + RESET, 1) & 6;)
-        if (time_us() - start >= COMMAND_US) {
+        if (time_us() - start >= command_limit(h)) {
             stop(h);
             return;
         }
@@ -185,18 +203,36 @@ static void recover(struct sdhci *h) {
 
 static bool idle(struct sdhci *h, uint32_t lines) {
     for (uint64_t start = time_us(); rd(h->hc + PRESENT, 4) & lines;)
-        if (time_us() - start >= COMMAND_US) return stop(h);
+        if (time_us() - start >= command_limit(h)) return stop(h);
     return true;
+}
+
+/* A command's registers, in the order lk2nd writes them: what it moves
+ * (blocks of size, count of them, the transfer's direction, a block count
+ * and, where the host stops them itself, the stop for several), its
+ * argument, then the command itself. */
+static void issue(struct sdhci *h, unsigned index, uint32_t argument, unsigned type, unsigned size,
+                  unsigned count, bool write) {
+    clear(h, 0xffffffffu);
+    wr(h->hc + BLOCK_SIZE, size, 2);
+    wr(h->hc + BLOCK_COUNT, count, 2);
+    wr(h->hc + TRANSFER_MODE,
+       (size && !write ? 16 : 0) | (count > 1 ? 2 | 32 | (h->auto_stop ? 4 : 0) : 0), 2);
+    wr(h->hc + ARGUMENT, argument, 4);
+    wr(h->hc + COMMAND, index << 8 | type, 2);
+}
+
+/* The lines a command waits on: the command line, and the data line too
+ * for a busy response or when the host asks for it. */
+static uint32_t lines(const struct sdhci *h, unsigned type) {
+    return (type & 3) == 3 || h->wait_data_line ? 3 : 1;
 }
 
 bool sdhci_command(struct sdhci *h, unsigned index, uint32_t argument, unsigned type,
                    uint32_t errors, uint32_t *response) {
-    if (h->failed || !idle(h, (type & 3) == 3 ? 3 : 1)) return false;
-    clear(h, 0xffffffffu);
-    wr(h->hc + ARGUMENT, argument, 4);
-    wr(h->hc + TRANSFER_MODE, 0, 2);
-    wr(h->hc + COMMAND, index << 8 | type, 2);
-    if (!wait_status(h, COMMAND_DONE, COMMAND_US)) {
+    if (h->failed || !idle(h, lines(h, type))) return false;
+    issue(h, index, argument, type, 0, 0, false);
+    if (!wait_status(h, COMMAND_DONE, command_limit(h))) {
         recover(h);
         return false;
     }
@@ -216,19 +252,18 @@ bool sdhci_command(struct sdhci *h, unsigned index, uint32_t argument, unsigned 
 bool sdhci_data(struct sdhci *h, unsigned index, uint32_t argument, uint32_t errors, uint8_t *data,
                 unsigned size, unsigned count, bool write) {
     if (h->failed || !size || size > 512 || !count || count > 511 || !idle(h, 3)) return false;
-    clear(h, 0xffffffffu);
-    wr(h->hc + BLOCK_SIZE, size, 2);
-    wr(h->hc + BLOCK_COUNT, count, 2);
-    wr(h->hc + ARGUMENT, argument, 4);
-    wr(h->hc + TRANSFER_MODE, 2 | (write ? 0 : 16) | (count > 1 ? 32 : 0), 2);
-    wr(h->hc + COMMAND, index << 8 | 0x3a, 2);
-    if (!wait_status(h, COMMAND_DONE, COMMAND_US)) goto failed;
+    issue(h, index, argument, 0x3a, size, count, write);
+    if (!wait_status(h, COMMAND_DONE, command_limit(h))) goto failed;
     uint32_t response = rd(h->hc + RESPONSE, 4);
     clear(h, COMMAND_DONE);
     if (response & errors) goto failed;
     for (unsigned block = 0; block < count; ++block) {
         unsigned ready_bit = write ? WRITE_READY : READ_READY;
-        if (!wait_status(h, ready_bit, DATA_US)) goto failed;
+        if (!wait_status(h, ready_bit, data_limit(h))) goto failed;
+        /* The buffer's own ready bit (write or read enabled), where the host
+         * checks it too. */
+        if (h->check_buffer && !(rd(h->hc + PRESENT, 4) & (write ? 1u << 10 : 1u << 11)))
+            goto failed;
         clear(h, ready_bit);
         uint8_t *p = data + block * size;
         if (!((uintptr_t)p & 3) && !(size & 3)) {
@@ -252,12 +287,45 @@ bool sdhci_data(struct sdhci *h, unsigned index, uint32_t argument, uint32_t err
         }
     }
     /* A write ends once the card has programmed it, its busy released. */
-    if (!wait_status(h, TRANSFER_DONE, write ? busy_limit(h) : DATA_US)) goto failed;
+    if (!wait_status(h, TRANSFER_DONE, write ? busy_limit(h) : data_limit(h))) goto failed;
     clear(h, TRANSFER_DONE);
     return true;
 failed:
     recover(h);
     return false;
+}
+
+/* The host stopped for good: sdhci_ask's -1. */
+static int abandon(struct sdhci *h) {
+    stop(h);
+    return -1;
+}
+
+int sdhci_ask(struct sdhci *h, unsigned index, uint32_t argument, unsigned type,
+              uint32_t *response) {
+    if (h->failed || !idle(h, 3)) return -1;
+    issue(h, index, argument, type, 0, 0, false);
+    uint32_t status;
+    uint64_t start = time_us();
+    while (!((status = rd(h->hc + STATUS, 4)) & (ERROR_SUMMARY | COMMAND_DONE)))
+        if (time_us() - start >= command_limit(h)) return abandon(h);
+    if ((status & ERROR_SUMMARY) && !(status & ERRORS & ~LINE_ERRORS)) {
+        /* Command-line errors alone (timeout, CRC, end bit, index): nothing
+         * came back; the lines reset for the next command. */
+        clear(h, 0xffffffffu);
+        wr(h->hc + RESET, 6, 1);
+        for (start = time_us(); rd(h->hc + RESET, 1) & 6;)
+            if (time_us() - start >= command_limit(h)) return abandon(h);
+        return 0;
+    }
+    if (status & ERRORS) return abandon(h);
+    *response = rd(h->hc + RESPONSE, 4);
+    clear(h, COMMAND_DONE);
+    if ((type & 3) == 3) {
+        if (!wait_status(h, TRANSFER_DONE, busy_limit(h))) return abandon(h);
+        clear(h, TRANSFER_DONE);
+    }
+    return 1;
 }
 
 /* The controller from cold: GCC's clocks (GPLL0 voted, the AHB and card
@@ -272,7 +340,7 @@ bool sdhci_start(struct sdhci *h) {
     h->slow = false;
     wr(GPLL0_VOTE, rd(GPLL0_VOTE, 4) | 1, 4);
     wr(h->ahb_cbcr, rd(h->ahb_cbcr, 4) | 1, 4);
-    if (!clock_rate(h, false)) return false;
+    if (!sdhci_clock_rate(h, false)) return false;
     wr(h->apps_cbcr, rd(h->apps_cbcr, 4) | 1, 4);
     if (!wait_branch(h->ahb_cbcr) || !wait_branch(h->apps_cbcr)) return stop(h);
     wr(h->pads, (rd(h->pads, 4) & ~h->pads_mask) | h->pads_value, 4);

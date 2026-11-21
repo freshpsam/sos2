@@ -77,9 +77,10 @@ svc_entry:
      * TrustZone protects, which answers with a watchdog reset (the
      * bootloader then reports bootreason=wdog_reset; 2026-11-20, which
      * builds did it followed code layout). There the instruction cache and
-     * branch prediction wait for translation: boot_cache.c turns them on
-     * with its MMU for the engine's decoding, about 3 s in, and vm_init
-     * (arch/arm/mmu.c) for good. */
+     * branch prediction wait for translation, which arm_early_mmu
+     * (arch/arm/boot_cache.c) turns on once BSS is cleared, behind tables
+     * where only the kernel's text is executable, until vm_init
+     * (arch/arm/mmu.c) installs the kernel's own. */
     mov     r1, #0
     dsb     sy
     mcr     p15, 0, r1, c7, c5, 0   @ ICIALLU
@@ -121,7 +122,11 @@ svc_entry:
     bhs     2f
     stmia   r0!, {r3-r6}
     b       1b
-2:  mov     r0, r8
+2:
+#ifdef SOS2_BOARD_NEXUS5
+    bl      arm_early_mmu           @ the instruction cache, behind translation
+#endif
+    mov     r0, r8
     bl      kernel_main
     b       unsupported_entry
 

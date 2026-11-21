@@ -100,6 +100,43 @@ static void heard_ap(struct wifi_station *s, uint64_t now) {
     s->probe_attempts = 0;
 }
 
+/* The access point gone, its reason kept through cleanup and backoff. */
+static void disconnected(struct wifi_station *s, unsigned reason, uint64_t now) {
+    static const char prefix[] = "access point disconnected: reason ";
+    unsigned at = sizeof(prefix) - 1;
+    char digits[5];
+    unsigned count = 0;
+    memcpy(s->disconnect_detail, prefix, at);
+    do {
+        digits[count++] = (char)('0' + reason % 10);
+        reason /= 10;
+    } while (reason);
+    while (count) s->disconnect_detail[at++] = digits[--count];
+    s->disconnect_detail[at] = 0;
+    wifi_station_reconnect(s, s->disconnect_detail, now);
+}
+
+static bool listening(const struct wifi_station *s) {
+    return s && s->state != WIFI_OFF && s->state != WIFI_FAILED && s->state != WIFI_RECOVER &&
+           s->state != WIFI_BACKOFF;
+}
+
+void wifi_station_authenticated(struct wifi_station *s, uint64_t now) {
+    if (listening(s) && s->state == WIFI_AUTH && s->sent) enter(s, WIFI_ASSOC, now);
+}
+
+void wifi_station_associated(struct wifi_station *s, uint64_t now) {
+    if (listening(s) && s->state == WIFI_ASSOC && s->sent) enter(s, WIFI_LINKING, now);
+}
+
+void wifi_station_disconnected(struct wifi_station *s, unsigned reason, uint64_t now) {
+    if (listening(s)) disconnected(s, reason, now);
+}
+
+void wifi_station_heard(struct wifi_station *s, uint64_t now) {
+    if (listening(s) && s->state == WIFI_ONLINE) heard_ap(s, now);
+}
+
 void wifi_station_beacon_missed(struct wifi_station *s, uint64_t now) {
     if (!s || s->state != WIFI_ONLINE || s->probe_deadline || now > UINT64_MAX - 3000000) return;
     /* Stock probes on heartbeat loss before tearing down the association.
@@ -578,21 +615,10 @@ void wifi_station_receive_checked(struct wifi_station *s, const unsigned char *p
             return;
         }
         if ((fc & 0x4000) && !verified_management(s, p, n, rx)) return;
-        /* Retain the AP's reason through cleanup/backoff. An OTA ACK alone
-         * cannot distinguish an accepted data packet from decryption or
-         * handshake failure at the AP. Apply the security checks above first. */
-        static const char prefix[] = "access point disconnected: reason ";
-        unsigned at = sizeof(prefix) - 1, reason = le16(p + 24);
-        char digits[5];
-        unsigned count = 0;
-        memcpy(s->disconnect_detail, prefix, at);
-        do {
-            digits[count++] = (char)('0' + reason % 10);
-            reason /= 10;
-        } while (reason);
-        while (count) s->disconnect_detail[at++] = digits[--count];
-        s->disconnect_detail[at] = 0;
-        wifi_station_reconnect(s, s->disconnect_detail, now);
+        /* An OTA ACK alone cannot distinguish an accepted data packet from
+         * decryption or handshake failure at the AP. Apply the security
+         * checks above first. */
+        disconnected(s, le16(p + 24), now);
         return;
     }
     if (type == 0xd0 && s->state == WIFI_ONLINE && s->rsn.pmf) {

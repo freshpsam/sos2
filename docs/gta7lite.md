@@ -141,7 +141,8 @@ Both have been tried.
 ## USB link
 
 While SOS2 runs, its USB port is a fastboot device for the computer it is
-plugged into (boards/gta7lite/usb.c and fastboot.c). It has fastboot's
+plugged into (boards/gta7lite/usb.c and fastboot.c, with the protocol the
+Nexus 5 shares in kernel/usb/fastboot.c). It has fastboot's
 generic IDs, 18d1:d00d, which Android's udev rules give the desktop user, so
 the fastboot tool needs no root. The host sees it once the desktop runs; a
 port that failed to start says why in the desktop's status lines.

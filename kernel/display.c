@@ -3,7 +3,7 @@
 /* QEMU's displays: virtio-gpu, else ramfb. The devices keep the framebuffer
  * their loader set up, the Redmi 2 with its Adreno; the Nexus 5's panel
  * shows it only as frames sent to it (boards/nexus5/display.c). */
-#if !defined(SOS2_BOARD_REDMI2) && !defined(SOS2_BOARD_GTA7LITE) && !defined(SOS2_BOARD_NEXUS5)
+#ifndef SOS2_DEVICE
 #define QEMU_DISPLAY 1
 #endif
 #ifdef SOS2_BOARD_REDMI2
@@ -26,7 +26,7 @@ bool display_init(const struct platform_devices *devices, struct framebuffer *ou
     (void)devices;
     (void)out;
     return false; /* The phone uses its verified handoff. */
-#elif defined(SOS2_BOARD_GTA7LITE) || defined(SOS2_BOARD_NEXUS5)
+#elif defined(SOS2_LOADER_FRAMEBUFFER)
     /* The bootloader's framebuffer, from the verified handoff; no GPU. */
     screen = out;
     *out = devices->framebuffer;
@@ -96,6 +96,9 @@ void display_blank(void) {
      * may be waiting for its own command. */
     if (!screen) return;
     gfx_rect(screen, 0, 0, (int)screen->width, (int)screen->height, 0);
+#ifdef SOS2_BOARD_NEXUS5
+    nexus5_display_damage();
+#endif
 #ifdef QEMU_DISPLAY
     if (gpu && !failed) {
         virtio_gpu_page_view(UINT32_MAX, WEB_HEIGHT);
@@ -111,6 +114,9 @@ bool display_present_region(struct framebuffer *visible, const struct framebuffe
     if (redmi2_adreno_present(visible, source, x, y, width, height)) return true;
 #endif
     if (!gfx_present_scaled_region(visible, source, x, y, width, height)) return false;
+#ifdef SOS2_BOARD_NEXUS5
+    if (visible == screen) nexus5_display_damage();
+#endif
 #ifdef QEMU_DISPLAY
     if (gpu && !failed && visible == screen && width && height && x < source->width &&
         y < source->height) {

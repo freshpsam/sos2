@@ -213,8 +213,7 @@ bool GPURaster::present(std::span<const WebCore::IntRect> rectangles) {
     else {
         for (const auto &rect : rectangles) add(rect);
     }
-    int result =
-        frame.count ? sos2_gpu(USER_GPU_PRESENT, uintptr_t(&frame), sizeof(frame)) : 0;
+    int result = frame.count ? sos2_gpu(USER_GPU_PRESENT, uintptr_t(&frame), sizeof(frame)) : 0;
     if (result < 0) {
         lose();
         return false;

@@ -103,6 +103,16 @@ bool wifi_station_send(struct wifi_station *, const void *, unsigned);
 void wifi_station_stop(struct wifi_station *, const char *);
 void wifi_station_reconnect(struct wifi_station *, const char *, uint64_t);
 void wifi_station_beacon_missed(struct wifi_station *, uint64_t);
+/* A FullMAC radio's news, for a firmware that authenticates, associates and
+ * keeps the link itself (boards/nexus5/wifi.c), in place of the frames a
+ * SoftMAC radio would hear: the station's authentication answered (open
+ * system), its association done (the network joined), the link lost with
+ * the access point's reason, and the network heard while the firmware holds
+ * the link. Each acts only in the state such a frame would. */
+void wifi_station_authenticated(struct wifi_station *, uint64_t);
+void wifi_station_associated(struct wifi_station *, uint64_t);
+void wifi_station_disconnected(struct wifi_station *, unsigned reason, uint64_t);
+void wifi_station_heard(struct wifi_station *, uint64_t);
 /* Set by the radio driver before each poll. Standby leaves the network, as a
  * reconnection does (the station and BSS deleted) but without an error, and
  * holds the rejoin until standby ends; a survey runs to its end. */

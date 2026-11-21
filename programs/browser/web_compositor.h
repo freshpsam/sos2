@@ -142,10 +142,10 @@ private:
     bool m_reached{false};                     // in the tree the last update walked
     RefPtr<WebCore::NativeImage> m_videoFrame; // the frame drawn
     WebCore::FloatRect m_videoBounds;          // surface coordinates, clipped
-    WebCore::TransformationMatrix m_combined; // layer coordinates to the page surface
-    WebCore::FloatRect m_subtreeBounds;       // surface coordinates, clipped
-    WebCore::IntRect m_cover;                 // layer coordinates of m_backing
-    WebCore::IntRect m_wantedCover;           // what this update gives it
+    WebCore::TransformationMatrix m_combined;  // layer coordinates to the page surface
+    WebCore::FloatRect m_subtreeBounds;        // surface coordinates, clipped
+    WebCore::IntRect m_cover;                  // layer coordinates of m_backing
+    WebCore::IntRect m_wantedCover;            // what this update gives it
     SkBitmap m_backing;
     WebCore::Region m_dirty;          // layer coordinates
     bool m_coverMoved{false};         // strips were painted since the last full repaint

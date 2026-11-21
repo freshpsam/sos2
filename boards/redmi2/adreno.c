@@ -135,8 +135,7 @@ static bool clocks(struct adreno_device *g) {
     bits(g, GCC + 0x59000, 1, 1);
     write32(g, GCC + 0x3102c, 0x107);
     bits(g, GCC + 0x31028, 1, 1);
-    if (!wait_bits(g, GCC + 0x59000, 1, 0) || !wait_bits(g, GCC + 0x31028, 1, 0))
-        return fail(g);
+    if (!wait_bits(g, GCC + 0x59000, 1, 0) || !wait_bits(g, GCC + 0x31028, 1, 0)) return fail(g);
     if (!clock_branch(g, 0x59028) || !clock_branch(g, 0x31024) || !clock_branch(g, 0x31040) ||
         !clock_branch(g, 0x59024) || !clock_branch(g, 0x59020))
         return fail(g);
@@ -547,7 +546,7 @@ static void scale(struct adreno_device *g, struct adreno_rect r) {
 /* Caller supplies an immutable complete source snapshot before submission.
  * Damage is in destination pixels, with 16x8 workgroup alignment. */
 static bool adreno_submit(struct adreno_device *g, unsigned x, unsigned y, unsigned width,
-                   unsigned height) {
+                          unsigned height) {
     struct adreno_rect r = {x, y, width, height};
     if (!ready(g) || !rect_valid(r, 720, 1280, true)) return false;
     reserve(g, 512);
@@ -615,8 +614,7 @@ bool adreno_frame(struct adreno_device *g, const struct adreno_copy *c,
         checkpoint(g, ++stage);
     }
     scale(g, output);
-    if (((g->ring_write - start) & (ADRENO_RING_WORDS - 1)) + 8 > 4096)
-        return fail(g);
+    if (((g->ring_write - start) & (ADRENO_RING_WORDS - 1)) + 8 > 4096) return fail(g);
     fence(g);
     return true;
 }
@@ -643,8 +641,7 @@ bool adreno_selftest(struct adreno_device *g) {
                 color = ((color >> 8) & 0xf800) | ((color >> 5) & 0x7e0) | ((color >> 3) & 31);
             if (g->format == PIXEL_ARGB8888) color |= 0xff000000;
             for (unsigned b = 0; b < g->bytes; ++b)
-                if (out[x * g->bytes + b] != (unsigned char)(color >> (8 * b)))
-                    return fail(g);
+                if (out[x * g->bytes + b] != (unsigned char)(color >> (8 * b))) return fail(g);
         }
         for (unsigned x = 720 * g->bytes; x < g->stride; ++x)
             if (out[x] != 0xa5) return fail(g);

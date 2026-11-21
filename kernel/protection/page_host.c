@@ -100,8 +100,10 @@ static struct widget_damage {
 
 static unsigned widget_count;
 static uint64_t keyboard_damage;
+
 /* device_message: why the touch screen, then the USB link, is unavailable. */
 enum { DEVICE_TOUCH, DEVICE_USB, DEVICES };
+
 static char entropy_message[73], device_message[DEVICES][73];
 static bool entropy_ready, storage_ready, storage_session;
 static unsigned selected, current_modifiers;
@@ -148,7 +150,7 @@ enum {
 /* The top bar's buttons: CLOSE over a page and, on the Galaxy Tab A7 Lite
  * and the Nexus 5, which have no Home or Back key, HOME and BACK over a page
  * or the Wi-Fi screen, BACK on the right as on Samsung's navigation bar. */
-#if defined(SOS2_BOARD_GTA7LITE) || defined(SOS2_BOARD_NEXUS5)
+#ifdef SOS2_NAVIGATION_BUTTONS
 enum { NAVIGATION_BUTTONS = 1 };
 #else
 enum { NAVIGATION_BUTTONS = 0 };
@@ -932,7 +934,9 @@ void page_host_touch_status(const char *error) {
     device_status(DEVICE_TOUCH, "TOUCH UNAVAILABLE: ", error);
 }
 
-void page_host_usb_status(const char *error) { device_status(DEVICE_USB, "USB UNAVAILABLE: ", error); }
+void page_host_usb_status(const char *error) {
+    device_status(DEVICE_USB, "USB UNAVAILABLE: ", error);
+}
 
 void page_host_entropy_status(bool ready, const char *error) {
     char text[sizeof(entropy_message)] = {0};

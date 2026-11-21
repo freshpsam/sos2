@@ -108,10 +108,9 @@ void gta7lite_usb_drain(void);
 bool gta7lite_usb_read(void *data, uint32_t size);
 /* VUSB33, the USB PHY's 3.3 V (pmic.c): on, and its output confirmed. */
 bool gta7lite_usb_supply(void);
-/* fastboot (fastboot.c): each command as it arrives. */
-void gta7lite_fastboot(const char *command, unsigned length);
-/* A panic on CPU 0: from now on a flash needs the service worker idle. */
-void gta7lite_fastboot_panic(void);
+/* The tablet's fastboot commands and variables (fastboot.c) on the shared
+ * protocol (kernel/usb/fastboot.c), before the host sees the link. */
+void gta7lite_fastboot_init(void);
 
 /* Wi-Fi. The connectivity subsystem's memory and Wi-Fi's DMA pool, where
  * Linux places the device tree's consys and wifi reservations (16 MiB-
@@ -123,8 +122,9 @@ enum {
     GTA7LITE_WIFI_POOL = 0xbe000000u,
     GTA7LITE_WIFI_POOL_SIZE = 0x300000u
 };
-bool gta7lite_connsys_reserve(struct platform_devices *d, uint64_t kernel_start, uint64_t kernel_end,
-                              uint64_t dtb, uint64_t dtb_size);
+
+bool gta7lite_connsys_reserve(struct platform_devices *d, uint64_t kernel_start,
+                              uint64_t kernel_end, uint64_t dtb, uint64_t dtb_size);
 bool gta7lite_connsys_reserved(void);
 /* The subsystem started up to RF calibration (connsys.c): 0, or why not.
  * yield runs between steps. */

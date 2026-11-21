@@ -28,7 +28,6 @@ enum {
     BRAKE = 2,
     BRAKE_US = 15000,
     WAIT_US = 500,
-    TLMM = 0xfd511000, /* GPIO_CFG n at 0x10 n, GPIO_IN_OUT n at 0x10 n + 4 */
     PWM_PIN = 27,
     ENABLE_PIN = 60,
     GP1_FUNCTION = 6,
@@ -42,14 +41,6 @@ enum {
     SUPPLY_US = 2000,
 };
 
-static uintptr_t pin(unsigned gpio) { return TLMM + 0x10u * gpio; }
-
-static bool wait_clear(uintptr_t address, uint32_t bits) {
-    for (uint64_t start = time_us(); mmio_read32(address) & bits;)
-        if (time_us() - start >= WAIT_US) return false;
-    return true;
-}
-
 /* The PWM at d of PERIOD (the stock driver's M = 1, N and D inverted). */
 static bool duty(unsigned d) {
     mmio_write32(GP1_CFG, DUAL_EDGE_XO_BY_4);
@@ -58,13 +49,13 @@ static bool duty(unsigned d) {
     mmio_write32(GP1_D, ~(d << 1) & 0xff);
     mmio_write32(GP1_CMD, RCG_UPDATE);
     barrier();
-    return wait_clear(GP1_CMD, RCG_UPDATE);
+    return nexus5_wait_bits(GP1_CMD, RCG_UPDATE, false, WAIT_US);
 }
 
 bool nexus5_vibrator_init(void) {
-    mmio_write32(pin(ENABLE_PIN) + 4, 0);
-    mmio_write32(pin(ENABLE_PIN), PIN_OUTPUT);
-    mmio_write32(pin(PWM_PIN), GP1_FUNCTION << 2);
+    mmio_write32(nexus5_gpio(ENABLE_PIN) + 4, 0);
+    mmio_write32(nexus5_gpio(ENABLE_PIN), PIN_OUTPUT);
+    mmio_write32(nexus5_gpio(PWM_PIN), GP1_FUNCTION << 2);
     barrier();
     if (!nexus5_pmic_write(L19_ENABLE, ENABLED)) return false;
     for (uint64_t start = time_us();;) {
@@ -74,18 +65,18 @@ bool nexus5_vibrator_init(void) {
     }
 }
 
+uint32_t nexus5_vibrator_brake(void) { return duty(BRAKE) ? BRAKE_US : 0; }
+
 bool nexus5_vibrator_run(bool on) {
     if (on) {
         if (!duty(FORWARD)) return false;
         mmio_write32(GP1_CBCR, BRANCH_ENABLE);
         barrier();
-        if (!wait_clear(GP1_CBCR, CLOCK_OFF)) return false;
-        mmio_write32(pin(ENABLE_PIN) + 4, PIN_HIGH);
+        if (!nexus5_wait_bits(GP1_CBCR, CLOCK_OFF, false, WAIT_US)) return false;
+        mmio_write32(nexus5_gpio(ENABLE_PIN) + 4, PIN_HIGH);
         return true;
     }
-    bool braked = duty(BRAKE);
-    if (braked) delay_us(BRAKE_US);
-    mmio_write32(pin(ENABLE_PIN) + 4, 0);
+    mmio_write32(nexus5_gpio(ENABLE_PIN) + 4, 0);
     mmio_write32(GP1_CBCR, 0);
     barrier();
     return true;

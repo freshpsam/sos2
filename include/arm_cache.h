@@ -19,4 +19,14 @@ uint32_t arm_cache_control(void);
 bool arm_boot_cache_begin(const struct platform_devices *, uintptr_t dtb, uintptr_t source,
                           size_t source_size, uintptr_t output, size_t output_size);
 void arm_boot_cache_end(void);
+#ifdef SOS2_BOARD_NEXUS5
+/* From the Nexus 5's entry (boot.S), after BSS is cleared: translation, the
+ * instruction cache and branch prediction on behind tables of the kernel
+ * alone (arch/arm/boot_cache.c); the data cache stays off. early: whether
+ * those tables are in use, until vm_init installs the kernel's. */
+void arm_early_mmu(void);
+bool arm_boot_cache_early(void);
+#else
+static inline bool arm_boot_cache_early(void) { return false; }
+#endif
 #endif

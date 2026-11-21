@@ -1,6 +1,7 @@
 /* The eMMC store on the devices (include/emmc_store.h). Every transfer stays
- * inside its region, one sector at a time through the board's driver; a
- * failure stops the card, and both users, for the boot. */
+ * inside its region, through the board's driver: reads several sectors at a
+ * time where it can, writes one at a time; a failure stops the card, and
+ * both users, for the boot. */
 #include "emmc_store.h"
 #include "block.h"
 #include "disk_partition.h"
@@ -16,6 +17,21 @@ static unsigned char bounce[4096] __attribute__((aligned(4)));
 static bool read_sector(void *context, uint64_t sector, void *data) {
     (void)context;
     return emmc_card.read(sector, data);
+}
+
+/* count sectors from sector into out: in transfers of up to 256 where the
+ * driver can and out is word-aligned, else one at a time. */
+static bool read_sectors(uint64_t sector, unsigned char *out, unsigned count) {
+    if (emmc_card.read_many && !((uintptr_t)out & 3)) {
+        for (unsigned n; count; count -= n, sector += n, out += (size_t)n * 512) {
+            n = count < 256 ? count : 256;
+            if (!emmc_card.read_many(sector, out, n)) return false;
+        }
+        return true;
+    }
+    for (unsigned i = 0; i < count; ++i)
+        if (!emmc_card.read(sector + i, out + (size_t)i * 512)) return false;
+    return true;
 }
 
 bool block_init(const struct platform_devices *devices) {
@@ -50,9 +66,8 @@ static bool valid(uint64_t sector, const void *data, unsigned count) {
 }
 
 bool block_read(uint64_t sector, void *data, unsigned count) {
-    if (!valid(sector, data, count)) return false;
-    for (unsigned i = 0; i < count; ++i)
-        if (!emmc_card.read(partition.start + sector + i, bounce + i * 512)) return false;
+    if (!valid(sector, data, count) || !read_sectors(partition.start + sector, bounce, count))
+        return false;
     memcpy(data, bounce, count * 512);
     return true;
 }
@@ -100,12 +115,8 @@ static bool in_region(enum system_region region, uint64_t sector, const void *da
 }
 
 bool system_store_read(enum system_region region, uint64_t sector, void *data, unsigned count) {
-    if (!in_region(region, sector, data, count)) return false;
-    unsigned char *out = data;
-    for (unsigned i = 0; i < count; ++i)
-        if (!emmc_card.read(regions[region].start + sector + i, out + (size_t)i * 512))
-            return false;
-    return true;
+    return in_region(region, sector, data, count) &&
+           read_sectors(regions[region].start + sector, data, count);
 }
 
 bool system_store_write(enum system_region region, uint64_t sector, const void *data,

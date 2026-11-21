@@ -5,9 +5,11 @@
 #include "haptics.h"
 #ifdef SOS2_BOARD_GTA7LITE
 #include "gta7lite.h"
+#include "fastboot.h"
 #endif
 #ifdef SOS2_BOARD_NEXUS5
 #include "nexus5.h"
+#include "fastboot.h"
 #endif
 
 static struct framebuffer *panic_screen;
@@ -74,7 +76,7 @@ _Noreturn void panic(const char *message) {
      * computer can restart the tablet, or flash a fixed system. */
     bool usb = !affinity && !gta7lite_usb_init();
     if (usb) {
-        gta7lite_fastboot_panic();
+        fastboot_panic();
         gta7lite_usb_connect();
     }
     for (;;) {
@@ -87,7 +89,7 @@ _Noreturn void panic(const char *message) {
      * computer can restart the phone into its bootloader. Its waits read the
      * timer, as the vibrator's do. */
     if (!affinity && frequency && nexus5_usb_rescue()) {
-        nexus5_fastboot_panic();
+        fastboot_panic();
         for (;;) nexus5_usb_poll();
     }
     for (;;) arch_wait_event();

@@ -74,8 +74,7 @@ static bool needsBlendFallback(Page &page) {
         auto *local = dynamicDowncast<LocalFrame>(*frame);
         auto *view = local ? local->contentRenderer() : nullptr;
         for (auto *layer = view ? view->layer() : nullptr; layer;) {
-            if (layer->blendMode() != BlendMode::Normal)
-                return true;
+            if (layer->blendMode() != BlendMode::Normal) return true;
             if (auto *child = layer->firstChild()) {
                 layer = child;
                 continue;
@@ -318,7 +317,7 @@ int main() {
 #endif
         // The sos2.jsc= boot argument, such as useDFGJIT=false (LLInt and the
         // baseline JIT) or useJIT=false (LLInt alone); a bad one stops here.
-        if (const char* options = sos2_engine_options())
+        if (const char *options = sos2_engine_options())
             RELEASE_ASSERT(JSC::Options::setOptions(options));
     });
     ScriptController::initializeMainThread();
@@ -392,8 +391,7 @@ int main() {
     gpu = SOS2::GPURaster::create(pageWidth, pageHeight);
     schedule.gpu = gpu.get();
     // No layer exists yet: the first compositing update uses this compositor.
-    if (gpu &&
-        (compositors.gpu = SOS2::GPUCompositor::create(pageWidth, pageHeight))) {
+    if (gpu && (compositors.gpu = SOS2::GPUCompositor::create(pageWidth, pageHeight))) {
         // Layer tiles and canvases may then be GPU buffers.
         ProcessCapabilities::setCanUseAcceleratedBuffers(true);
         // Fixed-position elements get layers of their own, which WebCore moves

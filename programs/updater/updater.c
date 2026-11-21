@@ -425,9 +425,7 @@ static const char *action_label(enum action action) {
 
 /* A device that installs nothing yet but restarts into its bootloader's
  * download mode (the Galaxy Tab A7 Lite) has that in INSTALL SYSTEM's place. */
-static bool download_mode(void) {
-    return !installs() && (info.flags & USER_UPDATE_DOWNLOAD_MODE);
-}
+static bool download_mode(void) { return !installs() && (info.flags & USER_UPDATE_DOWNLOAD_MODE); }
 
 static bool enabled(int target) {
     if (busy()) return false;
@@ -435,8 +433,7 @@ static bool enabled(int target) {
     if (target == PREVIOUS_APPS) return row_offset > 0;
     if (target == NEXT_APPS) return row_offset + ROWS < row_count;
     if (target >= ROW_BUTTON)
-        return target - ROW_BUTTON >= (int)row_offset &&
-               target - ROW_BUTTON < (int)row_count &&
+        return target - ROW_BUTTON >= (int)row_offset && target - ROW_BUTTON < (int)row_count &&
                target - ROW_BUTTON < (int)row_offset + ROWS &&
                rows[target - ROW_BUTTON].action != ACTION_NONE;
     return target == CHECK || target == RESTART;
@@ -569,8 +566,8 @@ static void render_rows(void) {
         char page[24];
         snprintf(page, sizeof(page), "%u / %u", row_offset / ROWS + 1,
                  (row_count + ROWS - 1) / ROWS);
-        gfx_text(&screen, (WIDTH - gfx_text_width(page, 2)) / 2, PAGE_Y + (BUTTON_H - 14) / 2,
-                 page, 2, MUTED);
+        gfx_text(&screen, (WIDTH - gfx_text_width(page, 2)) / 2, PAGE_Y + (BUTTON_H - 14) / 2, page,
+                 2, MUTED);
     }
 }
 
@@ -1061,8 +1058,7 @@ static bool step_request(void) {
         net.headers[net.header_size] = 0;
         char *end = strstr(net.headers, "\r\n\r\n");
         if (!end) {
-            if (net.header_size == HEADERS_MAX)
-                stop(true, "Server headers too long");
+            if (net.header_size == HEADERS_MAX) stop(true, "Server headers too long");
             return net.header_size < HEADERS_MAX;
         }
         size_t used = (size_t)(end + 4 - net.headers) - before;
@@ -1230,12 +1226,9 @@ int main(void) {
     refresh_info();
     /* What ended the last update, such as a boot image left unwritten. */
     if (info.state == USER_UPDATE_FAILED && info.message[0]) say(true, "%s", info.message);
-    else if (info.flags & USER_UPDATE_RESTART_DUE)
-        say(false, "Installed; restart to use it");
-    else if (download_mode())
-        say(false, "Updates cannot install here yet");
-    else if (!installs())
-        say(false, "Running from RAM: updates cannot install");
+    else if (info.flags & USER_UPDATE_RESTART_DUE) say(false, "Installed; restart to use it");
+    else if (download_mode()) say(false, "Updates cannot install here yet");
+    else if (!installs()) say(false, "Running from RAM: updates cannot install");
     else say(false, "Ready");
     render();
     for (;;) {

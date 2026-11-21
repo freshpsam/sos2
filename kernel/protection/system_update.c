@@ -19,7 +19,7 @@
 #elif defined(SOS2_BOARD_NEXUS5)
 #include "nexus5.h"
 #endif
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE) || defined(SOS2_BOARD_NEXUS5)
+#ifdef SOS2_DEVICE
 #define SYSTEM_INSTALLS 1 /* QEMU's machines install nothing */
 #endif
 
@@ -82,7 +82,7 @@ static bool restart_due; /* an installed system update waits for a restart */
 #ifdef SYSTEM_INSTALLS
 static bool installed; /* started from the installed system */
 #endif
-#if !defined(SOS2_BOARD_REDMI2) && !defined(SOS2_BOARD_NEXUS5)
+#ifndef SOS2_PHONE
 static enum cpu_boot_method psci_method; /* QEMU and the tablet restart through PSCI */
 #endif
 static uint64_t worked_at;
@@ -128,7 +128,7 @@ static bool storage_installed(const char *args, size_t length) {
 }
 
 void system_update_init(const struct platform_devices *d) {
-#if !defined(SOS2_BOARD_REDMI2) && !defined(SOS2_BOARD_NEXUS5)
+#ifndef SOS2_PHONE
     psci_method = d->psci_method;
 #endif
 #ifdef SYSTEM_INSTALLS
@@ -334,8 +334,8 @@ static bool boot_image_valid(void) {
     uint64_t at =
         ANDROID_PAGE + ((uint64_t)kernel + ANDROID_PAGE - 1) / ANDROID_PAGE * ANDROID_PAGE;
     if (memcmp(image, "ANDROID!", 8) || kernel < 64 || le32(image + 12) != KERNEL_ADDRESS ||
-        ramdisk <= BOOT_BUNDLE_HEADER || le32(image + 20) != BOOT_RAMDISK_BASE || le32(image + 24) ||
-        le32(image + 32) != TAGS_ADDRESS || le32(image + 36) != ANDROID_PAGE ||
+        ramdisk <= BOOT_BUNDLE_HEADER || le32(image + 20) != BOOT_RAMDISK_BASE ||
+        le32(image + 24) || le32(image + 32) != TAGS_ADDRESS || le32(image + 36) != ANDROID_PAGE ||
         at + ((uint64_t)ramdisk + ANDROID_PAGE - 1) / ANDROID_PAGE * ANDROID_PAGE !=
             update.header.boot_size ||
         le32(image + ANDROID_PAGE + 0x24) != 0x016f2818)
@@ -500,7 +500,9 @@ bool system_update_busy(void) { return boot_open(); }
  * of a process, which no pid matches. */
 enum { FASTBOOT_OWNER = UINT32_MAX, TABLET_KERNEL = 0x40080000, TABLET_HEADER = 1660 };
 
-static uint32_t page_align(uint32_t n) { return (n + ANDROID_PAGE - 1) & ~(uint32_t)(ANDROID_PAGE - 1); }
+static uint32_t page_align(uint32_t n) {
+    return (n + ANDROID_PAGE - 1) & ~(uint32_t)(ANDROID_PAGE - 1);
+}
 
 /* The image's bytes at offset, which may cross from one piece to the next. */
 static bool image_is(uint32_t offset, const void *bytes, uint32_t n) {
@@ -556,8 +558,10 @@ static bool tablet_image_valid(uint32_t size) {
 static bool tablet_update_valid(void) {
     const unsigned char *h = update.image[0];
     uint32_t kernel = le32(h + 8), ramdisk = le32(h + 16), dtb = le32(h + 1648);
-    if (kernel > SYSTEM_BOOT_LIMIT || ramdisk > SYSTEM_BOOT_LIMIT || dtb > SYSTEM_BOOT_LIMIT) return false;
-    uint64_t size = ANDROID_PAGE + (uint64_t)page_align(kernel) + page_align(ramdisk) + page_align(dtb) + 16;
+    if (kernel > SYSTEM_BOOT_LIMIT || ramdisk > SYSTEM_BOOT_LIMIT || dtb > SYSTEM_BOOT_LIMIT)
+        return false;
+    uint64_t size =
+        ANDROID_PAGE + (uint64_t)page_align(kernel) + page_align(ramdisk) + page_align(dtb) + 16;
     if (size > update.header.boot_size || page_align((uint32_t)size) != update.header.boot_size)
         return false;
     for (uint32_t at = (uint32_t)size; at < update.header.boot_size; ++at)
@@ -620,7 +624,8 @@ const char *system_update_boot_receive(bool (*read)(void *data, uint32_t size)) 
     return 0;
 }
 
-const char *system_update_boot_install(void (*progress)(uint32_t done, uint32_t total, bool checking)) {
+const char *system_update_boot_install(void (*progress)(uint32_t done, uint32_t total,
+                                                        bool checking)) {
     if (update.owner != FASTBOOT_OWNER || update.state != USER_UPDATE_RECEIVING ||
         update.received != update.total)
         return "nothing downloaded";

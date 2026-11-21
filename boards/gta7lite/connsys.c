@@ -75,8 +75,8 @@ static const char *const ram_codes[] = {"/firmware/connsys/soc1_0_ram_mcu_1_1_hd
 static bool reserved;
 
 static uint32_t rd(uintptr_t a) { return mmio_read32(a); }
-static void wr(uintptr_t a, uint32_t v) { mmio_write32(a, v); }
 
+static void wr(uintptr_t a, uint32_t v) { mmio_write32(a, v); }
 
 static bool overlap(uint64_t a, uint64_t a_size, uint64_t b, uint64_t b_size) {
     return a_size && b_size && a < b + b_size && b < a + a_size;
@@ -85,10 +85,11 @@ static bool overlap(uint64_t a, uint64_t a_size, uint64_t b, uint64_t b_size) {
 /* The subsystem's memory and Wi-Fi's DMA pool where Linux would put the
  * device tree's consys and wifi reservations (16 MiB-aligned, below
  * 0xC0000000), kept out of every later allocation. */
-bool gta7lite_connsys_reserve(struct platform_devices *d, uint64_t kernel_start, uint64_t kernel_end,
-                              uint64_t dtb, uint64_t dtb_size) {
-    static const struct memory_region regions[] = {{GTA7LITE_CONNSYS_EMI, GTA7LITE_CONNSYS_EMI_SIZE},
-                                                   {GTA7LITE_WIFI_POOL, GTA7LITE_WIFI_POOL_SIZE}};
+bool gta7lite_connsys_reserve(struct platform_devices *d, uint64_t kernel_start,
+                              uint64_t kernel_end, uint64_t dtb, uint64_t dtb_size) {
+    static const struct memory_region regions[] = {
+        {GTA7LITE_CONNSYS_EMI, GTA7LITE_CONNSYS_EMI_SIZE},
+        {GTA7LITE_WIFI_POOL, GTA7LITE_WIFI_POOL_SIZE}};
     reserved = false;
     if (d->reserved_region_count + 2 > MAX_RESERVED_REGIONS) return false;
     for (unsigned i = 0; i < 2; ++i) {
@@ -100,7 +101,8 @@ bool gta7lite_connsys_reserve(struct platform_devices *d, uint64_t kernel_start,
             overlap(r->start, r->size, d->initrd_start, d->initrd_end - d->initrd_start))
             return false;
         for (size_t k = 0; k < d->reserved_region_count; ++k)
-            if (overlap(r->start, r->size, d->reserved_regions[k].start, d->reserved_regions[k].size))
+            if (overlap(r->start, r->size, d->reserved_regions[k].start,
+                        d->reserved_regions[k].size))
                 return false;
     }
     for (unsigned i = 0; i < 2; ++i) d->reserved_regions[d->reserved_region_count++] = regions[i];
@@ -129,7 +131,8 @@ static const char *memory(void) {
         if (!f || f->size <= RAM_CODE_HEADER) return "Wi-Fi RAM code missing";
         const uint8_t *data = runtime_file_data(f);
         uint32_t offset = le32(data + 24) & 0xffff00u, size = f->size - RAM_CODE_HEADER;
-        if (data[22] != 0x8a || offset + size > GTA7LITE_CONNSYS_EMI_SIZE) return "Wi-Fi RAM code invalid";
+        if (data[22] != 0x8a || offset + size > GTA7LITE_CONNSYS_EMI_SIZE)
+            return "Wi-Fi RAM code invalid";
         copy_words(GTA7LITE_CONNSYS_EMI + offset, data + RAM_CODE_HEADER, size);
     }
     wr(INFRACFG + EMI_MAPPING,
@@ -236,7 +239,8 @@ static uint16_t crc16_arc(const uint8_t *p, unsigned n) {
     uint16_t crc = 0;
     for (unsigned i = 0; i < n; ++i) {
         crc ^= p[i];
-        for (unsigned b = 0; b < 8; ++b) crc = crc & 1 ? (uint16_t)(crc >> 1 ^ 0xa001) : (uint16_t)(crc >> 1);
+        for (unsigned b = 0; b < 8; ++b)
+            crc = crc & 1 ? (uint16_t)(crc >> 1 ^ 0xa001) : (uint16_t)(crc >> 1);
     }
     return crc;
 }
@@ -273,8 +277,14 @@ static unsigned stp_receive(uint8_t *out, unsigned capacity, unsigned timeout_ms
                     state = 1;
                 }
                 break;
-            case 1: head[1] = c; state = 2; break;
-            case 2: head[2] = c; state = 3; break;
+            case 1:
+                head[1] = c;
+                state = 2;
+                break;
+            case 2:
+                head[2] = c;
+                state = 3;
+                break;
             case 3:
                 state = 0;
                 if (stp.full && (uint8_t)(head[0] + head[1] + head[2]) != c) break;
@@ -314,7 +324,8 @@ static unsigned stp_receive(uint8_t *out, unsigned capacity, unsigned timeout_ms
 static void settle(void) { delay_us(SETTLE_US); }
 
 /* A WMT command and its event, which must start with `expect`. */
-static bool wmt(const uint8_t *command, unsigned n, const uint8_t *expect, unsigned m, unsigned timeout_ms) {
+static bool wmt(const uint8_t *command, unsigned n, const uint8_t *expect, unsigned m,
+                unsigned timeout_ms) {
     uint8_t event[64];
     settle();
     if (!stp_send(command, n)) return false;
@@ -327,7 +338,8 @@ static bool wmt(const uint8_t *command, unsigned n, const uint8_t *expect, unsig
  * patch count and sequence), then raw a 12-byte length header and the body,
  * paced. */
 static const char *patch(void) {
-    const struct runtime_file *f = runtime_file_find("/firmware/connsys/soc1_0_patch_mcu_1_1_hdr.bin");
+    const struct runtime_file *f =
+        runtime_file_find("/firmware/connsys/soc1_0_patch_mcu_1_1_hdr.bin");
     if (!f || f->size <= PATCH_HEADER) return "Wi-Fi ROM patch missing";
     const uint8_t *data = runtime_file_data(f);
     uint32_t size = f->size - PATCH_HEADER;
@@ -337,7 +349,8 @@ static const char *patch(void) {
     config[18] = 0x02;
     config[19] = 0x02;
     static const uint8_t accepted[] = {0x02, 0x01, 0x01, 0x00, 0x00};
-    if (!wmt(config, sizeof(config), accepted, sizeof(accepted), 1000)) return "Wi-Fi ROM patch refused";
+    if (!wmt(config, sizeof(config), accepted, sizeof(accepted), 1000))
+        return "Wi-Fi ROM patch refused";
     settle();
     uint8_t head[12] = {0};
     for (unsigned i = 0; i < 4; ++i) head[i] = (uint8_t)((size + 12) >> 8 * i);
@@ -349,16 +362,20 @@ static const char *patch(void) {
 /* After the patch, mtk_wcn_soc_sw_init: WMT reset, STP full mode, chip ID,
  * the radio chip's ID, RF calibration. */
 static const char *setup(void (*yield)(void)) {
-    static const uint8_t query[] = {0x01, 0x04, 0x01, 0x00, 0x04}, queried[] = {0x02, 0x04, 0x06, 0x00, 0x00, 0x04};
-    static const uint8_t reset[] = {0x01, 0x07, 0x01, 0x00, 0x04}, reset_done[] = {0x02, 0x07, 0x01, 0x00, 0x00};
+    static const uint8_t query[] = {0x01, 0x04, 0x01, 0x00, 0x04},
+                         queried[] = {0x02, 0x04, 0x06, 0x00, 0x00, 0x04};
+    static const uint8_t reset[] = {0x01, 0x07, 0x01, 0x00, 0x04},
+                         reset_done[] = {0x02, 0x07, 0x01, 0x00, 0x00};
     static const uint8_t set_stp[] = {0x01, 0x04, 0x05, 0x00, 0x03, 0xdb, 0x0e, 0x68, 0x01},
                          stp_set[] = {0x02, 0x04, 0x02, 0x00, 0x00, 0x03},
                          full_mode[] = {0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0xdb, 0x0e, 0x68, 0x01};
     static const uint8_t chip_id[] = {0x01, 0x02, 0x05, 0x00, 0x11, 0x65, 0x67, 0x00, 0x00},
                          chip_id_set[] = {0x02, 0x02, 0x01, 0x00, 0x00};
-    static const uint8_t adie[] = {0x01, 0x02, 0x01, 0x00, 0x12}, adie_found[] = {0x02, 0x02, 0x05, 0x00, 0x00};
+    static const uint8_t adie[] = {0x01, 0x02, 0x01, 0x00, 0x12},
+                         adie_found[] = {0x02, 0x02, 0x05, 0x00, 0x00};
     static const uint8_t calibrate[] = {0x01, 0x14, 0x01, 0x00, 0x01}, calibrated[] = {0x02, 0x14};
-    if (!wmt(reset, sizeof(reset), reset_done, sizeof(reset_done), 2000)) return "Wi-Fi reset failed";
+    if (!wmt(reset, sizeof(reset), reset_done, sizeof(reset_done), 2000))
+        return "Wi-Fi reset failed";
     yield();
     if (!wmt(query, sizeof(query), queried, sizeof(queried), 500) ||
         !wmt(set_stp, sizeof(set_stp), stp_set, sizeof(stp_set), 500))
@@ -366,15 +383,19 @@ static const char *setup(void (*yield)(void)) {
     stp.full = true;
     stp.txseq = stp.expected = 0;
     stp.txack = 7;
-    if (!wmt(query, sizeof(query), full_mode, sizeof(full_mode), 500)) return "Wi-Fi control link mode failed";
-    if (!wmt(chip_id, sizeof(chip_id), chip_id_set, sizeof(chip_id_set), 500)) return "Wi-Fi chip ID refused";
-    if (!wmt(adie, sizeof(adie), adie_found, sizeof(adie_found), 500)) return "Wi-Fi radio chip missing";
+    if (!wmt(query, sizeof(query), full_mode, sizeof(full_mode), 500))
+        return "Wi-Fi control link mode failed";
+    if (!wmt(chip_id, sizeof(chip_id), chip_id_set, sizeof(chip_id_set), 500))
+        return "Wi-Fi chip ID refused";
+    if (!wmt(adie, sizeof(adie), adie_found, sizeof(adie_found), 500))
+        return "Wi-Fi radio chip missing";
     yield();
     uint8_t event[64];
     settle();
     if (!stp_send(calibrate, sizeof(calibrate))) return "Wi-Fi calibration not sent";
     unsigned got = stp_receive(event, sizeof(event), 3000);
-    if (got < 5 || memcmp(event, calibrated, sizeof(calibrated)) || event[4]) return "Wi-Fi calibration failed";
+    if (got < 5 || memcmp(event, calibrated, sizeof(calibrated)) || event[4])
+        return "Wi-Fi calibration failed";
     return 0;
 }
 
@@ -384,10 +405,11 @@ const char *gta7lite_connsys_start(void (*yield)(void)) {
     if (!error) error = btif_open();
     if (error) return error;
     yield();
-    static const uint8_t query[] = {0x01, 0x04, 0x01, 0x00, 0x04}, queried[] = {0x02, 0x04, 0x06, 0x00, 0x00, 0x04};
-    if (!wmt(query, sizeof(query), queried, sizeof(queried), 500)) return "Wi-Fi control link silent";
+    static const uint8_t query[] = {0x01, 0x04, 0x01, 0x00, 0x04},
+                         queried[] = {0x02, 0x04, 0x06, 0x00, 0x00, 0x04};
+    if (!wmt(query, sizeof(query), queried, sizeof(queried), 500))
+        return "Wi-Fi control link silent";
     error = patch();
     if (error) return error;
     return setup(yield);
 }
-

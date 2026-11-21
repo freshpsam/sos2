@@ -48,11 +48,11 @@ static void close_stream(struct stream *s) {
 }
 
 void audio_init(const struct platform_devices *devices) {
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
-    (void)devices;
-#elif defined(SOS2_BOARD_GTA7LITE)
+#ifdef SOS2_BOARD_GTA7LITE
     (void)devices;
     online = gta7lite_audio_init(&device);
+#elif defined(SOS2_DEVICE)
+    (void)devices; /* the phones have no sound driver yet */
 #else
     online = virtio_snd_init(devices, &device);
 #endif

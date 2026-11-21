@@ -165,7 +165,7 @@ bool arm_machine_init(const struct platform_devices *d) {
 }
 
 enum arm_rtc_kind arm_rtc_kind(void) {
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_NEXUS5)
+#ifdef SOS2_PHONE
     return ARM_RTC_PMIC;
 #else
     return ARM_RTC_UNIX;

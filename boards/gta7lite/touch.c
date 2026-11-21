@@ -93,7 +93,6 @@ enum {
     MAX_PARTS = 24,
 };
 
-
 static void spi_write(uint32_t offset, uint32_t value) {
     mmio_write32(SPI1 + offset, value);
     barrier();

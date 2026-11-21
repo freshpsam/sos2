@@ -5,7 +5,8 @@
 /* The eMMC's two users on the devices (kernel/protection/emmc_store.c): the
  * data volume (block_*, include/block.h) and the installed system's boot and
  * cache regions (system_store_*, include/system_store.h), over the board's
- * card driver, which moves single 512-byte sectors of the user area. */
+ * card driver, which moves 512-byte sectors of the user area: one at a
+ * time, or several in one transfer where it can. */
 struct emmc_card {
     /* Takes over the card as the loader left it, once per boot: true while
      * it serves, with the user area's size in sectors. */
@@ -16,6 +17,9 @@ struct emmc_card {
      * with its programming finished. */
     bool (*read)(uint64_t sector, void *data);
     bool (*write)(uint64_t sector, const void *data);
+    /* count (at most 256) consecutive sectors read in one transfer into a
+     * word-aligned buffer; NULL where the driver has no such read. */
+    bool (*read_many)(uint64_t sector, void *data, unsigned count);
     /* The card's cache written back. */
     bool (*flush)(void);
     /* The boot partition's first sectors, which the loader keeps. */

@@ -1,4 +1,5 @@
 #include "gta7lite.h"
+#include "boot_handoff.h"
 #include "board.h"
 #include "platform.h"
 
@@ -78,10 +79,6 @@ bool gta7lite_download_mode(bool on) {
  * base and size. */
 enum { WIDTH = 800, HEIGHT = 1340, STRIDE = 3200 };
 
-static bool overlaps(uint64_t a, uint64_t n, uint64_t b, uint64_t m) {
-    return a < b + m && b < a + n;
-}
-
 const char *gta7lite_handoff(struct platform_devices *d, uint64_t kernel_start, uint64_t kernel_end,
                              uint64_t dtb_address) {
     if (d->has_ram_console) {
@@ -94,39 +91,22 @@ const char *gta7lite_handoff(struct platform_devices *d, uint64_t kernel_start, 
     d->framebuffer_size = 0;
     if (!d->has_videolfb) return "LK framebuffer handoff (atag,videolfb) missing";
     uint64_t fb = d->videolfb_base, fb_size = d->videolfb_vram;
-    if (!fb || (fb & 4095) || fb_size < (uint64_t)STRIDE * HEIGHT ||
-        !fdt_range_in_ram(d, fb, fb_size) || fb + fb_size > 1ull << 32)
-        return "LK framebuffer outside reported RAM";
-    if (kernel_end <= kernel_start || !fdt_range_in_ram(d, kernel_start, kernel_end - kernel_start))
-        return "kernel outside reported RAM";
-    if (!fdt_range_in_ram(d, dtb_address, d->dtb_size)) return "device tree outside reported RAM";
-    if (overlaps(fb, fb_size, kernel_start, kernel_end - kernel_start) ||
-        overlaps(fb, fb_size, dtb_address, d->dtb_size))
-        return "framebuffer overlaps boot data";
-    uint64_t ramdisk_size = 0;
-    if (d->has_initrd_start || d->has_initrd_end) {
-        if (!d->has_initrd_start || !d->has_initrd_end || d->initrd_end <= d->initrd_start ||
-            !fdt_range_in_ram(d, d->initrd_start, d->initrd_end - d->initrd_start))
-            return "invalid ramdisk handoff";
-        ramdisk_size = d->initrd_end - d->initrd_start;
-        if (overlaps(fb, fb_size, d->initrd_start, ramdisk_size))
-            return "framebuffer overlaps ramdisk";
-    }
-    d->framebuffer = (struct framebuffer){(void *)(uintptr_t)fb, WIDTH, HEIGHT, STRIDE, PIXEL_ARGB8888};
+    if (!fb || (fb & 4095) || fb_size < (uint64_t)STRIDE * HEIGHT)
+        return "LK framebuffer too small or not page-aligned";
+    const struct boot_handoff h = {.kernel_start = kernel_start,
+                                   .kernel_end = kernel_end,
+                                   .dtb = dtb_address,
+                                   .fb = fb,
+                                   .fb_size = fb_size,
+                                   .fb_limit = 1ull << 32};
+    const char *error = boot_handoff_screen(d, &h);
+    if (error) return error;
+    d->framebuffer =
+        (struct framebuffer){(void *)(uintptr_t)fb, WIDTH, HEIGHT, STRIDE, PIXEL_ARGB8888};
     d->framebuffer_size = fb_size;
     d->has_framebuffer = true;
-    if (overlaps(kernel_start, kernel_end - kernel_start, dtb_address, d->dtb_size))
-        return "device tree overlaps kernel";
-    if (ramdisk_size &&
-        (overlaps(d->initrd_start, ramdisk_size, kernel_start, kernel_end - kernel_start) ||
-         overlaps(d->initrd_start, ramdisk_size, dtb_address, d->dtb_size)))
-        return "ramdisk overlaps boot data";
-    for (size_t i = 0; i < d->reserved_region_count; ++i) {
-        const struct memory_region *r = &d->reserved_regions[i];
-        if (r->size > UINT64_MAX - r->start) return "invalid reserved memory";
-        if (overlaps(kernel_start, kernel_end - kernel_start, r->start, r->size))
-            return "kernel overlaps reserved memory";
-    }
+    error = boot_handoff_memory(d, &h);
+    if (error) return error;
     /* Wi-Fi's memory: without it, Wi-Fi stays off and says so. */
     (void)gta7lite_connsys_reserve(d, kernel_start, kernel_end, dtb_address, d->dtb_size);
     return 0;

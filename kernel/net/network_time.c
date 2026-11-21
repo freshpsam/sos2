@@ -13,6 +13,7 @@
 enum { IDLE, RESOLVING, WAITING };
 
 static const char server[] = "time.cloudflare.com";
+
 enum { SERVER_PORT = 123 };
 static struct udp_pcb *socket;
 static ip_addr_t remote;

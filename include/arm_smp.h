@@ -46,7 +46,7 @@ void arm_warm_entry(void);
 /* Saves CPU 0's context and calls power_down: 1 if that returns (the CPU
  * stayed on), 0 once the CPU powered down and resumed with its context. */
 int arm_cpu0_suspend(void (*power_down)(void));
-#if defined(SOS2_BOARD_REDMI2) || defined(SOS2_BOARD_GTA7LITE)
+#ifdef SOS2_CPU_SLEEP
 /* Standby: idle secondary CPUs power down (ASLEEP, never given work) until
  * arm_smp_wake, which waits up to 0.2 s for them to be IDLE again. A CPU not
  * back by then leaves service (CPU 0 runs pages once no worker remains). */

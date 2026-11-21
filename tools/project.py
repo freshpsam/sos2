@@ -95,6 +95,20 @@ def launch(engine, storage, extra):
     run(*args, *extra)
 
 
+def check_engine(engine):
+    """The bundle's updater and apps must come from this checkout's sources
+    (tools/build_native_apps.py): only make engine builds them. None, or why
+    not."""
+    import build_native_apps
+    stamp = engine.with_name(engine.name + build_native_apps.SOURCES_SUFFIX)
+    if not stamp.is_file():
+        return f'{engine.name} has no record of its programs\' sources; run make engine'
+    if stamp.read_text().strip() != build_native_apps.signature():
+        return (f'{engine.name}\'s updater and apps were built from other sources (programs/, apps/, '
+                'sdk/, include/user_abi.h ...); run make engine')
+    return None
+
+
 def release_name():
     """The build's name for the updater: UTC time and commit, with + when
     the checkout has uncommitted changes."""
@@ -212,6 +226,9 @@ def main():
         parser.error(f'{args.command} requires an engine bundle; run make engine first')
     if engine is not None and not engine.is_file():
         parser.error('engine bundle is missing; run make engine or set ENGINE to an existing bundle')
+    stale = engine and check_engine(engine)
+    if stale:
+        parser.error(stale)
     try:
         if args.command == 'run':
             launch(engine, args.storage, extra)
