@@ -13,17 +13,15 @@
  * at once when it comes on, and never while it is off, when nothing shows
  * them. A reading that fails leaves the icon as it was, until three in a
  * row have.
- * The level is the phone's gauge's, or the tablet's estimate from the
- * battery's voltage (boards/gta7lite/pmic.c), steadied so that the icon does
- * not jump: off a charger it only falls and on one it only rises, and a step
- * of 5% or more is taken only once three readings in a row span at most two
- * percentage points and a minute or more from first to last; smaller steps
- * in that direction are taken at once, even after a brief wake. After standby
- * or three failed reads, the same confirmation permits either direction: a
- * charger may have come and gone while not polling.
- * The phone's gauge is never reset: a reset estimates the charge afresh from
- * the voltage of the moment, which a load lowers, and on the handset the
- * level then jumped between half and near empty. */
+ * The level is the Nexus 5's gauge's, or the Redmi 2's and the tablet's
+ * estimate from the battery's voltage (battery_ocv_percent), steadied so that
+ * the icon does not jump: off a charger it only falls and on one it only
+ * rises, and a step of 5% or more is taken only once three readings in a row
+ * span at most two percentage points and a minute or more from first to
+ * last; smaller steps in that direction are taken at once, even after a
+ * brief wake. After boot, standby or three failed reads, the same
+ * confirmation permits either direction: a charger may have come and gone
+ * while not polling, and a voltage read at boot carries its load. */
 enum { POLL_US = 30000000 };
 static struct battery_view view;
 static uint64_t next_poll;
@@ -38,8 +36,7 @@ static bool shown_valid, resync, step_charger;
 /* The level to show for the gauge's reading. */
 static unsigned steady(unsigned percent, bool charger, uint64_t now) {
     if (!shown_valid) {
-        shown_valid = true;
-        resync = false;
+        shown_valid = resync = true;
         return percent;
     }
     bool toward = charger ? percent > shown : percent < shown;
@@ -68,6 +65,14 @@ static unsigned steady(unsigned percent, bool charger, uint64_t now) {
     return percent;
 }
 #endif
+
+unsigned battery_ocv_percent(const uint16_t ocv[21], unsigned millivolts) {
+    if (millivolts >= ocv[0]) return 100;
+    for (unsigned i = 1; i < 21; ++i)
+        if (millivolts >= ocv[i])
+            return 100 - 5 * i + 5 * (millivolts - ocv[i]) / (ocv[i - 1] - ocv[i]);
+    return 0;
+}
 
 void battery_init(void) {
     view = (struct battery_view){0};

@@ -255,17 +255,10 @@ bool gta7lite_battery_read(struct battery_view *out) {
         millivolts < 2500 || millivolts > 4700)
         return false;
     bool charger = detect & RGS_CHRDET;
-    unsigned open = charger ? millivolts : millivolts + 60, percent = 0;
-    if (open >= ocv[0]) percent = 100;
-    else
-        for (unsigned i = 1; i < 21; ++i)
-            if (open >= ocv[i]) {
-                percent = 100 - 5 * i + 5 * (open - ocv[i]) / (ocv[i - 1] - ocv[i]);
-                break;
-            }
-    *out = (struct battery_view){.available = true,
-                                 .charger = charger,
-                                 .charging = charger && gta7lite_charge_state() == 1,
-                                 .percent = percent};
+    *out = (struct battery_view){
+        .available = true,
+        .charger = charger,
+        .charging = charger && gta7lite_charge_state() == 1,
+        .percent = battery_ocv_percent(ocv, charger ? millivolts : millivolts + 60)};
     return true;
 }

@@ -24,6 +24,16 @@ uint64_t process_user_us(void);
 void process_freeze(bool freeze);
 /* Trusted shell only. Close waits for in-flight slices before reclaiming RAM. */
 int32_t process_web_control(unsigned slot, bool restart);
+/* Low memory (page_host.c): a web page's process ends, as on Close, and its
+ * memory returns to the pool, but its slot stays, so that the page host can
+ * keep its entry and start it again with process_web_resume. */
+int32_t process_web_park(unsigned slot);
+int32_t process_web_resume(unsigned slot);
+/* Whether a process that stopped (closed, faulted or parked) still has
+ * memory to give back to the pool. */
+bool process_reclaiming(void);
+/* Whether a slot's process has sound waiting to play (audio_process_playing). */
+bool process_playing(unsigned slot);
 /* Allocate a new isolated page; returns its zero-based identifier or an error. */
 int32_t process_web_open(void);
 /* Start an app (include/apps.h) in a new slot, like a page; same results. */

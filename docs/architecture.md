@@ -13,8 +13,19 @@ engine, `/bin/sos2-web`, which runs once per open page, and the
   kernel preempts user code every 5 ms; a fault ends only that process, and
   **Close** reclaims even a hung page.
 - Free RAM and, per process, a 544 MiB quota (1 GiB on AArch64) and 64
-  threads limit what runs. When the last page closes, free memory must be
-  back at its post-boot baseline, or the kernel panics.
+  threads limit what runs. A page left with under 64 MiB, of its quota or of
+  free RAM, has WebKit release its caches, decoded images and compiled code
+  and collect garbage, again only once it has grown by 32 MiB or has under
+  16 MiB left (`programs/browser/web_main.cpp`). Memory a page frees stays
+  its own, and a page whose allocation fails stops, most often the one in
+  use. So with under 64 MiB of RAM free the web page shown least recently,
+  a silent one first, never the one on screen nor an app, is parked: its
+  process ends and gives its memory back, and its entry stays in the
+  desktop's list, darker, starting the page again at its address when opened
+  (`kernel/protection/page_host.c`). Pages are parked one at a time, none
+  while a stopped page's memory is still coming back, and never one whose
+  address was too long to keep. When the last page closes, free memory must
+  be back at its post-boot baseline, or the kernel panics.
 - Up to four CPUs run, eight on AArch64. CPU 0 owns the desktop, scheduler,
   syscalls and drivers; the others run page threads, a page's own threads
   side by side (its GC markers, compiler threads, image decoders and
@@ -308,6 +319,13 @@ in one step before, holding every system call.
   on the Wi-Fi screen from a network to the list.
 - Dragging scrolls; a movement of up to six pixels is a tap. On the phone,
   buttons and keys give a 15 ms buzz (`kernel/protection/haptics.c`).
+- Pages hear the finger as a phone's browser tells them, as the iPhone user
+  agent promises: touchstart when it lands, touchmove as it moves, touchend
+  when it lifts, then a tap's mouse events and click
+  (`programs/browser/web_input.cpp`). A page that cancels touchstart, or a
+  touchmove before the drag scrolls, keeps the drag from scrolling;
+  cancelling touchstart or touchend drops the click. YouTube's mobile player
+  starts a video with sound only after a touchstart.
 - Header, keyboard and desktop input, including Wi-Fi passwords, never
   reaches a page.
 
@@ -346,7 +364,7 @@ returned when it closes or its process ends. The mixer
 (`kernel/audio/audio.c`) sums the playing streams and saturates the total. A
 stream's `played` count grows as frames leave its queue and `latency` counts
 those still queued in the device, so what is heard is `played - latency`, the
-clock media playback follows. Without an audio device, as on the phone,
+clock media playback follows. Without an audio device, as on the Nexus 5,
 streams play silently at the same rate, so the clock still keeps real time.
 QEMU's virtio-sound device gets 10 ms periods, at most four at a time, and
 stops a quarter second after the streams run dry
@@ -354,7 +372,12 @@ stops a quarter second after the streams run dry
 jack, play a ring the audio DMA reads, which the main loop's polls fill up
 to 133 ms ahead, with silence where the streams run dry; they power down 3 s
 after the last frame. Its volume keys set a volume for each output, which
-scales the mix (`boards/gta7lite/audio.c`, [Galaxy Tab A7 Lite](gta7lite.md)). `make run` plays through PulseAudio or
+scales the mix (`boards/gta7lite/audio.c`, [Galaxy Tab A7 Lite](gta7lite.md)).
+The Redmi 2's loudspeaker plays the mix in mono from a 256 ms ring in RAM
+that the audio interface's DMA reads, filled up to 245 ms ahead, with the
+same volume steps (`boards/redmi2/audio.c`, [Redmi 2](redmi2.md#sound)); the
+volume steps and the keys' timing are shared (`audio_mix_volume`,
+`kernel/volume_keys.c`). `make run` plays through PulseAudio or
 PipeWire when one runs; `RUN_ARGS='--audio none'` leaves the device out, and
 `'--audio wav:FILE'` records it.
 

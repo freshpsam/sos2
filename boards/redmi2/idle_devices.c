@@ -25,10 +25,10 @@
  *   standby begins;
  * - unused devices' pins, set as the vendor kernel's sleep states leave
  *   them (msm8916-pinctrl.dtsi and the WT88047's board files): the cameras'
- *   resets, standbys and clocks, the codec's PDM link, the amplifiers' and
- *   key backlight's enables, the flash, the LED controller's I2C, the
- *   magnetometer's reset, the IMU's interrupt, the SD card's detect and
- *   pads, and the boot chain's debug UART.
+ *   resets, standbys and clocks, the key backlight's enable, the flash, the
+ *   LED controller's I2C, the magnetometer's reset, the IMU's interrupt, the
+ *   SD card's detect and pads, and the boot chain's debug UART (the codec's
+ *   PDM link and the amplifiers' enables are audio.c's).
  * Addresses: Linux gcc-msm8916.c, pinctrl-msm8916.c (blsp_i2c2 is function
  * 3), msm8916.dtsi; lk2nd's hsusb.h for the ChipIdea controller. */
 static uint32_t read32(uintptr_t address) {
@@ -283,8 +283,7 @@ static const struct pin {
     {26,0x001},{27,0x001},                                     /* camera clocks: input, pulled down */
     {28,0x201},{33,0x201},{34,0x201},{35,0x201},{120,0x201},   /* camera resets, standbys, focus: low */
     {29,0x004},{30,0x004},                                     /* camera I2C (CCI) */
-    {63,0x005},{64,0x005},{65,0x005},{66,0x005},{67,0x005},{68,0x005}, /* codec PDM link: pulled down */
-    {8,0x200},{117,0x200},{119,0x200},                         /* amplifier and key backlight enables: low */
+    {119,0x200},                                               /* key backlight enable: low */
     {31,0x001},{32,0x001},                                     /* flash */
     {22,0x008},{23,0x008},                                     /* LED controller I2C (QUP6) */
     {36,0x001},{115,0x001},                                    /* magnetometer reset, IMU interrupt */

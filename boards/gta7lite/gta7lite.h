@@ -32,10 +32,9 @@ bool gta7lite_pmic_update(uint16_t address, uint16_t value, uint16_t mask);
 int gta7lite_volume_key(void);
 
 /* The volume of the output in use (audio.c), from 0, silent, to
- * GTA7LITE_VOLUME_STEPS, after stepping it by step; and whether that output
- * is headphones in the jack, which turns the speakers off. */
-enum { GTA7LITE_VOLUME_STEPS = 15 };
-
+ * AUDIO_VOLUME_STEPS (include/audio.h), after stepping it by step; and
+ * whether that output is headphones in the jack, which turns the speakers
+ * off. */
 unsigned gta7lite_audio_volume(int step);
 bool gta7lite_audio_headphones(void);
 

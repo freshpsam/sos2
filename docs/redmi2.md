@@ -35,7 +35,8 @@ data last until reboot.
 If Wi-Fi fails the desktop says why ([Wi-Fi](#wi-fi)). Randomness
 comes from CPU jitter, which seeds a generator (as on the
 [tablet](gta7lite.md)); if its self-test fails, pages, Wi-Fi and HTTPS stay
-unavailable. Power toggles standby, which lasts about two weeks.
+unavailable. Power toggles standby, which lasts about two weeks. Pages play
+[sound](#sound) through the loudspeaker; the volume keys set its level.
 
 ## Wi-Fi
 
@@ -208,11 +209,14 @@ never retried.
   its framebuffer (`lk2nd.pass-simplefb=autorefresh,relocate`).
 - **Keys:** Menu, Home and Back report through the touch controller below the
   display rows; Home shows the desktop and Back goes back, never to the
-  desktop. Menu is unused.
-- **Devices:** FT5x06 touch; PM8916 power key, backlight, vibrator, RTC and
-  restart; SMB1360 battery gauge; CPU-jitter entropy; WCN3620
-  [Wi-Fi](#wi-fi); the eMMC; an optional Adreno 306. All four cores
-  start; a core that does not is skipped.
+  desktop. Menu is unused. Volume Up (GPIO 107) and Volume Down (the
+  PM8916's RESIN) step the [loudspeaker's](#sound) volume, which the header
+  shows in place of the clock for 2 s.
+- **Devices:** FT5x06 touch; PM8916 power key, backlight, vibrator, RTC,
+  restart and voltage ADC; SMB1360 charger and gauge; CPU-jitter entropy;
+  WCN3620 [Wi-Fi](#wi-fi); the eMMC; an optional Adreno 306; the
+  [loudspeaker](#sound). All four cores start; a core that does not is
+  skipped.
 - **Wi-Fi:** the stock
   [WT88047 kernel](https://github.com/LineageOS/android_kernel_wingtech_msm8916/tree/beb5692ed25808aebce7b57e318cf8bd33e645d8)
   (its WCNSS, prima/DXE and SCM sources) defines the board contract, and
@@ -227,15 +231,62 @@ never retried.
   accepting the first (`status=00000005`), SOS2 restarts the upload once.
 - **Restart:** a PMIC hard reset through PS_HOLD, as lk2nd's `reboot_device`
   does.
-- **Battery:** the header's icon shows the SMB1360 gauge's level and its
-  charger's USB input, which alone marks the battery charging, read every
-  30 s with the screen on and never in standby. SOS2 only reads the gauge: it
-  sets no charger limit and never resets it. The level is steadied: off a
+- **Sound:** see [Sound](#sound).
+- **Battery:** the header's icon shows a level estimated from the battery's
+  voltage, as on the tablet, and the SMB1360's USB input, which alone marks
+  the battery charging, read every 30 s with the screen on and never in
+  standby (`boards/redmi2/battery.c`). The voltage is VPH_PWR, which the
+  battery feeds, through the PM8916's voltage ADC (VADC 0x3100, channel 7
+  behind a 1:3 divider, calibrated against its 0.625 V and 1.25 V
+  references as Linux's `qcom-spmi-vadc.c` does). The stock DT turns off
+  the PM8916's own charger and BMS (`use-external-charger`, `disable-bms`).
+  The level comes from the 25 C open-circuit voltages of Qualcomm's QRD SKUI
+  profile for a 4.35 V, 2200 mAh cell like the BM44
+  (`batterydata-qrd-skui-4v35-2200mah.dtsi`), with 0% at its 3.4 V cutoff.
+  A reading carries the load of its moment, so the level takes the highest
+  reading of the last 2.5 minutes off a charger, with 45 mV added back for
+  an awake phone's lightest load, and the lowest on one; only a load held
+  that long reads low. The SMB1360 gauge's own level is used only
+  when the VADC cannot be read: its readings refresh rarely at this phone's
+  currents, and it stayed at 100% for hours. SOS2 only reads the SMB1360: it
+  sets no charger limit and never resets the gauge, whose reset estimated
+  the charge afresh from the voltage of the moment and made the level jump
+  between half and near empty. The level is steadied: off a
   charger it only falls, on one it only rises, and a step of 5% or more waits
   for three consecutive readings within two percentage points, spanning at
   least a minute. Smaller steps in that direction update immediately, even
-  during brief wake-ups. After standby or three failed reads, that
+  during brief wake-ups. After boot, standby or three failed reads, that
   confirmation allows either direction, since charging may have changed
   while unobserved.
-  Below the current Linux's setup counts as standby (200 mA) the gauge
-  refreshes its readings rarely, so the level can lag.
+
+## Sound
+
+Pages and apps play through the loudspeaker (`boards/redmi2/audio.c`), as
+mainline Linux drives MSM8916 sound without the modem's DSP (`lpass-cpu.c`,
+`lpass-platform.c`, `lpass-apq8016.c`, `apq8016_sbc.c`, `msm8916-wcd-*.c`,
+`gcc-msm8916.c`, `msm8916-wingtech-wt88047.dts`), with the analog power-up
+and power-down sequences of the stock kernel (`msm8x16-wcd.c`, whose audio
+interface the DSP ran) and the speaker route of LineageOS's mixer paths:
+
+- LPAIF's first read DMA channel plays a 256 ms ring of 16-bit stereo frames
+  in uncached kernel memory over the primary MI2S port (1.536 MHz bit clock
+  from the crystal) to the SoC's digital codec (9.6 MHz master clock), whose
+  RX1 and RX2 paths cross the PDM link (GPIO 63-68) to the PM8916's analog
+  codec; its headphone amplifiers feed the loudspeaker's amplifier, from the
+  right one, which GPIO 117 enables.
+- As the stock speaker path sends one channel, the loudspeaker gets the mix
+  in mono. The digital gains stay at Android's 0 dB; the volume scales the
+  samples, 15 steps of 3 dB and silence, 12 (-9 dB) at each start, as on the
+  tablet.
+- The clocks, codecs and amplifier power up when a stream has frames, in
+  about 25 ms, the amplifier last, and down 3 s after the last frame; until
+  then standby keeps its 20 ms polls rather than sleeping the whole chip.
+  The main loop's polls keep the ring filled up to 245 ms ahead of the DMA,
+  with silence behind the audio, so a volume change is heard within that. A
+  DMA that stops for half a second (judged by polls less than a lap apart),
+  or a power-up that fails, leaves pages playing silently until the next
+  boot.
+- Tried by hand: the loudspeaker plays and the volume keys step it. Not
+  yet: headphones. Nothing senses the jack (the PM8916's MBHC), and its
+  switch (GPIO 8) stays open, so the loudspeaker plays with a plug in. The
+  microphones are unused.

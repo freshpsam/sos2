@@ -70,6 +70,9 @@ bool arm_machine_init(const struct platform_devices *d) {
         {0x01a98000,0x1000}, /* DSI0 controller, PLL and PHY: panel sleep, pipeline off */
         {0x0184d000,0x1000}, /* GCC MDSS clocks and power domain */
         {0x01a01000,0x2000}, {0x01a6b000,0x1000}, /* MDP top and CTL0, INTF1 */
+        {0x0181c000,0x1000}, /* GCC audio clocks: the loudspeaker (audio.c) */
+        {0x07702000,0x1000}, {0x07708000,0x10000}, /* LPASS MI2S routing, audio interface and DMA */
+        {0x0771c000,0x1000}, /* the digital codec */
     };
     for (unsigned i = 0; i < sizeof(phone) / sizeof(phone[0]); ++i)
         if (!device(phone[i].start, phone[i].size)) return false;

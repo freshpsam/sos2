@@ -28,6 +28,11 @@ struct page {
     /* The app this slot runs (include/apps.h), or NULL for a web page. Apps
      * start from the launcher and stay out of the WEB PAGES list. */
     const struct app *app;
+    /* parked: its process gave its memory back (park_for_memory), and
+     * opening it starts it again at browser.url. shown: when it was last on
+     * screen. */
+    bool parked;
+    uint64_t shown;
     struct user_input_event events[EVENT_COUNT];
     struct user_browser_state browser;
     struct user_browser_command command;
@@ -467,8 +472,23 @@ void page_host_init(struct framebuffer *screen) {
     desktop_wifi_network_status(0);
 }
 
+/* A parked page starts again at the address it last showed. */
+static bool resume(struct page *p) {
+    int32_t result = process_web_resume(p->slot);
+    if (result < 0) {
+        browser_message = result == USER_ENODEV ? "BROWSER SERVICES UNAVAILABLE"
+                                                : "NOT ENOUGH MEMORY TO OPEN PAGE";
+        dirty = true;
+        return false;
+    }
+    p->command = (struct user_browser_command){.action = BROWSER_NAVIGATE};
+    strcpy(p->command.url, p->browser.url);
+    return true;
+}
+
 static bool page_host_select(unsigned slot) {
-    if (!page(slot)) return false;
+    struct page *p = page(slot);
+    if (!p || (p->parked && !resume(p))) return false;
     set_focus(-1);
     selected = slot;
     browser_panel(false);
@@ -768,7 +788,8 @@ int32_t page_host_gpu_frame_check(unsigned slot, const struct user_pixel_rect *r
 
 void page_host_gpu_frame(unsigned slot, const struct user_pixel_rect *rects, unsigned count) {
     struct page *p = page(slot);
-    if (!p) return;
+    /* A present that yielded may finish after its page was parked. */
+    if (!p || p->parked) return;
     p->ready = true;
     p->gpu_frames = true;
     for (unsigned i = 0; i < count; ++i) {
@@ -871,6 +892,39 @@ void page_host_closed(unsigned slot) {
     update_keyboard();
 }
 
+/* Pages share one pool of memory, and a page whose allocation fails stops,
+ * most often the one in use, as it is the one asking. So below PARK_BELOW
+ * free pages the web page shown least recently, a silent one first, never
+ * the one on screen nor an app, gives its memory back: its process ends,
+ * and its entry stays in the list, starting it again at its address when
+ * opened. A page that published no address (one too long to keep) would
+ * come back blank, so it stays. One at a time, and none while a stopped
+ * process's memory is still coming back. */
+#define PARK_BELOW (64u * 1024 * 1024 / PAGE_SIZE)
+
+static void park_for_memory(void) {
+    struct page *on_screen = page(selected);
+    if (on_screen) on_screen->shown = loop_time_us();
+    if (pages_available() >= PARK_BELOW || process_reclaiming()) return;
+    struct page *oldest = 0, *quiet = 0;
+    for (struct page *p = pages; p; p = p->next) {
+        if (p->app || p->parked || p == on_screen || !p->browser.url[0]) continue;
+        if (!oldest || p->shown < oldest->shown) oldest = p;
+        if (!process_playing(p->slot) && (!quiet || p->shown < quiet->shown)) quiet = p;
+    }
+    if (quiet) oldest = quiet;
+    if (!oldest || process_web_park(oldest->slot) < 0) return;
+    unsigned slot = oldest->slot;
+    if (focused == (int)slot) set_focus(-1);
+    display_page_closed(slot);
+    if (composed_view == slot) composed_view = UINT32_MAX;
+    forget_keys(slot);
+    if (pointer_owner == (int)slot) pointer_owner = -1;
+    oldest->parked = true;
+    oldest->ready = false;
+    dirty = true;
+}
+
 bool page_host_opened(unsigned slot, const struct app *app) {
     struct page *p = page(slot);
     if (!p) {
@@ -888,7 +942,8 @@ bool page_host_opened(unsigned slot, const struct app *app) {
     display_page_closed(slot); /* A new process lifetime must not reuse old pixels. */
     if (composed_view == slot) composed_view = UINT32_MAX;
     p->app = app;
-    p->ready = false;
+    p->ready = p->parked = p->gpu_frames = false;
+    p->shown = loop_time_us();
     p->head = p->count = 0;
     p->keyboard_wanted = p->back_key = false;
     p->taps = 0;
@@ -1242,7 +1297,8 @@ static void page_list_render(struct framebuffer *screen, unsigned x, unsigned y)
     for (struct page *p = pages; p && row < list_rows(); p = p->next) {
         if (p->app || index++ < page_offset) continue;
         unsigned y = list_top() + row++ * LIST_ROW;
-        gfx_rect(screen, 16, y, 448, 48, 0x31515c);
+        /* A parked page is darker until it starts again. */
+        gfx_rect(screen, 16, y, 448, 48, p->parked ? 0x22363f : 0x31515c);
         char line[70];
         const char *label = p->browser.title[0] ? p->browser.title : p->browser.url;
         unsigned n = 0;
@@ -1251,7 +1307,8 @@ static void page_list_render(struct framebuffer *screen, unsigned x, unsigned y)
             ++n;
         }
         line[n] = 0;
-        gfx_text(screen, 26, y + 7, line[0] ? line : "LOADING PAGE...", 2, 0xf1f5f6);
+        gfx_text(screen, 26, y + 7, line[0] ? line : "LOADING PAGE...", 2,
+                 p->parked ? 0xb9c9d0 : 0xf1f5f6);
         n = 0;
         while (n < 69 && p->browser.url[n]) {
             line[n] = p->browser.url[n];
@@ -1457,6 +1514,7 @@ static void web_pass_step(void) {
 }
 
 void page_host_render(void) {
+    park_for_memory();
     status_tick();
     screen_keyboard_tick(&keyboard, loop_time_us(), soft_emit, 0);
     if (!display || (!dirty && !address_damage && !keyboard_damage && !widget_count &&

@@ -110,6 +110,7 @@ enum {
     GUARD = 256,
     LEAD = RING - 2 * GUARD,
     STALL_US = 500000,
+    LAP_US = RING * 1000000ull / USER_AUDIO_RATE, /* 144 ms */
     IDLE_US = 3000000,
     MIX_FRAMES = 512,
     /* The volume: 3 dB a step below full scale, from the speakers' 12
@@ -353,9 +354,6 @@ static const uint8_t amp_address[2] = {0x58, 0x59};
 
 static enum { OFF, ON, FAILED } state;
 
-/* Q15 gains of the volume's steps. */
-static const uint16_t volume_gain[GTA7LITE_VOLUME_STEPS + 1] = {
-    0, 260, 368, 519, 734, 1036, 1464, 2068, 2920, 4125, 5827, 8231, 11627, 16423, 23198, 32768};
 static unsigned volume[2] = {SPEAKER_VOLUME, HEADPHONE_VOLUME};
 
 /* The jack: whether ACCDET is sensing it, its last sample, the state taken. */
@@ -369,7 +367,7 @@ static struct {
  * the DMA's position in the ring at the last poll. */
 static uint64_t played, written, cleared;
 static uint32_t read_at;
-static uint64_t moved_at, heard_at;
+static uint64_t moved_at, heard_at, polled_at;
 
 static void afe(unsigned offset, uint32_t value, uint32_t mask) {
     uintptr_t at = AFE + offset;
@@ -558,7 +556,7 @@ static bool power_up(void) {
     played = written = 0;
     cleared = RING;
     read_at = 0;
-    moved_at = heard_at = time_us();
+    moved_at = heard_at = polled_at = time_us();
     state = ON;
     if (codec(true) && (jack.plugged || amps(true))) return true;
     power_down();
@@ -576,14 +574,9 @@ static bool position(uint32_t *at) {
 static void mix(uint64_t at, uint32_t count) {
     /* Cached: each frame passes through it three times. */
     static struct audio_frame frames[MIX_FRAMES] __attribute__((section(".cpu_private")));
-    int32_t gain = volume_gain[volume[jack.plugged]];
     while (count) {
         uint32_t n = count < MIX_FRAMES ? count : MIX_FRAMES;
-        audio_mix(frames, n);
-        if (gain != volume_gain[GTA7LITE_VOLUME_STEPS])
-            for (uint32_t i = 0; i < n; ++i)
-                frames[i] = (struct audio_frame){(int16_t)(frames[i].left * gain >> 15),
-                                                 (int16_t)(frames[i].right * gain >> 15)};
+        audio_mix_volume(frames, n, volume[jack.plugged], false);
         ring_write(at, frames, n);
         at += n;
         count -= n;
@@ -625,7 +618,7 @@ static bool jack_init(void) {
 
 unsigned gta7lite_audio_volume(int step) {
     unsigned *level = &volume[jack.plugged];
-    if (step > 0 && *level < GTA7LITE_VOLUME_STEPS) ++*level;
+    if (step > 0 && *level < AUDIO_VOLUME_STEPS) ++*level;
     if (step < 0 && *level) --*level;
     return *level;
 }
@@ -649,7 +642,11 @@ static bool poll(void) {
     }
     uint64_t now = time_us();
     uint32_t at;
-    if (position(&at) && at != read_at) {
+    /* After a lap or more without a poll, the DMA may stand where it stood,
+     * whole laps on: only polls closer than a lap tell a stop. */
+    bool seen = position(&at), lapped = now - polled_at >= LAP_US;
+    polled_at = now;
+    if (seen && (at != read_at || lapped)) {
         /* The position gives the DMA's progress modulo the ring: the laps
          * of a poll later than one are those the time since implies. */
         uint64_t moved = (at + RING - read_at) % RING;
@@ -658,7 +655,7 @@ static bool poll(void) {
         played += moved;
         read_at = at;
         moved_at = now;
-    } else if (now - moved_at >= STALL_US) {
+    } else if (!lapped && now - moved_at >= STALL_US) {
         power_down();
         state = FAILED;
         return false;
@@ -666,6 +663,13 @@ static bool poll(void) {
     /* Audio from where the last ended, or past the DMA if it ran out. */
     if (ready) {
         uint64_t start = written > played + GUARD ? written : (played + GUARD + 3) & ~3ull;
+        /* After a poll nearly a lap late, frames between the last silence
+         * and start still hold the lap before: silence them first. */
+        if (cleared < played) cleared = played;
+        if (cleared < start) {
+            ring_write(cleared, 0, (uint32_t)(start - cleared));
+            cleared = start;
+        }
         if (start < played + LEAD) {
             uint32_t room = (uint32_t)(played + LEAD - start) & ~3u;
             uint32_t n = (ready + 3) & ~3u;

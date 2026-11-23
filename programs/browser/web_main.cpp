@@ -10,6 +10,7 @@
 #include <WebCore/LocalFrame.h>
 #include <WebCore/LocalFrameInlines.h>
 #include <WebCore/LocalFrameView.h>
+#include <WebCore/MemoryRelease.h>
 #include <WebCore/PaintPhase.h>
 #include <WebCore/Page.h>
 #include <WebCore/PageConfiguration.h>
@@ -118,6 +119,38 @@ static void handBackAcceleratedAnimations(Page &page) {
                 effect->effectStackNoLongerAllowsAcceleration();
         }
     }
+}
+
+// A page's memory as SOS2 counts it (sos2_memory_info): what it maps, and
+// what it may still map, the smaller of what its quota leaves and what the
+// system's pool has free. WebKit's own pressure handler does not run here
+// (ENABLE_PERIODIC_MEMORY_MONITOR is off), so the loop looks every 2 s, and
+// with under 64 MiB left WebCore releases what it would under the system's
+// pressure: caches, decoded images, compiled code, then a full collection.
+// mimalloc keeps what is freed (main sets no purge) for reuse, and the
+// collector's blocks are unmapped. A page that stays large without growing
+// is left alone: another release waits until it maps 32 MiB more or has
+// under 16 MiB left. Once 64 MiB are free again, the next shortage releases
+// without that wait. Releases come at most every 10 s.
+static void relieveMemory() {
+    static MonotonicTime nextCheck, nextRelease;
+    static unsigned releasedAt;
+    auto now = MonotonicTime::now();
+    if (now < nextCheck) return;
+    nextCheck = now + 2_s;
+    user_memory_info info;
+    if (sos2_memory_info(&info) < 0) return;
+    uint64_t left = uint64_t(info.available_pages) * info.page_size;
+    if (left >= 64 * MB) {
+        releasedAt = 0;
+        return;
+    }
+    if (now < nextRelease) return;
+    if (left >= 16 * MB && releasedAt && info.current_pages < releasedAt + 32 * MB / info.page_size)
+        return;
+    nextRelease = now + 10_s;
+    releaseMemory(Critical::Yes, Synchronous::Yes);
+    releasedAt = sos2_memory_info(&info) < 0 ? 0 : info.current_pages;
 }
 
 // A flattened paint leaves out the frame's scrollbars when WebCore keeps them
@@ -530,6 +563,7 @@ int main() {
         RunLoop::cycle();
         SOS2::handleBrowserCommands(page.get());
         SOS2::saveStorage();
+        relieveMemory();
         // Bound work per frame even when a device or page produces continuous input.
         for (unsigned budget = 0; budget < 64; ++budget) {
             user_input_event event;

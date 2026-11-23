@@ -21,9 +21,12 @@
 #include <WebCore/PageConfiguration.h>
 #include <WebCore/PlatformKeyboardEvent.h>
 #include <WebCore/PlatformMouseEvent.h>
+#include <WebCore/PlatformTouchEvent.h>
+#include <WebCore/PlatformTouchPoint.h>
 #include <WebCore/PlatformWheelEvent.h>
 #include <WebCore/PointerCaptureController.h>
 #include <WebCore/PointerEvent.h>
+#include <WebCore/RemoteFrameGeometryTransformer.h>
 #include <WebCore/ScrollingCoordinatorTypes.h>
 #include <WebCore/UndoStep.h>
 #include <wtf/text/MakeString.h>
@@ -416,7 +419,61 @@ public:
     }
 };
 
+// The finger as WebKit's ports hand touches to WebCore (WebKit2's
+// WebEventConversion.cpp): one point, the same identifier for the whole
+// gesture, at its viewport position, with a fingertip's radius.
+class FingerPoint final : public PlatformTouchPoint {
+public:
+    FingerPoint(DoublePoint point, State state) {
+        m_id = 1;
+        m_state = state;
+        m_screenPos = point;
+        m_pos = point;
+        m_radius = {8, 8};
+        m_rotationAngle = 0;
+        m_twist = 0;
+        m_force = state == TouchReleased || state == TouchCancelled ? 0 : 1;
+    }
+};
+
+class FingerEvent final : public PlatformTouchEvent {
+public:
+    FingerEvent(DoublePoint point, Type type, PlatformTouchPoint::State state) {
+        m_type = type;
+        m_timestamp = MonotonicTime::now();
+        m_touchPoints.append(FingerPoint(point, state));
+    }
+};
+
+/* Pages hear the finger as a phone's browser tells them: touchstart when it
+ * lands, touchmove as it moves, touchend when it lifts, and the mouse events
+ * and click of a tap only after that. Sites written for phones listen for
+ * these; YouTube's mobile player, for one, lets a video start with sound
+ * only after a touchstart. True when the page cancelled the event. */
+bool Input::touch(Touch kind, IntPoint point) {
+    RefPtr frame = page.localMainFrame();
+    if (!frame) return false;
+    static constexpr std::pair<PlatformEvent::Type, PlatformTouchPoint::State> kinds[] = {
+        {PlatformEvent::Type::TouchStart, PlatformTouchPoint::TouchPressed},
+        {PlatformEvent::Type::TouchMove, PlatformTouchPoint::TouchMoved},
+        {PlatformEvent::Type::TouchEnd, PlatformTouchPoint::TouchReleased},
+        {PlatformEvent::Type::TouchCancel, PlatformTouchPoint::TouchCancelled}};
+    auto [type, state] = kinds[static_cast<unsigned>(kind)];
+    touchPoint = point;
+    touching = kind == Touch::Start || kind == Touch::Move;
+    // WebCore takes the element a touchstart hits as found, and a document
+    // without a root element (after document.open(), or a script removing
+    // it) hits none. Such a document hears no touch: its touchmove and
+    // touchend then find no target either.
+    RefPtr document = frame->document();
+    if (kind == Touch::Start && (!document || !document->documentElement())) return false;
+    auto cancelled =
+        frame->eventHandler().handleTouchEvent(FingerEvent(DoublePoint(point), type, state));
+    return cancelled && *cancelled;
+}
+
 void Input::cancelPointer() {
+    if (touching) touch(Touch::Cancel, touchPoint);
     if (down) {
         auto &handler = page.localMainFrame()->eventHandler();
         handler.invalidateClick();
@@ -428,7 +485,7 @@ void Input::cancelPointer() {
         // target for the cleanup mouse release outside the viewport.
         page.pointerCaptureController().reset();
     }
-    down = tracking = scrolling = nativeDrag = false;
+    down = tracking = scrolling = nativeDrag = touchHeld = touchCancelled = false;
     clicks = 0;
     lastClick = 0;
 }
@@ -471,7 +528,20 @@ void Input::handle(const user_input_event &event) {
         }
         bool pressed = event.flags & INPUT_DOWN;
         IntPoint point(event.x, event.y);
-        auto frame = page.localMainFrame();
+        if (pressed && event.code == 1) {
+            // A press ends any gesture still open, then starts its own.
+            if (touching) touch(Touch::Cancel, touchPoint);
+            touchHeld = touchCancelled = touch(Touch::Start, point);
+        } else if (touching && (!pressed || point != touchPoint)) {
+            // Cancelling a touchmove before the page scrolls keeps it from
+            // scrolling, as a tap's jitter may move it; cancelling touchend,
+            // like touchstart, from clicking.
+            bool cancelled = touch(pressed ? Touch::Move : Touch::End, point);
+            if (cancelled && pressed && !scrolling) touchHeld = true;
+            if (cancelled && !pressed) touchCancelled = true;
+        }
+        RefPtr frame = page.localMainFrame();
+        if (!frame) return;
         auto &handler = frame->eventHandler();
         if (pressed && event.code == 1) {
             tracking = true;
@@ -493,7 +563,7 @@ void Input::handle(const user_input_event &event) {
                 scrolling = true;
             if (scrolling) {
                 float dx = point.x() - dragPoint.x(), dy = point.y() - dragPoint.y();
-                if (dx || dy) {
+                if ((dx || dy) && !touchHeld) {
                     PlatformWheelEvent wheel(pressPoint, pressPoint, dx, dy, dx / 48, dy / 48,
                                              PlatformWheelEventGranularity::ScrollByPixelWheelEvent,
                                              false, false, false, false);
@@ -503,14 +573,19 @@ void Input::handle(const user_input_event &event) {
                     dragPoint = point;
                 }
                 if (!pressed) {
-                    tracking = scrolling = false;
+                    tracking = scrolling = touchHeld = touchCancelled = false;
                     clicks = 0;
                     lastClick = 0;
                 }
                 return;
             }
             if (pressed) return;
-            tracking = false;
+            tracking = touchHeld = false;
+            if (std::exchange(touchCancelled, false)) {
+                clicks = 0;
+                lastClick = 0;
+                return;
+            }
             double now = MonotonicTime::now().secondsSinceEpoch().value();
             bool nearby =
                 abs(point.x() - lastPoint.x()) <= 4 && abs(point.y() - lastPoint.y()) <= 4;
@@ -552,7 +627,7 @@ void Input::handle(const user_input_event &event) {
             handler.handleMouseReleaseEvent(mouse);
         else handler.mouseMoved(mouse);
         down = pressed;
-        if (!pressed) tracking = nativeDrag = false;
+        if (!pressed) tracking = nativeDrag = touchHeld = touchCancelled = false;
     } else if (event.type == INPUT_KEY && focused) {
         auto key = keyboardEvent(event);
         if (RefPtr frame = page.focusController().focusedOrMainFrame())

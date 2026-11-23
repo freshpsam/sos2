@@ -90,6 +90,9 @@ struct process {
     uint32_t pid;
     uint64_t cpu_us;
     bool reap_pending, restart;
+    /* process_web_park: once reaped, the record keeps the page's slot, and the
+     * desktop its entry, until process_web_resume starts it again. */
+    bool parked;
     const struct app *app; /* Its program and storage; NULL: a web page */
     unsigned running_mask;
     unsigned memory_jobs; /* Threads with a memory_job under way */
@@ -988,9 +991,15 @@ static void service_work(void *argument) {
     p->reap_pending = false;
     if (p->restart) {
         if (!spawn(p, p->pid, p->app)) {
-            /* A Close during the load already closed the slot: no error then.
-             * (spawn starts with restart clear; a reopen sets it again.) */
-            bool closed = p->state != RUNNABLE && !p->restart;
+            /* A Close or a park during the load already took the slot: no
+             * error then. spawn starts with restart clear; a reopen or a
+             * resume during the load sets it again, and the page starts
+             * afresh on the next turn. */
+            if (p->state != RUNNABLE && p->restart) {
+                p->reap_pending = true;
+                return;
+            }
+            bool closed = p->state != RUNNABLE;
             p->state = FAULTED;
             p->restart = false;
             if (!closed) page_host_start_failed(p->pid - 1);
@@ -1002,6 +1011,7 @@ static void service_work(void *argument) {
             return;
         }
     }
+    if (p->parked) return;
     remove_process(p);
     if (!processes && pages_available() + gpu_client_quarantined_pages() != baseline_pages)
         panic("process page leak");
@@ -1126,12 +1136,50 @@ int32_t process_web_control(unsigned slot, bool restart) {
         return USER_ENODEV;
     stop(p);
     p->state = EXITED;
+    p->parked = false;
     p->restart = restart;
     if (restart && !page_host_opened(slot, p->app)) {
         p->restart = false;
         return USER_ENOMEM;
     }
     return 0;
+}
+
+int32_t process_web_park(unsigned slot) {
+    if (current) return USER_EBUSY;
+    struct process *p = process_for(slot);
+    if (!p || p->app || p->parked || p->state != RUNNABLE) return USER_ENODEV;
+    network_close_process(p->pid);
+    audio_close_process(p->pid);
+    p->state = EXITED;
+    p->restart = false;
+    p->parked = p->reap_pending = true;
+    return 0;
+}
+
+int32_t process_web_resume(unsigned slot) {
+    if (current) return USER_EBUSY;
+    struct process *p = process_for(slot);
+    if (!p || !p->parked) return USER_ENODEV;
+    if (!random_ready || !runtime_file_find("/bin/sos2-web")) return USER_ENODEV;
+    if (!page_host_opened(slot, 0)) return USER_ENOMEM;
+    /* The reaper, its releases already done, starts the page (spawn clears
+     * parked), even if it is still reclaiming the parked process. */
+    p->parked = false;
+    p->restart = p->reap_pending = true;
+    return 0;
+}
+
+bool process_playing(unsigned slot) {
+    struct process *p = process_for(slot);
+    return p && audio_process_playing(p->pid);
+}
+
+bool process_reclaiming(void) {
+    /* vm_destroy clears the space once it has freed every page. */
+    for (struct process *p = processes; p; p = p->next)
+        if (p->reap_pending && p->space.mapped_pages) return true;
+    return false;
 }
 
 static bool collect(unsigned cpu) {

@@ -16,6 +16,8 @@ int32_t audio_call(unsigned pid, const struct vm_space *, unsigned op, user_ptr 
 /* A process stopped: its stream closes, and the frames it still queued are
  * dropped. */
 void audio_close_process(unsigned pid);
+/* Whether a process's stream holds frames to play and is not paused. */
+bool audio_process_playing(unsigned pid);
 
 /* A frame as SYS_AUDIO carries it: signed 16-bit samples, left then right. */
 struct audio_frame {
@@ -31,13 +33,23 @@ struct audio_device {
     uint32_t (*latency)(void);
 };
 
-/* QEMU's virtio-sound (kernel/audio/virtio_snd.c) and the tablet's speakers
- * (boards/gta7lite/audio.c); the phone has no audio driver yet. */
+/* QEMU's virtio-sound (kernel/audio/virtio_snd.c), the tablet's speakers
+ * (boards/gta7lite/audio.c) and the Redmi 2's loudspeaker
+ * (boards/redmi2/audio.c); the Nexus 5 has no audio driver yet. */
 bool virtio_snd_init(const struct platform_devices *, struct audio_device *);
 bool gta7lite_audio_init(struct audio_device *);
+bool redmi2_audio_init(struct audio_device *);
 /* For the device's driver: the most frames a playing stream holds, which the
  * mixer could take now; and the mix of the playing streams' next count
  * frames, silence where one runs short, which counts them played. */
 uint32_t audio_ready(void);
 void audio_mix(struct audio_frame *out, uint32_t count);
+
+/* The volume a device's driver applies to the mix, which the volume keys
+ * step: from 0, silent, to AUDIO_VOLUME_STEPS, full scale, 3 dB a step. */
+enum { AUDIO_VOLUME_STEPS = 15 };
+
+/* audio_mix at a volume step, in mono (each channel the mean of the two)
+ * for a single loudspeaker. */
+void audio_mix_volume(struct audio_frame *out, uint32_t count, unsigned level, bool mono);
 #endif

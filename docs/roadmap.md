@@ -39,14 +39,14 @@ Open work; the other documents describe what exists.
    Web Audio and other web APIs; WebGL once the devices draw with their GPUs;
    website-data controls and per-site process isolation, since every page
    shares the browser profile.
-8. **Sound.** An audio driver for the phone (the MSM8916's LPASS and the
-   PM8916 codec), whose pages until then play video silently, on the same
-   clock; on the tablet, its volumes kept across restarts, its headphones'
-   microphone and buttons, and the codec's power-up and power-down ramps
-   (about 30 ms each) run in steps rather than holding CPU 0's loop. In the
-   browser, sound for more than one element at a time (a second video plays
-   silently), and volume and mute that reach the half second already queued,
-   which needs `SYS_AUDIO` to take them.
+8. **Sound.** On the Redmi 2, headphones (jack detection through the
+   PM8916's MBHC and the jack's switch, GPIO 8); on the tablet, its volumes
+   kept across restarts, its headphones' microphone and buttons; on both,
+   the codecs' power-up and power-down sequences (about 25-30 ms each) run
+   in steps rather than holding CPU 0's loop. The Nexus 5's pages play
+   silently. In the browser, sound for more than one element at a time (a
+   second video plays silently), and volume and mute that reach the half
+   second already queued, which needs `SYS_AUDIO` to take them.
 9. **Power.** Standby draws 6.0 mA. The tablet and the Nexus 5 raise their
    CPU clocks only while pages work, the Nexus 5 within what its cores'
    temperature allows. Next: Wi-Fi's share in power save, the display's

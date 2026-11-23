@@ -16,19 +16,22 @@
 #include "redmi2_cpu_power.h"
 #include "redmi2_chip_sleep.h"
 #include "redmi2_idle_devices.h"
+#include "redmi2_audio.h"
+#include "audio.h"
 #include "wifi_setup.h"
 #include "wifi_device.h"
 #include "handoff.h"
 
 /* The Redmi 2's part of the kernel's start and main loop (kernel/main.c):
  * lk2nd's verified handoff and its startup screen, the power driver's
- * screen changes, the touch screen and the keys. Its standby: the backlight
- * off, then the panel asleep, held in reset, the touch controller asleep,
- * Wi-Fi's power saving in its firmware, an idle GPU's clocks stopped, the
- * idle secondary CPUs and then CPU 0 powered down and the CPU cluster at
- * 200 MHz; once Wi-Fi's radio is off and the power key's interrupt is armed,
- * the whole chip sleeps 10 s at a time (chip_sleep.c; 1 s polls where it
- * cannot), and a press or release wakes it at once. While it sleeps, the
+ * screen changes, the touch screen, the keys and the volume keys. Its
+ * standby: the backlight off, then the panel asleep, held in reset, the
+ * touch controller asleep, Wi-Fi's power saving in its firmware, an idle
+ * GPU's clocks stopped, the idle secondary CPUs and then CPU 0 powered down
+ * and the CPU cluster at 200 MHz; once Wi-Fi's radio is off, the sound
+ * hardware is off (3 s after the last frame) and the power key's interrupt
+ * is armed, the whole chip sleeps 10 s at a time (chip_sleep.c; 1 s polls
+ * where it cannot), and a press or release wakes it at once. While it sleeps, the
  * panel's, touch controller's and motion sensor's supply (L17) is off
  * (rails.c), so waking puts the motion sensor back to sleep. */
 extern char __image_start[], __image_end[];
@@ -42,12 +45,13 @@ static bool chip_slept;
 /* 1 s once nothing needs the 20 ms polls: CPU 0 powers down, Wi-Fi's radio
  * is off (or there is no Wi-Fi), the GPU rests, no service job is part way
  * (an eMMC write yields while the card programs), no vibrator stop waits to
- * be tried again, and the key's interrupt is armed with no press or release
- * being debounced and its shared line low. */
+ * be tried again, the sound hardware is off, and the key's interrupt is
+ * armed with no press or release being debounced and its shared line low. */
 static uint32_t standby_sleep_us(void) {
     bool quiet = redmi2_cpu0_wake_irq() && redmi2_power_key_irq() &&
                  redmi2_wifi_standby_settled() && redmi2_adreno_resting() && !kernel_io_busy() &&
-                 haptics_quiet() && redmi2_power_quiet() && !redmi2_cpu0_source_raised();
+                 haptics_quiet() && redmi2_power_quiet() && redmi2_audio_quiet() &&
+                 !redmi2_cpu0_source_raised();
     return quiet ? STANDBY_IDLE_US : BOARD_STANDBY_POLL_US;
 }
 
@@ -115,6 +119,12 @@ enum board_power board_power_poll(void) {
                                               : BOARD_POWER_NONE;
 }
 
+/* The volume keys step the loudspeaker's level, which the header shows. */
+static void volume_poll(void) {
+    int step = redmi2_volume_key();
+    if (step) page_host_volume(redmi2_audio_volume(step), AUDIO_VOLUME_STEPS, false);
+}
+
 void board_input(struct pointer_event *event) {
     enum phone_input_source source = PHONE_INPUT_TOUCH;
     if (phone_input_poll(event, &source)) {
@@ -123,6 +133,7 @@ void board_input(struct pointer_event *event) {
         else if (source == PHONE_INPUT_BACK) page_host_back();
         else page_host_input(event);
     }
+    volume_poll();
 }
 
 void board_after_frame(void) { redmi2_idle_devices_poll(); }

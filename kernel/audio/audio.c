@@ -51,8 +51,11 @@ void audio_init(const struct platform_devices *devices) {
 #ifdef SOS2_BOARD_GTA7LITE
     (void)devices;
     online = gta7lite_audio_init(&device);
+#elif defined(SOS2_BOARD_REDMI2)
+    (void)devices;
+    online = redmi2_audio_init(&device);
 #elif defined(SOS2_DEVICE)
-    (void)devices; /* the phones have no sound driver yet */
+    (void)devices; /* the Nexus 5 has no sound driver yet */
 #else
     online = virtio_snd_init(devices, &device);
 #endif
@@ -110,6 +113,21 @@ void audio_mix(struct audio_frame *out, uint32_t count) {
     }
 }
 
+/* Q15 gains of the volume's steps. */
+static const uint16_t volume_gain[AUDIO_VOLUME_STEPS + 1] = {
+    0, 260, 368, 519, 734, 1036, 1464, 2068, 2920, 4125, 5827, 8231, 11627, 16423, 23198, 32768};
+
+void audio_mix_volume(struct audio_frame *out, uint32_t count, unsigned level, bool mono) {
+    audio_mix(out, count);
+    int32_t gain = volume_gain[level < AUDIO_VOLUME_STEPS ? level : AUDIO_VOLUME_STEPS];
+    if (gain == volume_gain[AUDIO_VOLUME_STEPS] && !mono) return;
+    for (uint32_t i = 0; i < count; ++i) {
+        int32_t left = out[i].left, right = out[i].right;
+        if (mono) left = right = (left + right) >> 1;
+        out[i] = (struct audio_frame){(int16_t)(left * gain >> 15), (int16_t)(right * gain >> 15)};
+    }
+}
+
 /* Takes as many frames as fit, in at most two pieces around the queue's end. */
 static int32_t write_frames(struct stream *s, const struct vm_space *space, user_ptr from,
                             uint32_t count) {
@@ -164,4 +182,9 @@ int32_t audio_call(unsigned pid, const struct vm_space *space, unsigned op, user
 void audio_close_process(unsigned pid) {
     struct stream *s = stream_of(pid);
     if (s) close_stream(s);
+}
+
+bool audio_process_playing(unsigned pid) {
+    const struct stream *s = stream_of(pid);
+    return s && !s->paused && s->count;
 }

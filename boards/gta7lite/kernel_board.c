@@ -1,5 +1,6 @@
 #include "kernel_board.h"
 #include "platform.h"
+#include "audio.h"
 #include "display.h"
 #include "page_host.h"
 #include "process.h"
@@ -25,7 +26,7 @@ static void volume_poll(void) {
     bool plugged = gta7lite_audio_headphones();
     if (!step && plugged == headphones) return;
     headphones = plugged;
-    page_host_volume(gta7lite_audio_volume(step), GTA7LITE_VOLUME_STEPS, plugged);
+    page_host_volume(gta7lite_audio_volume(step), AUDIO_VOLUME_STEPS, plugged);
 }
 
 /* Long boot work (expanding the ramdisk, page tables, zeroing pages) reports
