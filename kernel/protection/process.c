@@ -26,7 +26,23 @@
 
 enum state { RUNNABLE, FAULTED, EXITED };
 
-enum thread_state { T_UNUSED, T_READY, T_SLEEP, T_WAIT, T_SERVICE, T_QUIESCE, T_DONE };
+enum thread_state { T_UNUSED, T_READY, T_SLEEP, T_WAIT, T_SERVICE, T_MEMORY, T_QUIESCE, T_DONE };
+
+/* Mappings and unmappings of MEMORY_JOB_PAGES pages (1 MiB) or more take
+ * MEMORY_SLICE_PAGES a turn of the kernel's loop, about 0.1 ms on the Nexus
+ * 5, while their thread waits (T_MEMORY): mapping 60 MiB in one call held
+ * every other syscall and the desktop for 45 ms there. */
+#define MEMORY_JOB_PAGES   256
+#define MEMORY_SLICE_PAGES 32
+
+/* A thread's big mapping or unmapping (include/vm.h). */
+struct memory_job {
+    user_ptr address;
+    unsigned count, done;
+    unsigned char permissions;
+    bool unmap;
+    bool finish; /* The unmap's last step waits in T_QUIESCE. */
+};
 
 struct thread {
     struct arm_context context;
@@ -43,6 +59,7 @@ struct thread {
     unsigned running_cpu;
     bool resume;
     uint64_t deadline, cpu_us, slice_deadline;
+    struct memory_job memory;
 };
 
 /* What first-fit searches in the heap or the JIT window found: no free run of
@@ -75,6 +92,7 @@ struct process {
     bool reap_pending, restart;
     const struct app *app; /* Its program and storage; NULL: a web page */
     unsigned running_mask;
+    unsigned memory_jobs; /* Threads with a memory_job under way */
 };
 
 #define PROCESS_PAGES ((sizeof(struct process) + PAGE_SIZE - 1) / PAGE_SIZE)
@@ -296,7 +314,7 @@ static bool copy_thread_context(struct process *p, user_ptr address, const struc
 static int32_t create_thread(struct process *p, user_ptr address) {
     struct user_thread_start start;
     if (!vm_copy_from_user(&p->space, &start, address, sizeof(start))) return USER_EFAULT;
-    if ((start.entry & 3) || !vm_resolve(&p->space, start.entry, VM_EXEC) ||
+    if (!arch_user_entry_valid(start.entry) || !vm_resolve(&p->space, start.entry, VM_EXEC) ||
         (start.stack & (USER_STACK_ALIGN - 1)) || (start.size & (USER_STACK_ALIGN - 1)) ||
         start.size < PAGE_SIZE || start.size > 4 * 1024 * 1024 ||
         !vm_accessible(&p->space, start.stack, start.size, VM_WRITE) ||
@@ -362,9 +380,9 @@ static void lower_hints(struct process *p, user_ptr address) {
 
 /* First-fit placement of count pages at a multiple of alignment pages in
  * [lower, upper), within the heap or the JIT window, resumed where earlier
- * searches for such runs ended. */
+ * searches for such runs ended; reserved only, for a memory job, if asked. */
 static user_ptr allocate_range(struct process *p, unsigned count, unsigned alignment,
-                               user_ptr lower, user_ptr upper, unsigned flags) {
+                               user_ptr lower, user_ptr upper, unsigned flags, bool reserve) {
     unsigned range = hint_range(lower);
     struct range_hint *hint = 0;
     for (unsigned i = 0; i < RANGE_HINTS; ++i)
@@ -373,7 +391,9 @@ static user_ptr allocate_range(struct process *p, unsigned count, unsigned align
     user_ptr known = hint ? hint->address : range ? USER_JIT_BASE : USER_HEAP_BASE;
     user_ptr from = known > lower ? known : lower;
     if (from >= upper) return 0;
-    user_ptr address = vm_allocate_range(&p->space, count, alignment, from, upper, flags);
+    user_ptr address = reserve
+                           ? vm_reserve_range(&p->space, count, alignment, from, upper, flags)
+                           : vm_allocate_range(&p->space, count, alignment, from, upper, flags);
     /* Only a search that covered the range from its start teaches anything;
      * a failure may be the page pool running out, not a lack of room. */
     if (address && from == known) {
@@ -388,6 +408,28 @@ static user_ptr allocate_range(struct process *p, unsigned count, unsigned align
     return address;
 }
 
+/* Whether a mapping of count pages runs as a job. */
+static bool deferred_mapping(unsigned count) { return count >= MEMORY_JOB_PAGES; }
+
+/* A job's range starts on a megabyte if one is free, where sections fit. */
+static user_ptr place(struct process *p, unsigned count, unsigned alignment, user_ptr lower,
+                      user_ptr upper, unsigned flags, bool reserve) {
+    user_ptr address = 0;
+    if (reserve && alignment < MEMORY_JOB_PAGES)
+        address = allocate_range(p, count, MEMORY_JOB_PAGES, lower, upper, flags, true);
+    return address ? address : allocate_range(p, count, alignment, lower, upper, flags, reserve);
+}
+
+/* The calling thread waits while memory_step runs the job. */
+static void memory_defer(struct process *p, user_ptr address, unsigned count, unsigned flags,
+                         bool unmap) {
+    current_thread->memory = (struct memory_job){
+        .address = address, .count = count, .permissions = (unsigned char)flags, .unmap = unmap};
+    current_thread->state = T_MEMORY;
+    continue_slice = false;
+    ++p->memory_jobs;
+}
+
 static user_result memory_call(struct process *p, uint32_t number, user_ptr address, unsigned count,
                                unsigned flags) {
     bool jit = jit_window(p, address, address + (user_ptr)count * PAGE_SIZE);
@@ -395,8 +437,11 @@ static user_result memory_call(struct process *p, uint32_t number, user_ptr addr
         ((flags & 6) == 6 && !jit) || (flags && !(flags & VM_READ)))
         return USER_EINVAL;
     if (number == SYS_VM_MAP && !address) {
-        address = allocate_range(p, count, 1, USER_HEAP_BASE, USER_HEAP_END, flags);
-        return address ? (user_result)address : USER_ENOMEM;
+        bool reserve = deferred_mapping(count);
+        address = place(p, count, 1, USER_HEAP_BASE, USER_HEAP_END, flags, reserve);
+        if (!address) return USER_ENOMEM;
+        if (reserve) memory_defer(p, address, count, flags, false);
+        return (user_result)address;
     }
     if (number == SYS_VM_CHECK) {
         if ((address & (PAGE_SIZE - 1)) || address < USER_BASE || address >= USER_END ||
@@ -411,8 +456,14 @@ static user_result memory_call(struct process *p, uint32_t number, user_ptr addr
                   count > (USER_HEAP_END - address) / PAGE_SIZE)))
         return USER_EINVAL;
     for (unsigned i = 0; i < count; ++i) {
-        bool mapped = vm_mapped(&p->space, address + i * PAGE_SIZE);
-        if (number == SYS_VM_MAP ? mapped : !mapped) return USER_EINVAL;
+        user_ptr at = address + i * PAGE_SIZE;
+        if (number == SYS_VM_MAP ? vm_occupied(&p->space, at) : !vm_mapped(&p->space, at))
+            return USER_EINVAL;
+    }
+    if (number == SYS_VM_MAP && deferred_mapping(count)) {
+        if (!vm_reserve(&p->space, address, count, flags)) return USER_ENOMEM;
+        memory_defer(p, address, count, flags, false);
+        return (user_result)address;
     }
     if (number == SYS_VM_MAP) {
         unsigned i = 0;
@@ -420,6 +471,12 @@ static user_result memory_call(struct process *p, uint32_t number, user_ptr addr
         if (i == count) return (user_result)address;
         if (i && !vm_release(&p->space, address, i)) panic("mapping rollback failed");
         return USER_ENOMEM;
+    }
+    if (number == SYS_VM_UNMAP && deferred_mapping(count)) {
+        /* Quiescent here, as every unmap (needs_quiescence). */
+        if (!vm_unmap_begin(&p->space, address, count)) return USER_EINVAL;
+        memory_defer(p, address, count, 0, true);
+        return 0;
     }
     if (number == SYS_VM_UNMAP) {
         /* One release, not a page at a time: it frees emptied tables once. */
@@ -620,8 +677,10 @@ static void syscall(struct process *p) {
                 r[0] = (user_reg)USER_EINVAL;
                 break;
             }
-            user_ptr address = allocate_range(p, count, 1u << shift, lower, upper, flags);
+            bool reserve = deferred_mapping(count);
+            user_ptr address = place(p, count, 1u << shift, lower, upper, flags, reserve);
             r[0] = address ? address : (user_reg)USER_ENOMEM;
+            if (address && reserve) memory_defer(p, address, count, flags, false);
             break;
         }
         case SYS_MEMORY_INFO: {
@@ -797,7 +856,7 @@ static bool needs_quiescence(const struct process *p, const user_reg *r) {
 
 static bool quiescence_pending(const struct process *p) {
     for (unsigned i = 0; i < USER_THREAD_LIMIT; ++i)
-        if (p->threads[i].state == T_QUIESCE || p->threads[i].state == T_SERVICE) return true;
+        if (p->threads[i].state == T_QUIESCE) return true;
     return false;
 }
 
@@ -833,18 +892,62 @@ static void stop(struct process *p) {
     p->reap_pending = true;
 }
 
+/* A service request of p's may be waiting meanwhile: it touches p's memory
+ * only between the worker's yields, through vm_copy_* walking the tables
+ * then, so a mapping changed here at worst fails its copy (USER_EFAULT).
+ * A memory job's unmap ends here too. */
 static void finish_quiescent(struct process *p) {
-    if (p->running_mask || p == io_owner || p->state != RUNNABLE) return;
+    if (p->running_mask || p->state != RUNNABLE) return;
     for (unsigned i = 0; i < USER_THREAD_LIMIT; ++i) {
         struct thread *t = &p->threads[i];
         if (t->state != T_QUIESCE) continue;
         t->state = T_READY;
+        if (t->memory.finish) {
+            vm_unmap_end(&p->space, t->memory.address, t->memory.count);
+            lower_hints(p, t->memory.address);
+            t->memory.finish = false;
+            t->context.r[0] = 0;
+            --p->memory_jobs;
+            continue;
+        }
         current = p;
         current_thread = t;
         syscall(p);
         if (p->space.mapped_pages > p->peak_pages) p->peak_pages = p->space.mapped_pages;
         current = 0;
         current_thread = 0;
+    }
+}
+
+/* One slice of a job. An unmap's last step frees the tables it emptied,
+ * which needs the process quiescent (vm_unmap_end). */
+static void memory_slice(struct process *p, struct thread *t) {
+    struct memory_job *job = &t->memory;
+    unsigned end = job->count;
+    if (end - job->done > MEMORY_SLICE_PAGES) end = job->done + MEMORY_SLICE_PAGES;
+    for (; job->done < end; ++job->done) {
+        user_ptr at = job->address + (user_ptr)job->done * PAGE_SIZE;
+        if (job->unmap) vm_unmap_page(&p->space, at);
+        else vm_fill_reserved(&p->space, at, job->permissions);
+    }
+    if (job->done < job->count) return;
+    if (job->unmap) {
+        job->finish = true;
+        t->state = T_QUIESCE;
+        return;
+    }
+    t->context.r[0] = (user_reg)job->address;
+    t->state = T_READY;
+    --p->memory_jobs;
+}
+
+/* A slice of each job a turn. A process that stopped keeps its job's
+ * half-done entries for vm_destroy. */
+static void memory_step(void) {
+    for (struct process *p = processes; p; p = p->next) {
+        if (!p->memory_jobs || p->state != RUNNABLE) continue;
+        for (unsigned i = 0; i < USER_THREAD_LIMIT; ++i)
+            if (p->threads[i].state == T_MEMORY) memory_slice(p, &p->threads[i]);
     }
 }
 
@@ -939,8 +1042,11 @@ static void service_step(void) {
             for (unsigned checked = 0; checked < count; ++checked) {
                 struct process *p = next_io ? next_io : processes;
                 next_io = p->next ? p->next : processes;
-                if (p->running_mask) continue;
+                /* A request runs beside the process's other threads, which
+                 * never wait for it (finish_quiescent). Teardown waits for
+                 * every thread to leave its CPU. */
                 if (p->reap_pending) {
+                    if (p->running_mask) continue;
                     io_owner = p;
                     break;
                 }
@@ -1028,10 +1134,12 @@ int32_t process_web_control(unsigned slot, bool restart) {
     return 0;
 }
 
-static void collect(unsigned cpu) {
-    if (arm_cpu_failed(cpu)) panic("secondary CPU kernel exception");
+static bool collect(unsigned cpu) {
     const struct arm_cpu *result = arm_cpu_result(cpu);
-    if (!result) return;
+    if (!result) {
+        if (arm_cpu_failed(cpu)) panic("secondary CPU kernel exception");
+        return false;
+    }
     struct process *p = dispatched[cpu].process;
     struct thread *t = dispatched[cpu].thread;
     if (!p || !t || t->running_cpu != cpu + 1 || !(p->running_mask & (1u << cpu)))
@@ -1052,6 +1160,7 @@ static void collect(unsigned cpu) {
         if (p->state != RUNNABLE) stop(p);
     }
     arm_cpu_release(cpu);
+    return true;
 }
 
 /* Sleeps and waits that have ended make their threads ready: once per step,
@@ -1103,9 +1212,10 @@ static void dispatch(unsigned cpu, uint64_t now) {
         struct process *p = next_process ? next_process : processes;
         next_process = p->next ? p->next : processes;
         /* CPU 0 still owns all kernel services. Independent user threads can
-         * run together until a mapping, suspension or I/O operation needs the
-         * whole address space quiescent. Never dispatch one thread twice. */
-        if (p == io_owner || p->state != RUNNABLE || quiescence_pending(p)) continue;
+         * run together, a service request included, until a mapping change or
+         * a suspension needs the whole address space quiescent. Never
+         * dispatch one thread twice. */
+        if (p->state != RUNNABLE || quiescence_pending(p)) continue;
         struct thread *t = next_ready(p, now);
         if (!t) continue;
         if (!t->resume || now >= t->slice_deadline) t->slice_deadline = now + 5000;
@@ -1144,12 +1254,27 @@ uint64_t process_user_us(void) { return user_us; }
  * Kernel services, including I/O already submitted, keep running. */
 void process_freeze(bool freeze) { frozen = freeze; }
 
+/* A turn of the loop is 20-40 us and a thread waited for one at each end of
+ * every system call, 5% of YouTube's main thread on the Nexus 5. */
+void process_turnaround(void) {
+    if (arm_smp_online() == 1) return; /* CPU 0 runs slices only in process_step */
+    bool collected = false;
+    for (unsigned cpu = 1; cpu < ARM_CPU_MAX; ++cpu) collected = collect(cpu) || collected;
+    if (!collected) return;
+    for (struct process *p = processes; p; p = p->next) finish_quiescent(p);
+    dispatch_idle(next_cpu);
+}
+
 void process_step(void) {
+    process_turnaround();
     for (unsigned cpu = 0; cpu < ARM_CPU_MAX; ++cpu) collect(cpu);
     for (struct process *p = processes; p; p = p->next) finish_quiescent(p);
+    memory_step();
     network_poll();
+    process_turnaround();
     audio_poll();
     service_step();
+    process_turnaround();
     if (random_ready != entropy_available()) {
         random_ready = entropy_available();
         page_host_entropy_status(random_ready, entropy_error());

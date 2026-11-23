@@ -134,7 +134,7 @@ struct HTTP2Session::Impl {
             return 0;
         }
         if (!value->headersReady || size > maximumBody - value->received ||
-            size > 65535 - value->response.body.size()) {
+            size > size_t(streamWindow) - value->response.body.size()) {
             // nghttp2 ignores non-fatal errors from this callback, so reset the
             // stream here rather than returning one.
             value->error = "HTTP/2 body exceeds resource limit or precedes headers";
@@ -215,9 +215,10 @@ struct HTTP2Session::Impl {
             {NGHTTP2_SETTINGS_ENABLE_PUSH, 0},
             {NGHTTP2_SETTINGS_HEADER_TABLE_SIZE, 4096},
             {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 6},
+            {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, streamWindow},
             {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, maximumHeaders}};
         if (nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, settings, std::size(settings)) ||
-            nghttp2_session_set_local_window_size(session, NGHTTP2_FLAG_NONE, 0, 6 * 65535))
+            nghttp2_session_set_local_window_size(session, NGHTTP2_FLAG_NONE, 0, connectionWindow))
             failed = true;
     }
 

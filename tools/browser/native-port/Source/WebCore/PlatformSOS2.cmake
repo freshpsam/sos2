@@ -51,6 +51,7 @@ list(APPEND WebCore_SOURCES
     platform/graphics/sos2/MediaSampleSOS2.cpp
     platform/graphics/sos2/MediaSourcePrivateSOS2.cpp
     platform/graphics/sos2/SourceBufferPrivateSOS2.cpp
+    platform/graphics/sos2/YUVScalerSOS2.cpp
     platform/sos2/PlatformScreenSOS2.cpp
     platform/sos2/PlatformDisplaySOS2.cpp
     platform/graphics/PlatformDisplay.cpp

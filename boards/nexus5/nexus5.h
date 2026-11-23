@@ -91,12 +91,23 @@ uint32_t nexus5_vibrator_brake(void);
 bool nexus5_vibrator_run(bool on);
 
 /* The cores' and L2's clocks (cpu_clock.c), on CPU 0: init moves CPU 0 and
- * the L2 from the bootloader's rates to the faster ones the rails carry as
- * they are (false: left as they were); start clocks a core that is still
- * off at that rate; standby parks CPU 0 and the L2 on 300 MHz and back. */
+ * the L2 from the bootloader's rates to the floor of the stock table's
+ * points for this part (false: left as they were); start clocks a core that
+ * is still off at the current point; poll, each loop turn with the
+ * processes' user time, raises the cores while pages work and lowers them
+ * after, within what their temperature allows; standby puts the cores at
+ * the floor and parks CPU 0 and the L2 on 300 MHz, and back. */
 bool nexus5_cpu_clock_init(void);
 bool nexus5_cpu_clock_start(unsigned cpu);
+void nexus5_cpu_clock_poll(uint64_t user_us);
 void nexus5_cpu_clock_standby(bool on);
+/* The cores' temperature sensors (thermal.c): init takes their calibration
+ * from the fuses; temperature gives the hottest core's, in degrees. */
+bool nexus5_thermal_init(void);
+bool nexus5_cpu_temperature(int *degrees);
+/* The RPM (rpm.c): the logic rail's corner while the apps processor runs
+ * (rpm-regulator-smd.h's: 5 normal, 7 super turbo), acknowledged. */
+bool nexus5_rpm_logic_corner(unsigned corner);
 
 /* The other three cores (smp.c), for arch/arm/smp.c on CPU 0: prepare
  * gives the firmware their entry and returns how many cores there are (1

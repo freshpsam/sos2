@@ -93,6 +93,19 @@ static struct {
     unsigned left, top, right, bottom;
 } web_damage;
 
+/* Where the display scales on the CPU (display_bands), a page's frame is drawn
+ * a band of rows a turn: scaling a video frame took the Nexus 5 1.4 ms, all of
+ * it holding CPU 0's loop and every system call. A pass copies the damaged
+ * rows into the composition at once, so that a frame the page presents
+ * meanwhile waits for the next pass rather than mixing with this one, scales
+ * WEB_BAND_PIXELS of them a turn, and shows the region once the last band is
+ * in. Rows from next to bottom are left (none when they are equal). */
+static struct {
+    unsigned left, width, top, next, bottom;
+} web_pass;
+
+enum { WEB_BAND_PIXELS = WEB_WIDTH * 32 };
+
 static struct widget_damage {
     unsigned x, y, width, height;
     void (*paint)(struct framebuffer *, unsigned, unsigned);
@@ -132,6 +145,13 @@ static void status_tick(void);
 static void status_render(struct framebuffer *, unsigned, unsigned);
 static uint64_t status_minute = UINT64_MAX;
 static struct battery_view status_battery;
+/* When status_tick next reads the clock and the battery: the clock shows
+ * minutes, and both change slowly, so not every turn (that read the timer and
+ * divided its time by 60 s in 64 bits). */
+static uint64_t status_next;
+
+enum { STATUS_PERIOD_US = 100000 };
+
 /* The volume shown until volume_until (0: the clock is). */
 static unsigned volume_level, volume_steps;
 static bool volume_headphones;
@@ -428,6 +448,7 @@ void page_host_init(struct framebuffer *screen) {
     composed_view = UINT32_MAX;
     screen_active = true;
     web_damage.right = web_damage.bottom = 0;
+    web_pass.next = web_pass.bottom = 0;
     entropy_message[0] = device_message[DEVICE_TOUCH][0] = device_message[DEVICE_USB][0] = 0;
     address[0] = 0;
     address_length = address_cursor = address_offset = page_offset = 0;
@@ -441,6 +462,7 @@ void page_host_init(struct framebuffer *screen) {
     browser_message = 0;
     status_minute = UINT64_MAX;
     status_battery = (struct battery_view){0};
+    status_next = 0;
     desktop_wifi_close();
     desktop_wifi_network_status(0);
 }
@@ -915,7 +937,10 @@ void page_host_device_status(bool entropy, bool storage, bool session) {
     dirty = true;
 }
 
-void page_host_clock_status(void) { status_tick(); }
+void page_host_clock_status(void) {
+    status_next = 0;
+    status_tick();
+}
 
 static void device_status(unsigned device, const char *prefix, const char *error) {
     char text[sizeof(device_message[0])] = {0};
@@ -1275,13 +1300,52 @@ static void page_header_render(struct framebuffer *screen, unsigned x, unsigned 
     header_button(screen, BACK_X, "BACK");
 }
 
+/* The header's right side: the clock (or the volume while it changes) at
+ * x 354, then, 6 pixels on as the buttons are spaced, the battery, whose
+ * outline is 44x22 so that "100" fits inside at the clock's size, level with
+ * the clock's digits. */
+enum { CLOCK_X = 354, BATTERY_X = 418, BATTERY_Y = 12, BATTERY_W = 44, BATTERY_H = 22 };
+
 /* A bar, filled to the level: white for the speakers, green for
  * headphones. */
 static void volume_render(struct framebuffer *screen) {
     unsigned color = volume_headphones ? 0x61e0bd : 0xf1f5f6;
-    gfx_rect(screen, 360, 18, 62, 14, color);
-    gfx_rect(screen, 362, 20, 58, 10, 0x17232c);
-    if (volume_level) gfx_rect(screen, 363, 21, 56 * volume_level / volume_steps, 8, color);
+    gfx_rect(screen, CLOCK_X, 18, 58, 14, color);
+    gfx_rect(screen, CLOCK_X + 2, 20, 54, 10, 0x17232c);
+    if (volume_level) gfx_rect(screen, CLOCK_X + 3, 21, 52 * volume_level / volume_steps, 8, color);
+}
+
+/* The outline is green on a charger and red at 15 % or less. While the
+ * battery charges, a plus on its level bar; otherwise the percentage, in
+ * white at the clock's size over the level bar in a darker shade of the
+ * outline, so the digits read on the bar and beside it alike. Without a
+ * gauge, an empty outline. */
+static void battery_render(struct framebuffer *screen) {
+    const struct battery_view *b = &status_battery;
+    bool low = b->percent <= 15;
+    unsigned color = !b->available ? 0xb9c9d0 : b->charger ? 0x61e0bd : low ? 0xef7766 : 0xf1f5f6;
+    gfx_rect(screen, BATTERY_X, BATTERY_Y, BATTERY_W, BATTERY_H, color);
+    gfx_rect(screen, BATTERY_X + 2, BATTERY_Y + 2, BATTERY_W - 4, BATTERY_H - 4, 0x17232c);
+    gfx_rect(screen, BATTERY_X + BATTERY_W, BATTERY_Y + 7, 3, BATTERY_H - 14, color);
+    if (!b->available) return;
+    int bar = (int)((BATTERY_W - 6) * b->percent / 100);
+    if (b->charging) {
+        gfx_rect(screen, BATTERY_X + 3, BATTERY_Y + 3, bar, BATTERY_H - 6, color);
+        int x = BATTERY_X + BATTERY_W / 2, y = BATTERY_Y + BATTERY_H / 2;
+        gfx_rect(screen, x - 2, y - 6, 4, 12, 0x17232c);
+        gfx_rect(screen, x - 6, y - 2, 12, 4, 0x17232c);
+        gfx_rect(screen, x - 1, y - 5, 2, 10, color);
+        gfx_rect(screen, x - 5, y - 1, 10, 2, color);
+        return;
+    }
+    gfx_rect(screen, BATTERY_X + 3, BATTERY_Y + 3, bar, BATTERY_H - 6,
+             b->charger ? 0x1f5c4e
+             : low      ? 0x73302a
+                        : 0x31515c);
+    char digits[12];
+    *decimal(digits, b->percent) = 0;
+    gfx_text(screen, BATTERY_X + (BATTERY_W - gfx_text_width(digits, 2)) / 2, BATTERY_Y + 4, digits,
+             2, 0xf1f5f6);
 }
 
 static void status_render(struct framebuffer *screen, unsigned x, unsigned y) {
@@ -1298,28 +1362,18 @@ static void status_render(struct framebuffer *screen, unsigned x, unsigned y) {
         time[3] = '0' + minute / 10;
         time[4] = '0' + minute % 10;
     }
-    if (!volume_until) gfx_text(screen, 360, 16, time, 2, 0xf1f5f6);
-    /* Green on a charger, with a plus while it charges; without a gauge an
-     * empty outline. */
-    unsigned color = !status_battery.available      ? 0xb9c9d0
-                     : status_battery.charger       ? 0x61e0bd
-                     : status_battery.percent <= 15 ? 0xef7766
-                                                    : 0xf1f5f6;
-    gfx_rect(screen, 436, 14, 24, 20, color);
-    gfx_rect(screen, 438, 16, 20, 16, 0x17232c);
-    gfx_rect(screen, 460, 20, 3, 8, color);
-    if (status_battery.available) {
-        gfx_rect(screen, 439, 17, 18 * status_battery.percent / 100, 14, color);
-        if (status_battery.charging) {
-            gfx_rect(screen, 446, 20, 2, 8, 0x17232c);
-            gfx_rect(screen, 443, 23, 8, 2, 0x17232c);
-            gfx_rect(screen, 447, 20, 1, 8, color);
-            gfx_rect(screen, 443, 24, 8, 1, color);
-        }
-    }
+    if (!volume_until) gfx_text(screen, CLOCK_X, 16, time, 2, 0xf1f5f6);
+    battery_render(screen);
 }
 
 static void status_tick(void) {
+    uint64_t now = loop_time_us();
+    if (volume_until && now >= volume_until) {
+        volume_until = 0;
+        page_host_redraw_region(352, 0, 128, WEB_TOP, status_render);
+    }
+    if (now < status_next) return;
+    status_next = now + STATUS_PERIOD_US;
     uint64_t us = 0, minute = system_clock_read(&us) ? us / 60000000 : UINT64_MAX;
     struct battery_view battery = *battery_view();
     if (battery.percent > 100) battery.available = false;
@@ -1328,10 +1382,6 @@ static void status_tick(void) {
         battery.charging != status_battery.charging) {
         status_minute = minute;
         status_battery = battery;
-        page_host_redraw_region(352, 0, 128, WEB_TOP, status_render);
-    }
-    if (volume_until && time_us() >= volume_until) {
-        volume_until = 0;
         page_host_redraw_region(352, 0, 128, WEB_TOP, status_render);
     }
 }
@@ -1392,11 +1442,25 @@ static void browser_render(struct framebuffer *screen) {
     launcher_render(screen);
 }
 
+/* The current pass's next band, and once it is the last, the region shown. */
+static void web_pass_step(void) {
+    if (web_pass.next >= web_pass.bottom) return;
+    unsigned rows = WEB_BAND_PIXELS / web_pass.width;
+    if (!rows) rows = 1;
+    unsigned end = web_pass.bottom - web_pass.next > rows ? web_pass.next + rows : web_pass.bottom;
+    (void)display_draw_region(display, &composition, web_pass.left, web_pass.next + WEB_TOP,
+                              web_pass.width, end - web_pass.next);
+    web_pass.next = end;
+    if (end == web_pass.bottom)
+        display_show_region(display, &composition, web_pass.left, web_pass.top + WEB_TOP,
+                            web_pass.width, web_pass.bottom - web_pass.top);
+}
+
 void page_host_render(void) {
     status_tick();
-    screen_keyboard_tick(&keyboard, time_us(), soft_emit, 0);
-    if (!display ||
-        (!dirty && !address_damage && !keyboard_damage && !widget_count && !web_damage.right))
+    screen_keyboard_tick(&keyboard, loop_time_us(), soft_emit, 0);
+    if (!display || (!dirty && !address_damage && !keyboard_damage && !widget_count &&
+                     !web_damage.right && web_pass.next >= web_pass.bottom))
         return;
     /* A phone scanout is uncached. Comparing a whole frame to highlight one
      * key can exceed the touch report deadline and turn its release into a
@@ -1428,7 +1492,8 @@ void page_host_render(void) {
             !web_damage.top && web_damage.bottom >= visible_page->viewport)
             composed_view = view;
         display_page_view(gpu_view || view == composed_view ? view : UINT32_MAX, view_height);
-        if (web_damage.right) {
+        /* Damage that comes during a pass waits for the next. */
+        if (web_damage.right && web_pass.next >= web_pass.bottom) {
             unsigned height = visible_page ? visible_page->viewport : 0;
             unsigned bottom = web_damage.bottom < height ? web_damage.bottom : height;
             if (visible_page && visible_page->ready && web_damage.top < bottom) {
@@ -1440,11 +1505,15 @@ void page_host_render(void) {
                     for (unsigned row = web_damage.top; row < bottom; ++row)
                         memcpy(composition_pixels + (row + WEB_TOP) * WEB_WIDTH + x,
                                visible_page->pixels + row * WEB_WIDTH + x, width * 4);
-                    (void)display_present_region(display, &composition, x, y, width, rows);
+                    if (display_bands())
+                        web_pass = (__typeof__(web_pass)){x, width, web_damage.top, web_damage.top,
+                                                          bottom};
+                    else (void)display_present_region(display, &composition, x, y, width, rows);
                 }
             }
             web_damage.right = web_damage.bottom = 0;
         }
+        web_pass_step();
         for (unsigned i = 0; i < widget_count; ++i) {
             const struct widget_damage *d = &widget_damage[i];
             d->paint(&composition, d->x, d->y);
@@ -1507,4 +1576,5 @@ void page_host_render(void) {
     widget_count = 0;
     dirty = false;
     web_damage.right = web_damage.bottom = 0;
+    web_pass.next = web_pass.bottom = 0;
 }

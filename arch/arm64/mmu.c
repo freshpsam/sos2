@@ -16,13 +16,21 @@
  * attributes: 0 Device-nGnRE, 1 Normal non-cacheable, 2 Normal write-back.
  * Code, immutable kernel data and explicitly CPU-private memory are cached.
  * User pages and their supervisor physical aliases use identical shareable
- * write-back attributes. Page tables, scanout and DMA remain non-cacheable,
- * and table walks are non-cacheable too. The allocator's free pages are
- * non-cacheable; transitions happen only while no CPU can execute the owning
- * address space. No device uses user pages as DMA.
+ * write-back attributes. Scanout and DMA remain non-cacheable. The
+ * allocator's free pages are non-cacheable; transitions happen only while no
+ * CPU can execute the owning address space. No device uses user pages as DMA.
+ * The shared engine is mapped with 2 MiB level 2 blocks, as arch/arm/mmu.c
+ * maps it with sections.
+ * Translation tables are cached and walked through the caches (TCR_EL1's
+ * IRGN0/ORGN0 write-back, inner shareable), which keeps walks coherent with
+ * the stores that change tables; uncached walks cost every TLB miss up to
+ * three trips to DRAM. Table pages come from the pool, aliased cached while
+ * they hold a table, as vm_cpu_alloc's buffers are.
  * https://developer.arm.com/documentation/101811/latest
  */
 #define DESCRIPTOR 3ull /* table (levels 1-2) or page (level 3) */
+#define BLOCK      1ull /* 2 MiB at level 2 */
+#define BLOCK_PAGES 512
 #define DEVICE     (0ull << 2)
 #define NORMAL     (1ull << 2)
 #define CACHED     (2ull << 2)
@@ -43,11 +51,20 @@
 #define USER_RO    (USER | READ_ONLY)
 #define ENTRIES    512
 #define L3_SPAN    0x200000ull /* bytes one level 3 table maps */
+/* Invalid level 3 entries (bit 0 clear, the rest ignored by walks) of ranges
+ * in progress (include/vm.h): RESERVED awaits its page, FREEING holds the
+ * page its retired translation mapped, RETIRED held one freed since. */
+#define RESERVED   (1ull << 2)
+#define FREEING    (1ull << 3)
+#define RETIRED    (RESERVED | FREEING)
 _Static_assert(USER_BASE % 0x40000000 == 0 && USER_END % 0x40000000 == 0 &&
                    USER_END <= (1ull << 39),
                "user window: whole level 1 entries inside the 39-bit space");
 
-static pte_t kernel_root[ENTRIES] __attribute__((aligned(4096)));
+static pte_t kernel_root[ENTRIES] __attribute__((aligned(4096), section(".cpu_private")));
+/* Tables are allocated cached once vm_init has made the kernel's own cached. */
+static bool tables_cached;
+static void *table_alloc(void);
 static struct vm_space kernel_space = {.root = kernel_root};
 extern char __image_start[], __image_end[], __text_end[], __rodata_end[];
 extern char __stack_guard[];
@@ -59,9 +76,9 @@ static unsigned index_at(uint64_t address, unsigned level) {
 
 /* The next-level table an entry points to, allocated if absent and wanted. */
 static pte_t *next_table(pte_t *entry, bool allocate, pte_t flags) {
-    if (!(*entry & 1)) {
-        if (!allocate) return 0;
-        pte_t *table = pages_alloc(1, 1);
+    if ((*entry & 3) != DESCRIPTOR) {
+        if (!allocate || *entry) return 0; /* A block has no table. */
+        pte_t *table = tables_cached ? table_alloc() : pages_alloc(1, 1);
         if (!table) return 0;
         /* Zeroed before it is linked: a mapping may add tables while the
          * process's other threads run (kernel/protection/process.c). */
@@ -146,9 +163,13 @@ void *vm_cpu_alloc(unsigned count) {
     return buffer;
 }
 
+/* A translation table's page, aliased cached for the cached walks;
+ * vm_cpu_free returns it. */
+static void *table_alloc(void) { return vm_cpu_alloc(1); }
+
 void vm_cpu_free(void *buffer, unsigned count) {
     /* Flush while the buffer is still owned. Free pages must have their
-     * original uncached mapping before they can become page tables or DMA. */
+     * original uncached mapping before they can become DMA. */
     for (unsigned i = 0; i < count; ++i)
         user_alias((uintptr_t)buffer + (uintptr_t)i * PAGE_SIZE, false);
     if (!pages_free(buffer, count)) panic("CPU buffer ownership corrupt");
@@ -219,9 +240,10 @@ static bool enable_translation(bool secondary) {
     arm_instruction_sync();
     uint64_t mmfr0;
     __asm__ volatile("mrs %0, id_aa64mmfr0_el1" : "=r"(mmfr0));
-    /* T0SZ 25, non-cacheable inner shareable walks, 4 KiB granule, TTBR1
-     * walks disabled (EPD1), output addresses as wide as the CPU's. */
-    uint64_t tcr = 25 | (3u << 12) | (1u << 23) | ((mmfr0 & 7) << 32);
+    /* T0SZ 25, write-back write-allocate inner shareable walks (IRGN0,
+     * ORGN0, SH0), 4 KiB granule, TTBR1 walks disabled (EPD1), output
+     * addresses as wide as the CPU's. */
+    uint64_t tcr = 25 | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23) | ((mmfr0 & 7) << 32);
     /* CNTKCTL_EL1.EL0VCTEN only: user code may read the virtual count and its
      * frequency (the kernel's monotonic clock) without a syscall. Timer
      * registers and the physical count stay privileged. */
@@ -240,6 +262,14 @@ bool vm_secondary_init(void) { return enable_translation(true); }
 
 static bool overlap(uint64_t start, uint64_t end, uint64_t other_start, uint64_t other_end) {
     return start < other_end && other_start < end;
+}
+
+/* At vm_init: the kernel's entry for a table page, made cached. */
+static void cache_table(pte_t *table) {
+    pte_t *leaf = leaf_table(kernel_root, (uintptr_t)table, false, 0);
+    if (!leaf) panic("kernel table unmapped");
+    pte_t *pte = &leaf[index_at((uintptr_t)table, 3)];
+    *pte = (*pte & ~ATTRIBUTE) | CACHED;
 }
 
 bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
@@ -336,11 +366,25 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
         kernel_unmap((uintptr_t)arm_cpu_stacks[cpu - 1]);
     for (unsigned cpu = 0; cpu < ARM_CPU_MAX; ++cpu)
         kernel_unmap((uintptr_t)arm_exception_stacks[cpu]);
+    /* The kernel's own tables came from the pool with the data cache off;
+     * like every table from here on, they are cached (the root is in the
+     * cached CPU-private section). */
+    for (unsigned i = 0; i < ENTRIES; ++i) {
+        pte_t *level2 = next_table(&kernel_root[i], false, 0);
+        if (!level2) continue;
+        cache_table(level2);
+        for (unsigned j = 0; j < ENTRIES; ++j) {
+            pte_t *table = next_table(&level2[j], false, 0);
+            if (table) cache_table(table);
+        }
+    }
+    tables_cached = true;
     return enable_translation(false);
 }
 
 static uintptr_t shared_base;
 static unsigned shared_pages, shared_users;
+static bool shared_adopted; /* The resources' own pages */
 
 static bool shared_page(uintptr_t physical) {
     return shared_pages && physical - shared_base < (uintptr_t)shared_pages * PAGE_SIZE;
@@ -350,7 +394,9 @@ static bool shared_page(uintptr_t physical) {
  * yielding every 64 KiB so the desktop keeps running meanwhile. */
 void *vm_shared_create(unsigned pages) {
     if (shared_pages || !pages) return 0;
-    unsigned char *block = pages_reserve(pages, 1);
+    /* Aligned for blocks; unaligned takes 4 KiB pages. */
+    unsigned char *block = pages_reserve(pages, BLOCK_PAGES);
+    if (!block) block = pages_reserve(pages, 1);
     if (!block) return 0;
     for (unsigned i = 0; i < pages; ++i) {
         user_alias((uintptr_t)block + (uintptr_t)i * PAGE_SIZE, true);
@@ -372,10 +418,32 @@ void vm_shared_publish(void) {
     epoch_advance();
 }
 
+bool vm_shared_adopt(const void *data, unsigned pages) {
+    uintptr_t base = (uintptr_t)data, start = runtime_files_base();
+    uint32_t size = runtime_files_size();
+    if (shared_pages || !pages || !size || (base & (L3_SPAN - 1)) || base < start ||
+        base - start > size || pages > (size - (base - start)) / PAGE_SIZE)
+        return false;
+    /* The resources are cached and were cleaned to the point of coherency as
+     * they arrived (vm_init); the epoch has every CPU invalidate its
+     * instruction cache before running them. */
+    shared_base = base;
+    shared_pages = pages;
+    shared_adopted = true;
+    epoch_advance();
+    return true;
+}
+
 bool vm_shared_active(void) { return shared_pages != 0; }
 
 void vm_shared_trim(void) {
     if (!shared_pages || shared_users) return;
+    if (shared_adopted) {
+        shared_adopted = false;
+        shared_base = 0;
+        shared_pages = 0;
+        return;
+    }
     for (unsigned i = 0; i < shared_pages; ++i) {
         user_alias(shared_base + (uintptr_t)i * PAGE_SIZE, false);
         if ((i & 15) == 15) kernel_io_wait();
@@ -387,7 +455,7 @@ void vm_shared_trim(void) {
 
 bool vm_create(struct vm_space *s) {
     *s = (struct vm_space){0};
-    s->root = pages_alloc(1, 1);
+    s->root = table_alloc();
     if (!s->root) return false;
     memcpy(s->root, kernel_root, sizeof(kernel_root));
     return true;
@@ -397,6 +465,14 @@ bool vm_create(struct vm_space *s) {
 static pte_t *user_table(const struct vm_space *s, user_ptr address) {
     if (!s->root || address < USER_BASE || address >= USER_END) return 0;
     return leaf_table(s->root, address, false, 0);
+}
+
+/* The block over a user address, or 0. */
+static pte_t user_block(const struct vm_space *s, user_ptr address) {
+    if (!s->root || address < USER_BASE || address >= USER_END) return 0;
+    pte_t *level2 = next_table(&s->root[index_at(address, 1)], false, 0);
+    pte_t entry = level2 ? level2[index_at(address, 2)] : 0;
+    return (entry & 3) == BLOCK ? entry : 0;
 }
 
 /* A new user table: privileged instruction fetches never use it (PXNTable). */
@@ -411,7 +487,16 @@ static void release_empty_table(struct vm_space *s, user_ptr address) {
     for (unsigned i = 0; i < ENTRIES; ++i)
         if (table[i]) return;
     level2[index_at(address, 2)] = 0;
-    if (!pages_free(table, 1)) panic("user table ownership corrupt");
+    vm_cpu_free(table, 1);
+}
+
+/* Frees the tables left empty over count pages from address. */
+static void release_empty_tables(struct vm_space *s, user_ptr address, unsigned count) {
+    user_ptr last = (address + (user_ptr)(count - 1) * PAGE_SIZE) & ~(L3_SPAN - 1);
+    for (user_ptr at = address & ~(L3_SPAN - 1);; at += L3_SPAN) {
+        release_empty_table(s, at);
+        if (at == last) break;
+    }
 }
 
 /* On the service worker: a page of a gigabyte frees for a second or more, so
@@ -426,17 +511,18 @@ void vm_destroy(struct vm_space *s) {
                 pte_t *table = next_table(&level2[j], false, 0);
                 if (!table) continue;
                 for (unsigned k = 0; k < ENTRIES; ++k)
-                    if ((table[k] & 3) == DESCRIPTOR) {
+                    if ((table[k] & 3) == DESCRIPTOR || (table[k] & ~ADDRESS) == FREEING) {
                         uintptr_t physical = table[k] & ADDRESS;
                         table[k] = 0;
                         if (!shared_page(physical)) free_user_page(physical);
                         if ((++freed & 15) == 0) kernel_io_wait();
                     }
-                if (!pages_free(table, 1)) panic("user table ownership corrupt");
+                vm_cpu_free(table, 1);
             }
-            if (!pages_free(level2, 1)) panic("user table ownership corrupt");
+            vm_cpu_free(level2, 1);
         }
-        if (!pages_free(s->root, 1)) panic("address space ownership corrupt");
+        vm_cpu_free(s->root, 1);
+        if (s->promised) pages_unpromise(s->promised);
         epoch_advance();
         if (s->shared) {
             if (!shared_users) panic("shared page block reference count");
@@ -485,35 +571,47 @@ bool vm_map(struct vm_space *s, user_ptr address, unsigned permissions) {
     return true;
 }
 
-bool vm_map_shared(struct vm_space *s, user_ptr address, unsigned page, unsigned permissions) {
+unsigned vm_map_shared(struct vm_space *s, user_ptr address, unsigned page, unsigned count,
+                       unsigned permissions) {
     if (!s->root || (address & (PAGE_SIZE - 1)) || address < USER_BASE || address >= USER_END ||
-        page >= shared_pages || !(permissions & VM_READ) || (permissions & ~(VM_READ | VM_EXEC)))
-        return false;
-    pte_t *table = new_user_table(s, address);
-    if (!table) return false;
-    pte_t *pte = &table[index_at(address, 3)];
-    if (*pte) return false;
-    *pte = user_entry(shared_base + (uintptr_t)page * PAGE_SIZE, permissions);
+        !count || page >= shared_pages || count > shared_pages - page ||
+        !(permissions & VM_READ) || (permissions & ~(VM_READ | VM_EXEC)))
+        return 0;
+    uintptr_t physical = shared_base + (uintptr_t)page * PAGE_SIZE;
+    pte_t entry = user_entry(physical, permissions);
+    unsigned mapped = 1;
+    pte_t *level2 = next_table(&s->root[index_at(address, 1)], true, PXN_TABLE);
+    if (!level2) return 0;
+    pte_t *slot = &level2[index_at(address, 2)];
+    if (!*slot && count >= BLOCK_PAGES && !((address | physical) & (L3_SPAN - 1))) {
+        __asm__ volatile("dsb ishst" ::: "memory");
+        *slot = (entry & ~3ull) | BLOCK;
+        mapped = BLOCK_PAGES;
+    } else {
+        pte_t *table = next_table(slot, true, PXN_TABLE);
+        if (!table || table[index_at(address, 3)]) return 0;
+        table[index_at(address, 3)] = entry;
+    }
     if (!s->shared) {
         s->shared = true;
         ++shared_users;
     }
-    return true;
+    return mapped;
 }
 
 void *vm_resolve(const struct vm_space *s, user_ptr address, unsigned permissions) {
     pte_t *table = user_table(s, address);
-    if (!table) return 0;
-    pte_t pte = table[index_at(address, 3)];
-    if ((pte & 3) != DESCRIPTOR || !(pte & USER) ||
+    pte_t pte = table ? table[index_at(address, 3)] : user_block(s, address);
+    uint64_t span = table ? PAGE_SIZE : L3_SPAN;
+    if ((pte & 3) != (table ? DESCRIPTOR : BLOCK) || !(pte & USER) ||
         ((permissions & VM_WRITE) && (pte & READ_ONLY)) || ((permissions & VM_EXEC) && (pte & UXN)))
         return 0;
-    return (void *)(uintptr_t)((pte & ADDRESS) | (address & (PAGE_SIZE - 1)));
+    return (void *)(uintptr_t)((pte & ADDRESS) | (address & (span - 1)));
 }
 
 bool vm_mapped(const struct vm_space *s, user_ptr address) {
     pte_t *table = user_table(s, address);
-    return table && (table[index_at(address, 3)] & 3) == DESCRIPTOR;
+    return table ? (table[index_at(address, 3)] & 3) == DESCRIPTOR : user_block(s, address) != 0;
 }
 
 bool vm_protect(struct vm_space *s, user_ptr address, unsigned permissions) {
@@ -600,17 +698,23 @@ bool vm_release(struct vm_space *s, user_ptr address, unsigned count) {
         free_user_page(physical);
         --s->mapped_pages;
     }
-    user_ptr last = (address + (user_ptr)(count - 1) * PAGE_SIZE) & ~(L3_SPAN - 1);
-    for (user_ptr at = address & ~(L3_SPAN - 1);; at += L3_SPAN) {
-        release_empty_table(s, at);
-        if (at == last) break;
-    }
+    release_empty_tables(s, address, count);
     epoch_advance(); /* The next entry to any space flushes the TLB. */
     return true;
 }
 
-user_ptr vm_allocate_range(struct vm_space *s, unsigned count, unsigned alignment, user_ptr lower,
-                           user_ptr upper, unsigned permissions) {
+/* Bytes from at to the end of its level 3 table's span, or to end if that
+ * is nearer. */
+static user_ptr table_stretch(user_ptr at, user_ptr end) {
+    user_ptr stretch = L3_SPAN - (at & (L3_SPAN - 1));
+    return stretch < end - at ? stretch : end - at;
+}
+
+/* The first run of count free pages at a multiple of alignment pages in
+ * [lower, upper), or 0. Reserved and retiring entries are not free. It goes
+ * a table at a time, as in arch/arm/mmu.c. */
+static user_ptr find_range(const struct vm_space *s, unsigned count, unsigned alignment,
+                           user_ptr lower, user_ptr upper) {
     if (!allocation_range(lower, upper) || ((lower | upper) & (PAGE_SIZE - 1)) ||
         count > (upper - lower) / PAGE_SIZE || !alignment || (alignment & (alignment - 1)) ||
         alignment > (upper - lower) / PAGE_SIZE)
@@ -618,22 +722,153 @@ user_ptr vm_allocate_range(struct vm_space *s, unsigned count, unsigned alignmen
     if (!s->root || !count || count > USER_PAGE_QUOTA - s->mapped_pages) return 0;
     user_ptr step = (user_ptr)alignment * PAGE_SIZE;
     user_ptr start = (lower + step - 1) & ~(step - 1);
-    unsigned free_run = 0;
-    for (user_ptr at = start; at < upper; at += PAGE_SIZE) {
-        if (vm_mapped(s, at)) {
-            /* The next run may start only at the next multiple of step. */
-            free_run = 0;
-            start = (at + step) & ~(step - 1);
-            at = start - PAGE_SIZE;
+    unsigned free_run = 0; /* Free pages from start to at */
+    for (user_ptr at = start; at < upper;) {
+        user_ptr stretch = table_stretch(at, upper);
+        const pte_t *table = user_table(s, at);
+        if (!table) {
+            if (count - free_run <= stretch / PAGE_SIZE) return start;
+            free_run += (unsigned)(stretch / PAGE_SIZE);
+            at += stretch;
             continue;
         }
-        if (++free_run < count) continue;
-        unsigned mapped = 0;
-        for (; mapped < count; ++mapped)
-            if (!vm_map(s, start + (user_ptr)mapped * PAGE_SIZE, permissions)) break;
-        if (mapped == count) return start;
-        if (mapped && !vm_release(s, start, mapped)) panic("heap rollback failed");
-        return 0;
+        const pte_t *entry = &table[index_at(at, 3)], *end = entry + stretch / PAGE_SIZE;
+        while (entry < end) {
+            if (!*entry) {
+                ++entry;
+                at += PAGE_SIZE;
+                if (++free_run == count) return start;
+                continue;
+            }
+            /* Past the mapped run; the next may start at a multiple of step. */
+            do {
+                ++entry;
+                at += PAGE_SIZE;
+            } while (entry < end && *entry);
+            free_run = 0;
+            start = (at + step - 1) & ~(step - 1);
+            if (start < at) return 0;
+            if (start != at) {
+                at = start;
+                break;
+            }
+        }
     }
     return 0;
+}
+
+user_ptr vm_allocate_range(struct vm_space *s, unsigned count, unsigned alignment, user_ptr lower,
+                           user_ptr upper, unsigned permissions) {
+    user_ptr start = find_range(s, count, alignment, lower, upper);
+    if (!start) return 0;
+    unsigned mapped = 0;
+    for (; mapped < count; ++mapped)
+        if (!vm_map(s, start + (user_ptr)mapped * PAGE_SIZE, permissions)) break;
+    if (mapped == count) return start;
+    if (mapped && !vm_release(s, start, mapped)) panic("heap rollback failed");
+    return 0;
+}
+
+bool vm_occupied(const struct vm_space *s, user_ptr address) {
+    pte_t *table = user_table(s, address);
+    return table ? table[index_at(address, 3)] != 0 : user_block(s, address) != 0;
+}
+
+bool vm_reserve(struct vm_space *s, user_ptr address, unsigned count, unsigned permissions) {
+    if (!s->root || !count || (address & (PAGE_SIZE - 1)) || count > USER_PAGE_QUOTA ||
+        count > USER_PAGE_QUOTA - s->mapped_pages ||
+        !allocation_range(address, address + (user_ptr)count * PAGE_SIZE) ||
+        (permissions && !user_permissions(address, permissions)))
+        return false;
+    user_ptr end = address + (user_ptr)count * PAGE_SIZE;
+    for (user_ptr at = address, n; at < end; at += n) {
+        n = table_stretch(at, end);
+        const pte_t *table = user_table(s, at);
+        if (table)
+            for (unsigned i = 0; i < n / PAGE_SIZE; ++i)
+                if (table[index_at(at, 3) + i]) return false;
+    }
+    for (user_ptr at = address; at < end; at += table_stretch(at, end))
+        if (!new_user_table(s, at)) {
+            release_empty_tables(s, address, count);
+            return false;
+        }
+    if (!pages_promise(count)) {
+        release_empty_tables(s, address, count);
+        return false;
+    }
+    for (user_ptr at = address, n; at < end; at += n) {
+        n = table_stretch(at, end);
+        pte_t *entry = &user_table(s, at)[index_at(at, 3)];
+        for (unsigned i = 0; i < n / PAGE_SIZE; ++i) entry[i] = RESERVED;
+    }
+    s->mapped_pages += count;
+    s->promised += count;
+    return true;
+}
+
+user_ptr vm_reserve_range(struct vm_space *s, unsigned count, unsigned alignment, user_ptr lower,
+                          user_ptr upper, unsigned permissions) {
+    user_ptr start = find_range(s, count, alignment, lower, upper);
+    return start && vm_reserve(s, start, count, permissions) ? start : 0;
+}
+
+void vm_fill_reserved(struct vm_space *s, user_ptr address, unsigned permissions) {
+    pte_t *table = user_table(s, address);
+    pte_t *pte = table ? &table[index_at(address, 3)] : 0;
+    if (!pte || *pte != RESERVED || !s->promised) panic("reserved mapping corrupt");
+    void *page = pages_alloc_promised();
+    --s->promised;
+    user_alias((uintptr_t)page, true);
+    *pte = user_entry((uintptr_t)page, permissions);
+    if (permissions & VM_EXEC) epoch_advance();
+}
+
+bool vm_unmap_begin(struct vm_space *s, user_ptr address, unsigned count) {
+    if (!count || (address & (PAGE_SIZE - 1)) || count > USER_PAGE_QUOTA ||
+        !allocation_range(address, address + (user_ptr)count * PAGE_SIZE))
+        return false;
+    user_ptr end = address + (user_ptr)count * PAGE_SIZE;
+    for (user_ptr at = address, n; at < end; at += n) {
+        n = table_stretch(at, end);
+        const pte_t *table = user_table(s, at);
+        if (!table) return false;
+        for (unsigned i = 0; i < n / PAGE_SIZE; ++i) {
+            pte_t pte = table[index_at(at, 3) + i];
+            if ((pte & 3) != DESCRIPTOR || shared_page(pte & ADDRESS)) return false;
+        }
+    }
+    for (user_ptr at = address, n; at < end; at += n) {
+        n = table_stretch(at, end);
+        pte_t *entry = &user_table(s, at)[index_at(at, 3)];
+        for (unsigned i = 0; i < n / PAGE_SIZE; ++i) entry[i] = (entry[i] & ADDRESS) | FREEING;
+    }
+    epoch_advance();
+    return true;
+}
+
+void vm_unmap_page(struct vm_space *s, user_ptr address) {
+    pte_t *table = user_table(s, address);
+    pte_t *pte = table ? &table[index_at(address, 3)] : 0;
+    if (!pte || (*pte & ~ADDRESS) != FREEING) panic("retiring mapping corrupt");
+    uintptr_t physical = *pte & ADDRESS;
+    *pte = RETIRED;
+    free_user_page(physical);
+    --s->mapped_pages;
+}
+
+void vm_unmap_end(struct vm_space *s, user_ptr address, unsigned count) {
+    user_ptr end = address + (user_ptr)count * PAGE_SIZE;
+    for (user_ptr at = address, n; at < end; at += n) {
+        n = table_stretch(at, end);
+        pte_t *table = user_table(s, at);
+        if (!table) panic("retired mapping corrupt");
+        pte_t *entry = &table[index_at(at, 3)];
+        for (unsigned i = 0; i < n / PAGE_SIZE; ++i) {
+            if (entry[i] != RETIRED) panic("retired mapping corrupt");
+            entry[i] = 0;
+        }
+    }
+    release_empty_tables(s, address, count);
+    epoch_advance(); /* CPUs may hold walks through the freed tables. */
 }

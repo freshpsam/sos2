@@ -69,6 +69,8 @@ static struct {
 static struct net_device device;
 static struct netif interface;
 static bool started, previous_link, random_failed;
+/* The address the desktop shows (0: none), told only when it changes. */
+static uint32_t shown_address;
 static uint32_t generation, random_words[RANDOM_WORDS];
 static unsigned random_head, random_count;
 static uint8_t random_partial[sizeof(uint32_t)];
@@ -88,7 +90,13 @@ void network_dhcp_prepare(struct dhcp *d, struct dhcp_msg *msg, unsigned type) {
 
 void network_assert(void) { panic("network stack invariant failed"); }
 
-u32_t sys_now(void) { return (u32_t)(time_us() / 1000); }
+/* The current poll's time, the main loop's for this turn (loop_time_us), and
+ * lwIP's clock, that time in milliseconds, at most a turn old when a system
+ * call has lwIP read it. */
+static uint64_t poll_us;
+static u32_t poll_ms;
+
+u32_t sys_now(void) { return poll_ms; }
 
 uint32_t network_random(void) {
     if (!random_count) {
@@ -258,6 +266,7 @@ static bool addressed(void) {
 void network_init(const struct platform_devices *devices) {
     network_time_init();
     started = previous_link = random_failed = false;
+    shown_address = UINT32_MAX; /* never assigned: the first poll tells it */
     generation = random_head = random_count = random_partial_bytes = 0;
     broadcast_replies = false;
     memset(connections, 0, sizeof(connections));
@@ -283,11 +292,16 @@ bool network_startup_pending(void) {
 }
 
 void network_poll(void) {
+    poll_us = loop_time_us();
+    poll_ms = (u32_t)(poll_us / 1000);
     device.poll(receive_frame);
-    if (addressed()) page_host_network_status(ip4addr_ntoa(netif_ip4_addr(&interface)));
-    else page_host_network_status(0);
+    uint32_t address = addressed() ? ip4_addr_get_u32(netif_ip4_addr(&interface)) : 0;
+    if (address != shown_address) {
+        shown_address = address;
+        page_host_network_status(address ? ip4addr_ntoa(netif_ip4_addr(&interface)) : 0);
+    }
     if (!device.online() && !started) {
-        network_time_poll(false);
+        network_time_poll(false, poll_us);
         for (unsigned i = 0; i < SOCKET_COUNT; ++i)
             if (connections[i].handle && connections[i].state != NET_FAILED)
                 fail_connection(&connections[i], USER_ENETDOWN);
@@ -297,10 +311,9 @@ void network_poll(void) {
     if (!started) {
         if (random_count < 16) {
             /* lwIP waits for entropy, but accepted sockets keep their deadline. */
-            uint64_t now = time_us();
             for (unsigned i = 0; i < SOCKET_COUNT; ++i)
                 if (connections[i].handle && connections[i].state == NET_CONNECTING &&
-                    now >= connections[i].deadline)
+                    poll_us >= connections[i].deadline)
                     fail_connection(&connections[i], USER_ETIMEDOUT);
             return;
         }
@@ -335,8 +348,7 @@ void network_poll(void) {
         }
     }
     sys_check_timeouts();
-    network_time_poll(addressed() && !random_failed);
-    uint64_t now = time_us();
+    network_time_poll(addressed() && !random_failed, poll_us);
     for (unsigned i = 0; i < SOCKET_COUNT; ++i) {
         struct connection *c = &connections[i];
         if (!c->handle) continue;
@@ -345,7 +357,7 @@ void network_poll(void) {
             continue;
         }
         if (c->state != NET_CONNECTING) continue;
-        if (now >= c->deadline) {
+        if (poll_us >= c->deadline) {
             fail_connection(c, USER_ETIMEDOUT);
             continue;
         }

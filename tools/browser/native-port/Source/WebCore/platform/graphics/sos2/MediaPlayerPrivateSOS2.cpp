@@ -360,7 +360,10 @@ void MediaPlayerPrivateSOS2::tick()
     RefPtr player = m_player.get();
     if (!player)
         return;
-    if (m_renderer->advance()) {
+    // The browser's video presenter may have shown frames as well.
+    m_renderer->advance();
+    if (unsigned shown = m_renderer->shownFrames(); shown != m_shownFrames) {
+        m_shownFrames = shown;
         m_waitingForFrame = false;
         player->repaint();
     }

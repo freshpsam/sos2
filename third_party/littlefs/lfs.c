@@ -125,6 +125,13 @@ static int lfs_bd_read(lfs_t *lfs,
     return 0;
 }
 
+// SOS2: compares and checksums go through the read cache 512 bytes at a time
+// (upstream: 8), so checking a programmed 4 KiB block takes 8 reads, not 512:
+// on the Nexus 5 those reads were most of an SQLite commit's time. Their
+// hint stays past the piece, so the reads still load the cache rather than
+// bypass it, as the 8-byte ones did.
+#define LFS_BD_CHUNK 512
+
 static int lfs_bd_cmp(lfs_t *lfs,
         const lfs_cache_t *pcache, lfs_cache_t *rcache, lfs_size_t hint,
         lfs_block_t block, lfs_off_t off,
@@ -133,11 +140,11 @@ static int lfs_bd_cmp(lfs_t *lfs,
     lfs_size_t diff = 0;
 
     for (lfs_off_t i = 0; i < size; i += diff) {
-        uint8_t dat[8];
+        uint8_t dat[LFS_BD_CHUNK];
 
         diff = lfs_min(size-i, sizeof(dat));
         int err = lfs_bd_read(lfs,
-                pcache, rcache, hint-i,
+                pcache, rcache, lfs_max(hint-i, diff+1),
                 block, off+i, &dat, diff);
         if (err) {
             return err;
@@ -158,10 +165,10 @@ static int lfs_bd_crc(lfs_t *lfs,
     lfs_size_t diff = 0;
 
     for (lfs_off_t i = 0; i < size; i += diff) {
-        uint8_t dat[8];
+        uint8_t dat[LFS_BD_CHUNK];
         diff = lfs_min(size-i, sizeof(dat));
         int err = lfs_bd_read(lfs,
-                pcache, rcache, hint-i,
+                pcache, rcache, lfs_max(hint-i, diff+1),
                 block, off+i, &dat, diff);
         if (err) {
             return err;
@@ -3350,6 +3357,50 @@ static int lfs_file_outline(lfs_t *lfs, lfs_file_t *file) {
 }
 #endif
 
+#ifndef LFS_READONLY
+// SOS2: the original file's bytes from the write position up to end, copied
+// into the file being written through a small buffer rather than a byte at a
+// time (two calls a byte made rewriting a 4 MiB database's tail take seconds
+// on the phones). The read is complete before the write, which may reuse
+// rcache's buffer (validation, CTZ pointers); orig's view of it is dropped
+// whenever that happened, as the byte loop did.
+static int lfs_file_copyorig(lfs_t *lfs, lfs_file_t *file, lfs_off_t end) {
+    lfs_file_t orig = {
+        .ctz.head = file->ctz.head,
+        .ctz.size = file->ctz.size,
+        .flags = LFS_O_RDONLY,
+        .pos = file->pos,
+        .cache = lfs->rcache,
+    };
+    lfs_cache_drop(lfs, &lfs->rcache);
+
+    while (file->pos < end) {
+        uint8_t data[512];
+        lfs_size_t size = lfs_min(sizeof(data), end - file->pos);
+        lfs_ssize_t res = lfs_file_flushedread(lfs, &orig, data, size);
+        if (res < 0) {
+            return res;
+        }
+        if (res == 0) {
+            return LFS_ERR_CORRUPT;
+        }
+
+        res = lfs_file_flushedwrite(lfs, file, data, (lfs_size_t)res);
+        if (res < 0) {
+            return res;
+        }
+
+        // keep our reference to the rcache in sync
+        if (lfs->rcache.block != LFS_BLOCK_NULL) {
+            lfs_cache_drop(lfs, &orig.cache);
+            lfs_cache_drop(lfs, &lfs->rcache);
+        }
+    }
+
+    return 0;
+}
+#endif
+
 static int lfs_file_flush(lfs_t *lfs, lfs_file_t *file) {
     if (file->flags & LFS_F_READING) {
         if (!(file->flags & LFS_F_INLINE)) {
@@ -3364,34 +3415,9 @@ static int lfs_file_flush(lfs_t *lfs, lfs_file_t *file) {
 
         if (!(file->flags & LFS_F_INLINE)) {
             // copy over anything after current branch
-            lfs_file_t orig = {
-                .ctz.head = file->ctz.head,
-                .ctz.size = file->ctz.size,
-                .flags = LFS_O_RDONLY,
-                .pos = file->pos,
-                .cache = lfs->rcache,
-            };
-            lfs_cache_drop(lfs, &lfs->rcache);
-
-            while (file->pos < file->ctz.size) {
-                // copy over a byte at a time, leave it up to caching
-                // to make this efficient
-                uint8_t data;
-                lfs_ssize_t res = lfs_file_flushedread(lfs, &orig, &data, 1);
-                if (res < 0) {
-                    return res;
-                }
-
-                res = lfs_file_flushedwrite(lfs, file, &data, 1);
-                if (res < 0) {
-                    return res;
-                }
-
-                // keep our reference to the rcache in sync
-                if (lfs->rcache.block != LFS_BLOCK_NULL) {
-                    lfs_cache_drop(lfs, &orig.cache);
-                    lfs_cache_drop(lfs, &lfs->rcache);
-                }
+            int err = lfs_file_copyorig(lfs, file, file->ctz.size);
+            if (err) {
+                return err;
             }
 
             // write out what we have
@@ -3745,6 +3771,22 @@ static lfs_soff_t lfs_file_seek_(lfs_t *lfs, lfs_file_t *file,
             return npos;
         }
     }
+
+#ifndef LFS_READONLY
+    // SOS2: a forward seek while writing, within what the file held before
+    // the write, copies only the bytes up to the new position and goes on
+    // writing. Ascending writes (an SQLite commit's pages) then copy the
+    // file's tail once, at the flush, instead of at every seek.
+    if ((file->flags & LFS_F_WRITING) && !(file->flags & LFS_F_INLINE)
+            && npos > file->pos && npos <= file->ctz.size) {
+        int err = lfs_file_copyorig(lfs, file, npos);
+        if (err) {
+            file->flags |= LFS_F_ERRED;
+            return err;
+        }
+        return npos;
+    }
+#endif
 
     // write out everything beforehand, may be noop if rdonly
     int err = lfs_file_flush(lfs, file);

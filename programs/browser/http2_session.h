@@ -3,6 +3,12 @@
 #include <span>
 
 namespace SOS2::HTTP {
+// What a stream and a connection's streams together may send before they are
+// consumed, so also the most a stream holds undecoded. The protocol's own
+// 64 KiB a stream allowed one such burst a round trip: YouTube's 3.4 MB of
+// scripts took 2 s of the Nexus 5's load.
+constexpr int32_t streamWindow = 1024 * 1024, connectionWindow = 3 * 1024 * 1024;
+
 // One bounded stream. The TLS connection and framing session are shared, while
 // each ResourceHandle keeps its own response, decoder, deadline and policy.
 struct HTTP2Stream {

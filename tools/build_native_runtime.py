@@ -111,7 +111,7 @@ def sdk():
     if not (SYSROOT/'lib/libc.a').exists(): raise RuntimeError('Build native Newlib first')
     build=BASE/'sdk';build.mkdir(parents=True,exist_ok=True)
     objects=[]
-    for filename in ('start.S','start.c','system.c','threads.c','semaphore.c','inet.c','network.c'):
+    for filename in ('start.S','start.c','system.c','threads.c','semaphore.c','inet.c','memory.c','network.c'):
         output=build/(filename+'.o');objects.append(str(output))
         run([arch.tool('gcc'),*sdk_flags(),'-Wall','-Wextra','-Werror=implicit-function-declaration',
              '-c',str(ROOT/'sdk/runtime'/filename),'-o',str(output)],build,'sdk-'+filename)
@@ -127,8 +127,18 @@ def libstdcxx(jobs):
     original="target_thread_file=`$CXX -v 2>&1 | sed -n 's/^Thread model: //p'`"
     replacement='target_thread_file=posix # SOS2 native pthreads'
     content=configure.read_text()
-    if content.count(original)==2: configure.write_text(content.replace(original,replacement))
+    if content.count(original)==2: content=content.replace(original,replacement)
     elif content.count(replacement)!=2: raise RuntimeError('Unexpected libstdc++ thread selection')
+    # Newlib's branch declares TLS for RTEMS alone. SOS2 has it (sdk/runtime/
+    # threads.c: native on ARM32, emulated on AArch64), and without it every
+    # std::call_once, done or not, locks one global mutex and builds a
+    # std::function: 1-2% of YouTube's main thread on the Nexus 5.
+    original_tls='    $as_echo "#define HAVE_MEMALIGN 1" >>confdefs.h\n'
+    replacement_tls=original_tls+'    $as_echo "#define HAVE_TLS 1" >>confdefs.h # SOS2 TLS\n'
+    if content.count(replacement_tls)!=1:
+        if content.count(original_tls)!=1: raise RuntimeError('Unexpected libstdc++ newlib configuration')
+        content=content.replace(original_tls,replacement_tls)
+    if content!=configure.read_text(): configure.write_text(content)
     (BASE/'libgcc').mkdir(exist_ok=True)
     copy_if_changed(source/'libgcc/gthr-posix.h',BASE/'libgcc/gthr-default.h')
     import shlex
@@ -143,7 +153,7 @@ def libstdcxx(jobs):
         '--prefix='+str(INSTALL),'--libdir='+str(SYSROOT/'lib'),'--with-gxx-include-dir='+str(SYSROOT/'include/c++/14.2.0'),
         '--disable-shared','--disable-multilib','--disable-nls','--disable-libstdcxx-pch','--disable-libstdcxx-verbose',
         '--enable-libstdcxx-threads','--enable-libstdcxx-time=yes','--with-newlib']
-    signature=hashlib.sha256(json.dumps([options,flags,arch.prefix(),env['LDFLAGS'],digest(ROOT/'sdk/include/sos2/features.h'),'clean-config-v2']).encode()).hexdigest();stamp=build/'.sos2-config'
+    signature=hashlib.sha256(json.dumps([options,flags,arch.prefix(),env['LDFLAGS'],digest(ROOT/'sdk/include/sos2/features.h'),'clean-config-v2','tls']).encode()).hexdigest();stamp=build/'.sos2-config'
     if not stamp.exists() or stamp.read_text().strip()!=signature:
         if stamp.exists():shutil.rmtree(build)
         run(options,build,'libstdcxx-configure',env);stamp.write_text(signature+'\n')
@@ -261,7 +271,10 @@ def icu(jobs):
         LIBS='-Wl,--whole-archive -lsos2 -Wl,--no-whole-archive -Wl,--start-group -lstdc++ -lc -lm -lgcc -Wl,--end-group')
     options=[str(source/'configure'),'--build=x86_64-pc-linux-gnu','--host='+arch.TRIPLE,
         '--prefix='+str(SYSROOT),'--with-cross-build='+str(host),'--with-data-packaging=static','--disable-tools',*common]
-    signature=hashlib.sha256(json.dumps([options,flags,arch.prefix(),env['LDFLAGS'],'mh-sos2',digest(ROOT/'sdk/include/sos2/abi.h')]).encode()).hexdigest();stamp=build/'.sos2-config'
+    # ICU's C++ instantiates libstdc++'s inline code (std::call_once), which
+    # follows libstdc++'s configuration; its make doesn't track those headers.
+    signature=hashlib.sha256(json.dumps([options,flags,arch.prefix(),env['LDFLAGS'],'mh-sos2',digest(ROOT/'sdk/include/sos2/abi.h'),
+        digest(includes/arch.TRIPLE/'bits/c++config.h')]).encode()).hexdigest();stamp=build/'.sos2-config'
     if not stamp.exists() or stamp.read_text().strip()!=signature:
         if stamp.exists():shutil.rmtree(build)
         run(options,build,'icu-configure',env);stamp.write_text(signature+'\n')

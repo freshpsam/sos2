@@ -43,6 +43,9 @@ _Static_assert(sizeof(struct arm_runtime_context) == 528, "assembly runtime size
  * 0x150 masks them. */
 #define USER_CONTEXT_FIELDS(entry, stack) .sp = (stack), .pc = (entry), .pstate = 0x140
 
+/* A user entry point: an instruction's word. */
+static inline int arch_user_entry_valid(user_reg entry) { return !(entry & 3); }
+
 /* Whether the trap interrupted EL0 in AArch64 (EL0t). */
 static inline int arch_trap_from_user(const struct arm_trap *trap) {
     return (trap->context.pstate & 0x1f) == 0;

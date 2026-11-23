@@ -84,6 +84,7 @@ enum {
     SET_VAR = 263,
     IOCTL_US = 2500000,
     POLL_FRAMES = 50,
+    BURST_YIELD_US = 500,
     MAX_CORES = 16,
 };
 
@@ -465,6 +466,7 @@ static bool service(bool waiting) {
         if (mail & 0x01) status |= FRAME_INDICATION;
     }
     if (status & FRAME_INDICATION) rx_pending = true;
+    uint64_t yielded = time_us();
     for (unsigned frames = 0; rx_pending && frames < POLL_FRAMES && (waiting || receive_room());
          ++frames) {
         int length;
@@ -472,6 +474,13 @@ static bool service(bool waiting) {
         else if ((length = read_frame()) > 0) dispatch(rx, (unsigned)length);
         if (length < 0) return false;
         if (!length) rx_pending = false;
+        /* A burst of frames held CPU 0's loop for up to 9 ms: on the service
+         * worker, give the loop a turn every 0.5 ms, between whole frames or
+         * superframes (a no-op on the main loop, whose sends read frames). */
+        if (time_us() - yielded >= BURST_YIELD_US) {
+            kernel_io_wait();
+            yielded = time_us();
+        }
     }
     return true;
 }

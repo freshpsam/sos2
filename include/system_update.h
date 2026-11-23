@@ -16,7 +16,7 @@ void system_update_init(const struct platform_devices *);
  * I/O. */
 int32_t system_update_info(struct vm_space *, user_ptr address, uint32_t size);
 int32_t system_update_apps(struct vm_space *, user_ptr address, uint32_t size);
-/* The other operations, on the service worker with the caller frozen. */
+/* The other operations, on the service worker while the calling thread waits. */
 int32_t system_update_call(uint32_t pid, struct vm_space *, uint32_t op, user_ptr address,
                            uint32_t size);
 /* A process ended: an update it was still receiving is abandoned, one

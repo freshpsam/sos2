@@ -18,11 +18,14 @@ ARM64 = ARCH == 'arm64'
 TRIPLE = 'aarch64-none-elf' if ARM64 else 'arm-none-eabi'
 SUFFIX = '-arm64' if ARM64 else ''
 # ARMv7 code that QEMU's Cortex-A15 runs, scheduled for the phone's in-order
-# Cortex-A53; sdk/sos2-arm32.cmake repeats this for CMake builds. arm64 stays
+# Cortex-A53, as Thumb-2 like WebKit's own: in ARM code the engine's
+# libraries took 4 MB more memory (compressed, about the same) for no speed;
+# threads may start in either (arch/arm/include/arch/context.h). sdk/sos2-arm32.cmake repeats this for
+# CMake builds. arm64 stays
 # at ARMv8.0 (JavaScriptCore takes its CPU features from these flags) with the
 # Cortex-A53 errata fixes; sdk/sos2-arm64.cmake repeats them.
 CPU = (['-mcpu=cortex-a53', '-mfix-cortex-a53-835769', '-mfix-cortex-a53-843419'] if ARM64 else
-       ['-marm', '-mcpu=cortex-a15', '-mtune=cortex-a53', '-mfpu=neon-vfpv4', '-mfloat-abi=hard'])
+       ['-mthumb', '-mcpu=cortex-a15', '-mtune=cortex-a53', '-mfpu=neon-vfpv4', '-mfloat-abi=hard'])
 LINK = ['--fix-cortex-a53-843419', '--wrap=_Unwind_Find_FDE'] if ARM64 else []
 CMAKE_TOOLCHAIN = ROOT/'sdk'/f'sos2-{ARCH}.cmake'
 LINKER_SCRIPT = ROOT/'sdk/runtime'/('linker-arm64.ld' if ARM64 else 'linker.ld')

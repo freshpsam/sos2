@@ -108,14 +108,32 @@ void display_blank(void) {
 #endif
 }
 
-bool display_present_region(struct framebuffer *visible, const struct framebuffer *source,
-                            unsigned x, unsigned y, unsigned width, unsigned height) {
+bool display_bands(void) {
 #ifdef SOS2_BOARD_REDMI2
-    if (redmi2_adreno_present(visible, source, x, y, width, height)) return true;
+    return false;
+#else
+    return true;
 #endif
-    if (!gfx_present_scaled_region(visible, source, x, y, width, height)) return false;
+}
+
+bool display_draw_region(struct framebuffer *visible, const struct framebuffer *source, unsigned x,
+                         unsigned y, unsigned width, unsigned height) {
+    return gfx_present_scaled_region(visible, source, x, y, width, height);
+}
+
+void display_show_region(struct framebuffer *visible, const struct framebuffer *source, unsigned x,
+                         unsigned y, unsigned width, unsigned height) {
+#if defined(SOS2_BOARD_NEXUS5) || !defined(QEMU_DISPLAY)
+    (void)source;
+    (void)x;
+    (void)y;
+    (void)width;
+    (void)height;
+#endif
 #ifdef SOS2_BOARD_NEXUS5
     if (visible == screen) nexus5_display_damage();
+#elif !defined(QEMU_DISPLAY)
+    (void)visible;
 #endif
 #ifdef QEMU_DISPLAY
     if (gpu && !failed && visible == screen && width && height && x < source->width &&
@@ -130,6 +148,15 @@ bool display_present_region(struct framebuffer *visible, const struct framebuffe
         virtio_gpu_damage(x0, y0, x1 - x0, y1 - y0);
     }
 #endif
+}
+
+bool display_present_region(struct framebuffer *visible, const struct framebuffer *source,
+                            unsigned x, unsigned y, unsigned width, unsigned height) {
+#ifdef SOS2_BOARD_REDMI2
+    if (redmi2_adreno_present(visible, source, x, y, width, height)) return true;
+#endif
+    if (!display_draw_region(visible, source, x, y, width, height)) return false;
+    display_show_region(visible, source, x, y, width, height);
     return true;
 }
 

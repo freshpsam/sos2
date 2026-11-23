@@ -43,13 +43,55 @@ static int panic_lines(int y, const char *text, bool draw) {
     return y;
 }
 
-uint64_t time_us(void) {
-    /* ARM architectural generic timer: virtual count and its frequency. */
-    uint64_t count = arch_counter();
-    uint32_t frequency = arch_counter_frequency();
-    if (!frequency) panic("architected timer has zero frequency");
-    return user_timer_us(count, frequency);
+/* The timer's frequency and floor((2^64 - 1) / frequency), set by the first
+ * time_us(), on CPU 0 before any other starts; cached memory. */
+static uint32_t timer_frequency __attribute__((section(".cpu_private")));
+static uint64_t timer_reciprocal __attribute__((section(".cpu_private")));
+
+static uint64_t multiply_high(uint64_t a, uint64_t b) {
+#ifdef __SIZEOF_INT128__
+    return (uint64_t)(((unsigned __int128)a * b) >> 64);
+#else
+    uint64_t low = (uint64_t)(uint32_t)a * (uint32_t)b, cross_a = (a >> 32) * (uint32_t)b,
+             cross_b = (uint64_t)(uint32_t)a * (b >> 32);
+    uint64_t middle = (low >> 32) + (uint32_t)cross_a + (uint32_t)cross_b;
+    return (a >> 32) * (b >> 32) + (cross_a >> 32) + (cross_b >> 32) + (middle >> 32);
+#endif
 }
+
+/* n / timer_frequency: the reciprocal's quotient is at most 2 short. */
+static uint64_t timer_divide(uint64_t n, uint64_t *remainder) {
+    uint64_t quotient = multiply_high(n, timer_reciprocal), rest = n - quotient * timer_frequency;
+    while (rest >= timer_frequency) {
+        rest -= timer_frequency;
+        ++quotient;
+    }
+    *remainder = rest;
+    return quotient;
+}
+
+/* The generic timer's virtual count in microseconds, exactly as
+ * user_timer_us computes it, but multiplying by the frequency's reciprocal:
+ * ARM32 has no 64-bit division, and libgcc's took half of the 950 cycles a
+ * call cost on the Nexus 5, whose main loop reads the clock some 16 times a
+ * turn. */
+uint64_t time_us(void) {
+    uint64_t count = arch_counter();
+    if (!timer_frequency) {
+        uint32_t frequency = arch_counter_frequency();
+        if (!frequency) panic("architected timer has zero frequency");
+        timer_reciprocal = UINT64_MAX / frequency;
+        timer_frequency = frequency;
+    }
+    uint64_t remainder, seconds = timer_divide(count, &remainder);
+    return seconds * 1000000 + timer_divide(remainder * 1000000, &remainder);
+}
+
+static uint64_t loop_time __attribute__((section(".cpu_private")));
+
+uint64_t loop_time_us(void) { return loop_time ? loop_time : time_us(); }
+
+void loop_time_update(void) { loop_time = time_us(); }
 
 void delay_us(uint64_t us) {
     for (uint64_t start = time_us(); time_us() - start < us;) { }

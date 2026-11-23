@@ -47,11 +47,15 @@ public:
     bool canShowMIMETypeAsHTML(const String &type) const final { return type == "text/html"_s; }
 
     String userAgent(const URL &) const final {
-        // Match the compatibility tokens in the pinned WebKit GLib/WPE port
-        // (platform/glib/UserAgentGLib.cpp), retaining our application identity.
-        // Missing Version/ or advertising ARM with Safari makes Google select
-        // its obsolete WAP tier and reject searches before scripts can run.
-        return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15 SOS2/1.0"_s;
+        // A mobile browser on every device, the tablet included: sites send
+        // their mobile pages, which the devices' cores load in half the time
+        // (YouTube's showed content after 6-7.5 s on the Nexus 5, its desktop
+        // one after 12-14 s, in 154 MiB rather than 396). Safari on the
+        // iPhone, whose engine this is, keeps sites' WebKit paths; Safari's
+        // tokens as they stand, Version/ above all: without it, or advertising
+        // ARM with Safari, Google selects its obsolete WAP tier and rejects
+        // searches before scripts can run. SOS2/ keeps our own identity.
+        return "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1 SOS2/1.0"_s;
     }
 
     void dispatchDecidePolicyForNavigationAction(

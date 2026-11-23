@@ -1,7 +1,8 @@
 /* The eMMC store on the devices (include/emmc_store.h). Every transfer stays
  * inside its region, through the board's driver: reads several sectors at a
- * time where it can, writes one at a time; a failure stops the card, and
- * both users, for the boot. */
+ * time where it can, and so writes to the data volume; the installed
+ * system's writes go a sector at a time. A failure stops the card, and both
+ * users, for the boot. */
 #include "emmc_store.h"
 #include "block.h"
 #include "disk_partition.h"
@@ -72,9 +73,16 @@ bool block_read(uint64_t sector, void *data, unsigned count) {
     return true;
 }
 
+/* A littlefs block (fs.c) goes in one transfer where the driver can: the
+ * Nexus 5's card programs it about as fast as one sector. */
 bool block_write(uint64_t sector, const void *data, unsigned count) {
     if (!valid(sector, data, count)) return false;
     memcpy(bounce, data, count * 512);
+    if (emmc_card.write_many && count > 1) {
+        bool done = emmc_card.write_many(partition.start + sector, bounce, count);
+        kernel_io_wait();
+        return done;
+    }
     for (unsigned i = 0; i < count; ++i) {
         if (!emmc_card.write(partition.start + sector + i, bounce + i * 512)) return false;
         kernel_io_wait();

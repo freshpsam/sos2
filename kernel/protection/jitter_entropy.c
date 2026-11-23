@@ -19,15 +19,34 @@
  * No user mapping, device PRNG credit, deterministic seed or timer fallback. */
 enum {
     UNIT = 4096,
-    UNITS = 1024,
+    STATE_UNITS = 16,
+    NOISE_UNITS = 1024,
+    NOISE_MIN = 64 * 1024,
     CHUNK = 32,
     SEED = 48,
     RESEED_BYTES = 1 << 20,
     RESEED_US = 600000000
 };
 
-static unsigned char memory[UNIT * UNITS] __attribute__((aligned(4096), section(".cpu_private")));
-static unsigned short allocated[UNITS];
+/* Two arenas. jitterentropy times accesses to its noise memory (1 MiB, and
+ * the only allocation of 64 KiB or more), which upstream sizes past the
+ * caches so that they reach the DRAM. Uncached kernel BSS makes sure of it
+ * whatever the caches hold: cached, the Nexus 5's 2 MiB L2 kept all of it,
+ * and the collector's startup health tests failed on some boots. The
+ * collectors' other state stays cached. The noise arena holds two: after a
+ * health test fails during startup, the collector is replaced by one with
+ * twice the noise memory before the first is freed. */
+static unsigned char noise_memory[UNIT * NOISE_UNITS] __attribute__((aligned(4096)));
+static unsigned char state_memory[UNIT * STATE_UNITS]
+    __attribute__((aligned(4096), section(".cpu_private")));
+static unsigned short noise_allocated[NOISE_UNITS], state_allocated[STATE_UNITS];
+
+static const struct arena {
+    unsigned char *memory;
+    unsigned short *allocated;
+    unsigned units;
+} arenas[] = {{state_memory, state_allocated, STATE_UNITS},
+              {noise_memory, noise_allocated, NOISE_UNITS}};
 static struct rand_data *collector;
 static jmp_buf escape;
 static uint64_t started, budget;
@@ -59,15 +78,16 @@ void jent_memset_secure(void *p, size_t n) {
 }
 
 void *jent_zalloc(size_t size) {
-    if (!size || size > sizeof(memory)) return 0;
+    const struct arena *a = &arenas[size >= NOISE_MIN];
+    if (!size || size > a->units * UNIT) return 0;
     unsigned count = (size + UNIT - 1) / UNIT, run = 0;
-    for (unsigned i = 0; i < UNITS; ++i) {
-        run = allocated[i] ? 0 : run + 1;
+    for (unsigned i = 0; i < a->units; ++i) {
+        run = a->allocated[i] ? 0 : run + 1;
         if (run == count) {
             unsigned first = i + 1 - count;
-            for (unsigned j = first; j <= i; ++j) allocated[j] = (unsigned short)(i + 1 - j);
-            memset(memory + first * UNIT, 0, count * UNIT);
-            return memory + first * UNIT;
+            for (unsigned j = first; j <= i; ++j) a->allocated[j] = (unsigned short)(i + 1 - j);
+            memset(a->memory + first * UNIT, 0, count * UNIT);
+            return a->memory + first * UNIT;
         }
     }
     return 0;
@@ -76,13 +96,17 @@ void *jent_zalloc(size_t size) {
 void jent_zfree(void *p, size_t size) {
     (void)size;
     if (!p) return;
-    uintptr_t address = (uintptr_t)p, base = (uintptr_t)memory;
-    if (address < base || address >= base + sizeof(memory) || (address - base) % UNIT)
-        panic("entropy allocation invalid");
-    unsigned first = (address - base) / UNIT, count = allocated[first];
-    if (!count || count > UNITS - first) panic("entropy allocation corrupt");
+    uintptr_t address = (uintptr_t)p;
+    const struct arena *a = 0;
+    for (unsigned i = 0; i < sizeof(arenas) / sizeof(arenas[0]); ++i)
+        if (address >= (uintptr_t)arenas[i].memory &&
+            address < (uintptr_t)arenas[i].memory + arenas[i].units * UNIT)
+            a = &arenas[i];
+    if (!a || (address - (uintptr_t)a->memory) % UNIT) panic("entropy allocation invalid");
+    unsigned first = (address - (uintptr_t)a->memory) / UNIT, count = a->allocated[first];
+    if (!count || count > a->units - first) panic("entropy allocation corrupt");
     jent_memset_secure(p, count * UNIT);
-    for (unsigned i = 0; i < count; ++i) allocated[first + i] = 0;
+    for (unsigned i = 0; i < count; ++i) a->allocated[first + i] = 0;
 }
 
 void jent_get_nstime(uint64_t *out) {
@@ -112,8 +136,10 @@ static void disable(void) {
     active = ready = false;
     collector = 0;
     jent_memset_secure(&drbg, sizeof(drbg));
-    jent_memset_secure(memory, sizeof(memory));
-    memset(allocated, 0, sizeof(allocated));
+    for (unsigned i = 0; i < sizeof(arenas) / sizeof(arenas[0]); ++i) {
+        jent_memset_secure(arenas[i].memory, arenas[i].units * UNIT);
+        memset(arenas[i].allocated, 0, arenas[i].units * sizeof(arenas[i].allocated[0]));
+    }
 }
 
 static const char *startup_error(int code) {
@@ -154,7 +180,7 @@ bool entropy_init(const struct platform_devices *devices) {
         disable();
         return false;
     }
-    /* 1 MiB initial noise memory, allowed to grow inside the 4 MiB arena.
+    /* 1 MiB initial noise memory, allowed to grow inside its 4 MiB arena.
      * Upstream enforces its minimum oversampling rate even when zero is used. */
     unsigned flags = JENT_DISABLE_INTERNAL_TIMER | JENT_FORCE_FIPS | JENT_MAX_MEMSIZE_1MB;
     int error = jent_entropy_init_ex(0, flags);

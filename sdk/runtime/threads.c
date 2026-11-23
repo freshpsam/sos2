@@ -38,9 +38,11 @@ static inline unsigned tls_align(void) {
 }
 #else
 #define TCB_SIZE 8
-extern void *__aeabi_read_tp(void);
-
-static inline void *thread_pointer(void) { return __aeabi_read_tp(); }
+static inline void *thread_pointer(void) {
+    void *pointer;
+    __asm__("mrc p15, 0, %0, c13, c0, 3" : "=r"(pointer)); /* TPIDRURO */
+    return pointer;
+}
 
 static inline unsigned tls_align(void) { return (uintptr_t)__tls_align; }
 #endif
@@ -55,10 +57,20 @@ void *__tls_get_addr(const sos2_word index[2]) {
     return (char *)pointer + header + index[1];
 }
 
-struct sos2_thread *sos2_self(void) {
+static inline struct sos2_thread *self_thread(void) {
     void *pointer = thread_pointer();
     return pointer ? *(struct sos2_thread **)pointer : NULL;
 }
+
+/* Inline below: every lock and key lookup asks, 1.5% of YouTube's main
+ * thread on the Nexus 5 as calls. */
+static inline unsigned self_id(void) {
+    struct sos2_thread *t = self_thread();
+    unsigned id = t ? __atomic_load_n(&t->tid, __ATOMIC_RELAXED) : 0;
+    return id ? id : (unsigned)pthread_self();
+}
+
+struct sos2_thread *sos2_self(void) { return self_thread(); }
 static struct _reent bootstrap = _REENT_INIT(bootstrap);
 
 struct _reent *__getreent(void) {
@@ -67,7 +79,7 @@ struct _reent *__getreent(void) {
 }
 
 int sos2_trylock(struct sos2_lock *lock) {
-    unsigned self = pthread_self();
+    unsigned self = self_id();
     if (sos2_load(&lock->owner) == self) {
         ++lock->depth;
         return 1;
@@ -88,7 +100,7 @@ void sos2_lock(struct sos2_lock *lock) {
 }
 
 void sos2_unlock(struct sos2_lock *lock) {
-    if (sos2_load(&lock->owner) != (unsigned)pthread_self() || !lock->depth) abort();
+    if (sos2_load(&lock->owner) != self_id() || !lock->depth) abort();
     if (!--lock->depth) {
         sos2_store(&lock->owner, 0);
         if (sos2_load(&lock->waiters)) sos2_wake(&lock->owner, 1);
@@ -279,9 +291,11 @@ void sos2_threads_init(void) {
     if (call(SYS_THREAD_TLS, sos2_ptr(main->tls), 0)) finish(121);
 }
 
+/* A thread's own ID never changes while it runs, so a plain load: every lock
+ * and unlock asks. */
 pthread_t pthread_self(void) {
     struct sos2_thread *t = sos2_self();
-    unsigned id = t ? sos2_load(&t->tid) : 0;
+    unsigned id = t ? __atomic_load_n(&t->tid, __ATOMIC_RELAXED) : 0;
     return id ? id : (unsigned)call(SYS_THREAD_ID, 0, 0);
 }
 
@@ -559,15 +573,18 @@ int pthread_key_delete(pthread_key_t key) {
     return r;
 }
 
+/* Without the registry's lock: WebKit asks on every Thread::current(). A
+ * thread's values are its own, and a key's generation tells a value set under
+ * it from one set before it was deleted and created again; using a key while
+ * another thread deletes it is undefined, as in POSIX. */
 void *pthread_getspecific(pthread_key_t key) {
-    sos2_lock(&registry_lock);
-    struct sos2_thread *t = sos2_self();
-    void *result =
-        key < SOS2_KEYS && keys[key].used && t->key_generations[key] == keys[key].generation
-            ? (void *)t->keys[key]
-            : NULL;
-    sos2_unlock(&registry_lock);
-    return result;
+    struct sos2_thread *t = self_thread();
+    if (key >= SOS2_KEYS || !t) return NULL;
+    unsigned generation = __atomic_load_n(&keys[key].generation, __ATOMIC_RELAXED);
+    return __atomic_load_n(&keys[key].used, __ATOMIC_RELAXED) &&
+                   t->key_generations[key] == generation
+               ? (void *)t->keys[key]
+               : NULL;
 }
 
 int pthread_setspecific(pthread_key_t key, const void *value) {
@@ -642,7 +659,7 @@ int pthread_mutex_destroy(pthread_mutex_t *handle) {
 int pthread_mutex_lock(pthread_mutex_t *handle) {
     struct mutex *m = mutex(handle);
     if (!m) return EINVAL;
-    if (m->type != PTHREAD_MUTEX_RECURSIVE && sos2_load(&m->lock.owner) == pthread_self())
+    if (m->type != PTHREAD_MUTEX_RECURSIVE && sos2_load(&m->lock.owner) == self_id())
         return EDEADLK;
     sos2_lock(&m->lock);
     return 0;
@@ -651,7 +668,7 @@ int pthread_mutex_lock(pthread_mutex_t *handle) {
 int pthread_mutex_trylock(pthread_mutex_t *handle) {
     struct mutex *m = mutex(handle);
     if (!m) return EINVAL;
-    if (m->type != PTHREAD_MUTEX_RECURSIVE && sos2_load(&m->lock.owner) == pthread_self())
+    if (m->type != PTHREAD_MUTEX_RECURSIVE && sos2_load(&m->lock.owner) == self_id())
         return EBUSY;
     return sos2_trylock(&m->lock) ? 0 : EBUSY;
 }
@@ -659,7 +676,7 @@ int pthread_mutex_trylock(pthread_mutex_t *handle) {
 int pthread_mutex_unlock(pthread_mutex_t *handle) {
     struct mutex *m = mutex(handle);
     if (!m) return EINVAL;
-    if (sos2_load(&m->lock.owner) != pthread_self()) return EPERM;
+    if (sos2_load(&m->lock.owner) != self_id()) return EPERM;
     sos2_unlock(&m->lock);
     return 0;
 }
@@ -667,7 +684,7 @@ int pthread_mutex_unlock(pthread_mutex_t *handle) {
 int pthread_mutex_timedlock(pthread_mutex_t *handle, const struct timespec *deadline) {
     struct mutex *m = mutex(handle);
     if (!m) return EINVAL;
-    if (m->type != PTHREAD_MUTEX_RECURSIVE && sos2_load(&m->lock.owner) == pthread_self())
+    if (m->type != PTHREAD_MUTEX_RECURSIVE && sos2_load(&m->lock.owner) == self_id())
         return EDEADLK;
     if (sos2_trylock(&m->lock)) return 0;
     if (!deadline || deadline->tv_sec < 0 || deadline->tv_nsec < 0 ||

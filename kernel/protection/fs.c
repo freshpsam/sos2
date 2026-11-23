@@ -5,46 +5,62 @@
 #include "page_alloc.h"
 #include "kernel_io.h"
 #include "lfs.h"
+#include "ramfs.h"
 #include "system_store.h"
 
 enum {
     BLOCK = 4096,
-    CACHE = 512,
+    /* littlefs's caches, a block each: it programs a file's data as its cache
+     * fills, so writes reach the eMMC a block at a time, in one transfer where
+     * the driver can (include/emmc_store.h), and it reads metadata a block at
+     * a time. With 512 bytes the Nexus 5 moved a sector per command. */
+    CACHE = 4096,
     /* The browser keeps its working cookie and storage database here
-     * (programs/browser/web_state.cpp): up to 6 MiB, with room for the two
-     * more copies littlefs makes while rewriting it and a journal. */
+     * (programs/browser/web_state.cpp): up to 6 MiB, with its journal and
+     * the copies it seeds and saves. */
     TEMP_BYTES = 24 * 1024 * 1024,
     RESERVE_BYTES = 64 * 1024,
     INTERNAL_PATH = 160,
     RESOURCE = 1,
     RESOURCE_DIR = 2,
     DISK_FILE = 3,
-    DISK_DIR = 4
+    DISK_DIR = 4,
+    BLOCKS_CACHED = 256
 };
 
+/* Each lookahead window littlefs fills by traversing the whole volume, every
+ * file's block list included: on the eMMC, thousands of sector reads. One of
+ * 32768 blocks (128 MiB) makes them rare; 1024 had each database save the
+ * browser makes on the Nexus 5 rescan the volume once or twice. */
 struct volume {
     lfs_t fs;
     struct lfs_config config;
     unsigned char *memory;
     bool mounted;
-    unsigned char read_cache[CACHE], write_cache[CACHE], lookahead[128];
+    unsigned char read_cache[CACHE], write_cache[CACHE], lookahead[4096];
 };
 
 /* A lost inode could not be reopened after a rename: its littlefs file is
- * closed and every operation except close fails. */
+ * closed and every operation except close fails. Its cache is a page of its
+ * own while it is open: a process's 64 would take 256 KiB. On the temporary
+ * volume an inode holds a ramfs node instead, one for each node a process
+ * has open; such an inode is never lost and keeps no path. */
 struct inode {
     struct volume *volume;
-    unsigned refs;
+    unsigned refs, node;
     bool lost;
     char path[INTERNAL_PATH];
     lfs_file_t file;
     struct lfs_file_config config;
-    unsigned char cache[CACHE];
+    unsigned char *cache;
 };
+
+_Static_assert(CACHE == PAGE_SIZE, "an inode's cache is a page");
 
 struct directory {
     struct volume *volume;
     lfs_dir_t dir;
+    unsigned node, position; /* on the temporary volume */
     bool used;
 };
 
@@ -63,15 +79,29 @@ static struct fs_pool *pools;
  * /data or /tmp:   /settings/{wifi,clock,reserve}
  *                  /profiles/browser/ (every web page), /profiles/apps/<id>/
  * Paths are canonical and cannot climb out of a profile's directory, so
- * nothing inside a profile is hidden. */
+ * nothing inside a profile is hidden. The data volume is littlefs, on the
+ * eMMC, QEMU's disk or RAM; the temporary volume is in RAM, with ramfs
+ * (include/ramfs.h), which writes in place. */
 enum { DATA, TEMP, VOLUMES };
 /* Cached: littlefs reads its caches a byte at a time (CRCs, metadata), which
  * in the kernel's uncached data made every file operation milliseconds long.
  * Only CPU 0 runs the file system. */
 static struct volume volumes[VOLUMES] __attribute__((section(".cpu_private")));
 static unsigned char *temporary;
+
+static bool in_ram(const struct volume *v) { return v == &volumes[TEMP]; }
+
+_Static_assert(RAMFS_FILE_MAX == LFS_FILE_MAX, "one file size limit for both volumes");
 /* CPU-only buffers are cached: every file read and write copies through them. */
 static unsigned char *transfer;
+
+/* The disk volume's blocks as last read, 1 MiB direct-mapped by number. To
+ * find each next block of a file littlefs reads a few words from some ten
+ * blocks of its skip list: reading 12 MB took 8,300 commands and 2.6 s on the
+ * Nexus 5, before the browser's first request after boot. A write drops the
+ * block, so littlefs's check of what it programmed reads the device. */
+static unsigned char *block_cache;
+static uint32_t cached_block[BLOCKS_CACHED] __attribute__((section(".cpu_private"))); /* + 1 */
 
 enum { SESSION_BYTES = 32 * 1024 * 1024 };
 
@@ -119,26 +149,43 @@ static bool range(const struct lfs_config *c, lfs_block_t block, lfs_off_t off, 
 }
 
 /* RAM volumes never block, but littlefs extends a file (truncate or a write
- * past EOF) one byte per call. Yield periodically like the block devices do,
- * so a large fill cannot hold CPU 0. A no-op outside the service worker. */
-static uint64_t ram_yield_at;
+ * past EOF) one byte per call; and the eMMC drivers finish a sector's read
+ * before their first yield, so a traversal (lookahead above) reads on
+ * without one. Yield every 2 ms, so neither holds CPU 0's loop and every
+ * other system call. A no-op outside the service worker. */
+static uint64_t yield_at;
 
-static void ram_yield(void) {
-    if (time_us() - ram_yield_at < 2000) return;
+static void yield_due(void) {
+    if (time_us() - yield_at < 2000) return;
     kernel_io_wait();
-    ram_yield_at = time_us();
+    yield_at = time_us();
 }
 
 static int read_block(const struct lfs_config *c, lfs_block_t block, lfs_off_t off, void *data,
                       lfs_size_t size) {
     if (!range(c, block, off, size)) return LFS_ERR_IO;
     struct volume *v = c->context;
+    yield_due();
     if (v->memory) {
-        ram_yield();
         memcpy(data, v->memory + block * BLOCK + off, size);
         return 0;
     }
-    return block_read((uint64_t)block * 8 + off / 512, data, size / 512) ? 0 : LFS_ERR_IO;
+    if (!block_cache)
+        return block_read((uint64_t)block * 8 + off / 512, data, size / 512) ? 0 : LFS_ERR_IO;
+    unsigned slot = block % BLOCKS_CACHED;
+    unsigned char *cached = block_cache + (size_t)slot * BLOCK;
+    if (cached_block[slot] != block + 1) {
+        cached_block[slot] = 0;
+        if (!block_read((uint64_t)block * 8, cached, BLOCK / 512)) return LFS_ERR_IO;
+        cached_block[slot] = block + 1;
+    }
+    memcpy(data, cached + off, size);
+    return 0;
+}
+
+static void block_forget(lfs_block_t block) {
+    unsigned slot = block % BLOCKS_CACHED;
+    if (cached_block[slot] == block + 1) cached_block[slot] = 0;
 }
 
 static int write_block(const struct lfs_config *c, lfs_block_t block, lfs_off_t off,
@@ -146,10 +193,11 @@ static int write_block(const struct lfs_config *c, lfs_block_t block, lfs_off_t 
     if (!range(c, block, off, size)) return LFS_ERR_IO;
     struct volume *v = c->context;
     if (v->memory) {
-        ram_yield();
+        yield_due();
         memcpy(v->memory + block * BLOCK + off, data, size);
         return 0;
     }
+    block_forget(block);
     return block_write((uint64_t)block * 8 + off / 512, data, size / 512) ? 0 : LFS_ERR_IO;
 }
 
@@ -157,9 +205,9 @@ static int erase_block(const struct lfs_config *c, lfs_block_t block) {
     if (block >= c->block_count) return LFS_ERR_IO;
     struct volume *v = c->context;
     if (v->memory) {
-        ram_yield();
+        yield_due();
         memset(v->memory + block * BLOCK, 0xff, BLOCK);
-    }
+    } else block_forget(block);
     /* Sector devices overwrite directly. littlefs permits undefined erased
      * contents and validates erased metadata with its forward CRC. */
     return 0;
@@ -232,6 +280,9 @@ void fs_init(const struct platform_devices *devices) {
     uint64_t sectors = disk ? block_sectors() : 0;
     struct volume *v = &volumes[DATA];
     if (disk && sectors >= 4096 && sectors <= 2u * 1024 * 1024 && !(sectors % 8)) {
+        memset(cached_block, 0, sizeof(cached_block));
+        /* Without the memory, reads go straight to the device. */
+        if (!block_cache) block_cache = vm_cpu_alloc(BLOCKS_CACHED * BLOCK / PAGE_SIZE);
         configure(v, (unsigned)(sectors / 8));
         v->mounted = lfs_mount(&v->fs, &v->config) == 0;
         if (mode == STORAGE_INSTALLED) {
@@ -269,9 +320,7 @@ void fs_init(const struct platform_devices *devices) {
     if (v->mounted) ensure_reserve(v);
     v = &volumes[TEMP];
     v->memory = temporary;
-    configure(v, TEMP_BYTES / BLOCK);
-    if (lfs_format(&v->fs, &v->config) || lfs_mount(&v->fs, &v->config) ||
-        lfs_mkdir(&v->fs, "/profiles"))
+    if (!ramfs_init(temporary, TEMP_BYTES) || ramfs_mkdir("/profiles"))
         panic("temporary filesystem initialization");
     v->mounted = true;
 }
@@ -305,7 +354,7 @@ bool fs_space_init(struct fs_space *s, const char *profile) {
             if (*end && *end != '/') continue;
             char saved = *end;
             *end = 0;
-            int result = lfs_mkdir(&v->fs, root);
+            int result = in_ram(v) ? ramfs_mkdir(root) : lfs_mkdir(&v->fs, root);
             *end = saved;
             if (!saved || (result && result != LFS_ERR_EXIST)) break;
         }
@@ -353,7 +402,10 @@ bool fs_profile_remove(const char *profile) {
         char path[INTERNAL_PATH];
         memcpy(path, profiles, sizeof(profiles) - 1);
         strcpy(path + sizeof(profiles) - 1, profile);
-        if (volumes[index].mounted && !remove_tree(&volumes[index], path)) removed = false;
+        struct volume *v = &volumes[index];
+        if (!v->mounted) continue;
+        int err = in_ram(v) ? ramfs_remove_tree(path) : remove_tree(v, path) ? 0 : LFS_ERR_IO;
+        if (err && err != LFS_ERR_NOENT) removed = false;
     }
     return removed;
 }
@@ -429,18 +481,26 @@ static int error(int value) { return value == LFS_ERR_CORRUPT ? USER_EIO : value
 
 static int close_handle(struct fs_handle *h) {
     int result = 0;
-    if (h->kind == DISK_FILE) {
+    if (h->kind == DISK_FILE && in_ram(((struct inode *)h->object)->volume)) {
+        struct inode *n = h->object;
+        if (!--n->refs) {
+            ramfs_release(n->node);
+            *n = (struct inode){0};
+        }
+    } else if (h->kind == DISK_FILE) {
         struct inode *n = h->object;
         /* A lost inode's littlefs file is already closed. */
         result = n->lost ? USER_EIO : lfs_file_sync(&n->volume->fs, &n->file);
         if (!--n->refs) {
             int closed = n->lost ? 0 : lfs_file_close(&n->volume->fs, &n->file);
             if (!result) result = closed;
-            n->volume = 0;
+            vm_cpu_free(n->cache, 1);
+            *n = (struct inode){0};
         }
     } else if (h->kind == DISK_DIR) {
         struct directory *dir = h->object;
-        result = lfs_dir_close(&dir->volume->fs, &dir->dir);
+        if (in_ram(dir->volume)) ramfs_release(dir->node);
+        else result = lfs_dir_close(&dir->volume->fs, &dir->dir);
         dir->used = false;
     }
     *h = (struct fs_handle){0};
@@ -529,9 +589,9 @@ static bool reopen(struct volume *v, struct inode *n, const char *relative) {
 /* Each process has its own littlefs file for a path, which keeps the contents
  * it opened. So the lock hands contents over: releasing commits the holder's
  * writes and reopens the other processes' files, which would otherwise each
- * keep a whole old copy (the browser's database in /tmp), and taking reopens
- * the taker's file if another process committed to it since, for all its
- * descriptors. */
+ * keep a whole old copy, and taking reopens the taker's file if another
+ * process committed to it since, for all its descriptors. On the temporary
+ * volume every process shares one node, the browser's database included. */
 static int32_t file_lock(struct fs_space *s, const char *path, uint32_t take) {
     if (take > 1) return USER_EINVAL;
     char relative[INTERNAL_PATH];
@@ -549,11 +609,12 @@ static int32_t file_lock(struct fs_space *s, const char *path, uint32_t take) {
         if (l->volume != v || strcmp(l->path, relative)) continue;
         if (l->holder != s) return take ? USER_EBUSY : USER_EINVAL;
         if (take) return 0;
+        l->holder = 0;
+        if (in_ram(v)) return 0;
         struct inode *n = open_inode(s, v, relative);
         int result = n && (n->file.flags & (LFS_F_DIRTY | LFS_F_WRITING))
                          ? error(lfs_file_sync(&v->fs, &n->file))
                          : 0;
-        l->holder = 0;
         for (struct fs_pool *p = pools; p; p = p->next)
             for (unsigned j = 0; j < USER_FILE_HANDLES; ++j) {
                 struct inode *other = &p->inodes[j];
@@ -565,7 +626,7 @@ static int32_t file_lock(struct fs_space *s, const char *path, uint32_t take) {
     }
     if (!take) return USER_EINVAL;
     if (!unused || held >= PROCESS_FILE_LOCKS) return USER_EAGAIN;
-    struct inode *n = open_inode(s, v, relative);
+    struct inode *n = in_ram(v) ? 0 : open_inode(s, v, relative);
     if (n && (n->file.flags & LFS_F_DUSTY) && !reopen(v, n, relative)) return USER_EIO;
     unused->holder = s;
     unused->volume = v;
@@ -601,6 +662,14 @@ static bool resource_dir(const char *path) {
 static int path_info(struct fs_space *s, const char *path, struct user_file_info *info) {
     char relative[INTERNAL_PATH];
     struct volume *v = volume_for(s, path, relative);
+    if (v && in_ram(v)) {
+        struct ramfs_entry entry;
+        int err = ramfs_stat(relative, &entry);
+        if (err) return err;
+        *info =
+            (struct user_file_info){entry.type == RAMFS_DIR ? FILE_DIR : FILE_REGULAR, entry.size};
+        return 0;
+    }
     if (v) {
         if (!v->mounted) return USER_ENODEV;
         /* littlefs commits directory metadata at sync; stat must also see a
@@ -665,13 +734,39 @@ static int open_file(struct fs_space *s, const char *path, unsigned flags) {
             while (i < USER_FILE_HANDLES && s->pool->directories[i].used) ++i;
             if (i == USER_FILE_HANDLES) return USER_EMFILE;
             struct directory *dir = &s->pool->directories[i];
-            int err = lfs_dir_open(&v->fs, &dir->dir, relative);
+            int err = in_ram(v) ? ramfs_open_dir(relative, &dir->node)
+                                : lfs_dir_open(&v->fs, &dir->dir, relative);
             if (err) return error(err);
+            dir->position = 0;
             dir->used = true;
             dir->volume = v;
             h->kind = DISK_DIR;
             h->object = dir;
             strcpy(h->path, path);
+        } else if (in_ram(v)) {
+            unsigned node;
+            int err = ramfs_open(relative,
+                                 ((flags & FILE_CREATE) ? RAMFS_CREATE : 0) |
+                                     ((flags & FILE_EXCLUSIVE) ? RAMFS_EXCLUSIVE : 0) |
+                                     ((flags & FILE_TRUNCATE) ? RAMFS_TRUNCATE : 0),
+                                 &node);
+            if (err) return err;
+            struct inode *n = 0, *unused = 0, *inodes = s->pool->inodes;
+            for (unsigned i = 0; i < USER_FILE_HANDLES && !n; ++i) {
+                if (inodes[i].volume == v && inodes[i].node == node) n = &inodes[i];
+                else if (!inodes[i].volume && !unused) unused = &inodes[i];
+            }
+            if (n) ramfs_release(node); /* the inode holds the node already */
+            else if (unused) {
+                n = unused;
+                *n = (struct inode){.volume = v, .node = node};
+            } else {
+                ramfs_release(node);
+                return USER_EMFILE;
+            }
+            ++n->refs;
+            h->kind = DISK_FILE;
+            h->object = n;
         } else {
             struct inode *n = 0, *inodes = s->pool->inodes;
             for (unsigned i = 0; i < USER_FILE_HANDLES; ++i)
@@ -690,14 +785,17 @@ static int open_file(struct fs_space *s, const char *path, unsigned flags) {
                         break;
                     }
                 if (!n) return USER_EMFILE;
-                *n = (struct inode){.volume = v};
+                unsigned char *cache = vm_cpu_alloc(1);
+                if (!cache) return USER_ENOMEM;
+                *n = (struct inode){.volume = v, .cache = cache};
                 n->config.buffer = n->cache;
                 int options = LFS_O_RDWR | ((flags & FILE_CREATE) ? LFS_O_CREAT : 0) |
                               ((flags & FILE_EXCLUSIVE) ? LFS_O_EXCL : 0) |
                               ((flags & FILE_TRUNCATE) ? LFS_O_TRUNC : 0);
                 int err = lfs_file_opencfg(&v->fs, &n->file, relative, options, &n->config);
                 if (err) {
-                    n->volume = 0;
+                    vm_cpu_free(cache, 1);
+                    *n = (struct inode){0};
                     return error(err);
                 }
                 strcpy(n->path, relative);
@@ -715,6 +813,9 @@ static int open_file(struct fs_space *s, const char *path, unsigned flags) {
 static int file_info(struct fs_handle *h, struct user_file_info *info) {
     if (h->kind == RESOURCE)
         *info = (struct user_file_info){FILE_REGULAR, ((struct runtime_file *)h->object)->size};
+    else if (h->kind == DISK_FILE && in_ram(((struct inode *)h->object)->volume))
+        *info =
+            (struct user_file_info){FILE_REGULAR, ramfs_size(((struct inode *)h->object)->node)};
     else if (h->kind == DISK_FILE) {
         struct inode *n = h->object;
         if (n->lost) return USER_EIO;
@@ -741,6 +842,16 @@ static bool child_name(const char *parent, unsigned index, struct user_dir_entry
 }
 
 static int read_directory(struct fs_handle *h, struct user_dir_entry *entry) {
+    if (h->kind == DISK_DIR && in_ram(((struct directory *)h->object)->volume)) {
+        struct directory *dir = h->object;
+        struct ramfs_entry found;
+        int result = ramfs_read_dir(dir->node, &dir->position, &found);
+        if (result <= 0) return result;
+        *entry = (struct user_dir_entry){
+            found.type == RAMFS_DIR ? FILE_DIR : FILE_REGULAR, found.size, {0}};
+        strcpy(entry->name, found.name);
+        return 1;
+    }
     if (h->kind == DISK_DIR) {
         struct directory *dir = h->object;
         struct lfs_info info;
@@ -798,6 +909,8 @@ static int path_operation(struct fs_space *s, uint32_t number, const char *path,
     if (!v) return USER_EROFS;
     if (!v->mounted) return USER_ENODEV;
     if (!strcmp(path, "/data") || !strcmp(path, "/tmp")) return USER_EBUSY;
+    if (in_ram(v) && number != SYS_PATH_RENAME)
+        return number == SYS_PATH_MKDIR ? ramfs_mkdir(relative) : ramfs_remove(relative);
     if (number == SYS_PATH_MKDIR) return error(lfs_mkdir(&v->fs, relative));
     if (number == SYS_PATH_REMOVE) {
         int err = lfs_remove(&v->fs, relative);
@@ -807,6 +920,7 @@ static int path_operation(struct fs_space *s, uint32_t number, const char *path,
     struct volume *new_volume = volume_for(s, other, new_relative);
     if (new_volume != v) return USER_EXDEV;
     if (!strcmp(other, "/data") || !strcmp(other, "/tmp")) return USER_EBUSY;
+    if (in_ram(v)) return ramfs_rename(relative, new_relative);
     /* Update every open inode name only after a successful atomic rename. */
     size_t old_length = strlen(relative), new_length = strlen(new_relative);
     /* littlefs would detach a directory moved below itself, losing the whole
@@ -869,8 +983,9 @@ static int path_operation(struct fs_space *s, uint32_t number, const char *path,
 }
 
 /* Seeking only records an offset and makes no littlefs call, so it runs on
- * the syscall path instead of pausing the page for the service worker. A
- * process is frozen while its own service I/O runs, so its handles are idle. */
+ * the syscall path instead of waiting for the service worker, even beside
+ * another thread's request on the same handle, which takes the offset as it
+ * starts and sets it as it ends. */
 int32_t fs_seek(struct fs_space *s, uint32_t handle, uint32_t offset) {
     if (!handle || handle > USER_FILE_HANDLES || !s->handles[handle - 1].kind) return USER_EBADF;
     struct fs_handle *h = &s->handles[handle - 1];
@@ -909,7 +1024,11 @@ int32_t fs_call(struct fs_space *s, struct vm_space *vm, uint32_t number, user_p
             struct volume *volume = volume_for(s, path, relative);
             struct user_fs_info info = {BLOCK, (runtime_files_size() + BLOCK - 1) / BLOCK, 0,
                                         USER_PATH_MAX, 1};
-            if (volume) {
+            if (volume && in_ram(volume)) {
+                info.blocks = ramfs_pages();
+                info.free_blocks = ramfs_free_pages();
+                info.read_only = 0;
+            } else if (volume) {
                 lfs_ssize_t used = lfs_fs_size(&volume->fs);
                 if (used < 0) return error(used);
                 if ((uint32_t)used > volume->config.block_count) return USER_EIO;
@@ -933,6 +1052,7 @@ int32_t fs_call(struct fs_space *s, struct vm_space *vm, uint32_t number, user_p
     int err = file_info(h, &info);
     if (err) return err;
     struct inode *n = h->kind == DISK_FILE ? h->object : 0;
+    bool ram = n && in_ram(n->volume);
     switch (number) {
         case SYS_FILE_SIZE: return info.type == FILE_REGULAR ? (int32_t)info.size : USER_EISDIR;
         case SYS_FILE_INFO: return vm_copy_to_user(vm, b, &info, sizeof(info)) ? 0 : USER_EFAULT;
@@ -952,7 +1072,12 @@ int32_t fs_call(struct fs_space *s, struct vm_space *vm, uint32_t number, user_p
             if (!count) return 0;
             if (!vm_accessible(vm, b, count, VM_WRITE)) return USER_EFAULT;
             const void *data;
-            if (n) {
+            if (ram) {
+                err = ramfs_read(n->node, h->offset, transfer, count);
+                if (err < 0) return err;
+                count = (unsigned)err;
+                data = transfer;
+            } else if (n) {
                 err = lfs_file_seek(&n->volume->fs, &n->file, h->offset, LFS_SEEK_SET);
                 if (err < 0) return error(err);
                 err = lfs_file_read(&n->volume->fs, &n->file, transfer, count);
@@ -974,6 +1099,11 @@ int32_t fs_call(struct fs_space *s, struct vm_space *vm, uint32_t number, user_p
             {
                 uint32_t offset = (h->flags & FILE_APPEND) ? info.size : h->offset;
                 if (offset > LFS_FILE_MAX || c > LFS_FILE_MAX - offset) return USER_EFBIG;
+                if (ram) {
+                    err = ramfs_write(n->node, offset, transfer, (uint32_t)c);
+                    if (err >= 0) h->offset = offset + (unsigned)err;
+                    return err;
+                }
                 err = lfs_file_seek(&n->volume->fs, &n->file, offset, LFS_SEEK_SET);
                 if (err < 0) return error(err);
                 err = lfs_file_write(&n->volume->fs, &n->file, transfer, (lfs_size_t)c);
@@ -984,10 +1114,10 @@ int32_t fs_call(struct fs_space *s, struct vm_space *vm, uint32_t number, user_p
             if (info.type != FILE_REGULAR) return USER_EISDIR;
             if (!n) return USER_EROFS;
             if (!(h->flags & FILE_WRITE)) return USER_EBADF;
-            return b > LFS_FILE_MAX
-                       ? USER_EFBIG
-                       : error(lfs_file_truncate(&n->volume->fs, &n->file, (lfs_off_t)b));
-        case SYS_FILE_SYNC: return n ? error(lfs_file_sync(&n->volume->fs, &n->file)) : 0;
+            if (b > LFS_FILE_MAX) return USER_EFBIG;
+            if (ram) return ramfs_truncate(n->node, (uint32_t)b);
+            return error(lfs_file_truncate(&n->volume->fs, &n->file, (lfs_off_t)b));
+        case SYS_FILE_SYNC: return n && !ram ? error(lfs_file_sync(&n->volume->fs, &n->file)) : 0;
         default: return USER_ENOSYS;
     }
 }

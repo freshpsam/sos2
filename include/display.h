@@ -11,6 +11,16 @@ void display_blank(void);
 bool display_present_region(struct framebuffer *, const struct framebuffer *, unsigned x,
                             unsigned y, unsigned width, unsigned height);
 bool display_present(struct framebuffer *, const struct framebuffer *);
+/* display_present_region in two steps, for a region drawn a band of rows at a
+ * time (kernel/protection/page_host.c): each band drawn, then the region shown
+ * once all are, so that a panel sent frames on demand (the Nexus 5's) never
+ * gets half of one. display_bands is false where the display presents regions
+ * itself (the Redmi 2's Adreno): there they are presented whole. */
+bool display_bands(void);
+bool display_draw_region(struct framebuffer *, const struct framebuffer *, unsigned x, unsigned y,
+                         unsigned width, unsigned height);
+void display_show_region(struct framebuffer *, const struct framebuffer *, unsigned x, unsigned y,
+                         unsigned width, unsigned height);
 /* Whether the display shows pages' GPU frames; false for good after a GPU
  * failure, and always on the phone. */
 bool display_gpu_frames(void);

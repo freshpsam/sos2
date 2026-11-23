@@ -36,6 +36,20 @@ SECTIONS
         __bss_start = .;
         __cpu_private_start = .;
         *(.cpu_private)
+        /* Cached as well: the scheduler's, page allocator's, network stack's and
+         * audio mixer's state, which CPU 0 alone uses and no device reads
+         * (virtio-net's and virtio-snd's queues stay uncached). */
+        *kernel/protection/page_alloc.o(.bss .bss.* COMMON)
+        *kernel/protection/process.o(.bss .bss.* COMMON)
+        *kernel/audio/audio.o(.bss .bss.* COMMON)
+        *kernel/net/network.o(.bss .bss.* COMMON)
+        *kernel/net/network_time.o(.bss .bss.* COMMON)
+        *kernel/wifi/*.o(.bss .bss.* COMMON)
+        *third_party/lwip/*.o(.bss .bss.* COMMON)
+        /* and the Wi-Fi driver's: SDIO in PIO, without DMA. */
+        *boards/nexus5/wifi.o(.bss .bss.* COMMON)
+        *boards/nexus5/bcm4339.o(.bss .bss.* COMMON)
+        *boards/nexus5/sdio.o(.bss .bss.* COMMON)
         . = ALIGN(4096);
         __cpu_private_end = .;
         *(.bss .bss.* COMMON)

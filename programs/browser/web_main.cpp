@@ -31,11 +31,15 @@
 #include <wtf/text/WTFString.h>
 #include <skia/core/SkSurface.h>
 #include <skia/core/SkCanvas.h>
+#include <skia/core/SkImage.h>
 #include <sos2/services.h>
 #include <bmalloc/mimalloc.h>
 #include <time.h>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <vector>
+#include "MediaRendererSOS2.h"
 #include "web_input.h"
 #include "web_storage.h"
 #include "web_browser.h"
@@ -231,6 +235,94 @@ struct FrameSchedule {
     }
 };
 
+// Shows a playing video's new frames while the main thread runs the page's
+// scripts, which on a busy page (YouTube's watch page on the Nexus 5) leave
+// it few composites: draws each frame where the last composite left the
+// video (SOS2::VideoPresentation), blends the layers above it there, and
+// presents that rectangle. Only for the CPU compositor drawing into the
+// pixel buffer. Never destroyed: its thread may run as the process ends.
+class VideoPresenter {
+public:
+    VideoPresenter(SOS2::LayerCompositor &compositor, SkSurface &surface, uint32_t *pixels,
+                   uint32_t *presented)
+        : m_compositor(compositor), m_surface(surface), m_pixels(pixels), m_presented(presented) {
+        std::thread([this] { run(); }).detach();
+    }
+
+    // While the page shows and paints into the pixel buffer.
+    void setEnabled(bool enabled) {
+        if (m_enabled.exchange(enabled, std::memory_order_relaxed) == enabled || !enabled) return;
+        SOS2::presentationsMade.fetch_add(1, std::memory_order_release);
+        SOS2::presentationsMade.notify_all();
+    }
+
+private:
+    // Without a presentation to show, it sleeps until the next one.
+    void run() {
+        for (;;) {
+            unsigned made = SOS2::presentationsMade.load(std::memory_order_acquire);
+            bool valid = false, playing = false;
+            if (m_enabled.load(std::memory_order_relaxed)) {
+                std::lock_guard lock(SOS2::surfaceLock());
+                valid = m_compositor.presentation().valid;
+                if (valid) playing = presentFrame();
+            }
+            if (!valid) {
+                SOS2::presentationsMade.wait(made, std::memory_order_acquire);
+                continue;
+            }
+            // A quarter of a display frame while a video plays.
+            struct timespec delay = {0, (playing ? 4 : 20) * 1000000L};
+            nanosleep(&delay, nullptr);
+        }
+    }
+
+    // Under the surface lock, with a valid presentation. True while the
+    // video's time goes on.
+    bool presentFrame() {
+        auto &p = m_compositor.presentation();
+        auto &renderer = *p.renderer;
+        renderer.advance();
+        bool playing = renderer.timeIsProgressing();
+        auto frame = renderer.currentFrame();
+        auto image = frame && frame != p.shown ? frame->platformImage() : nullptr;
+        if (!image || image->width() != p.frameSize.width() ||
+            image->height() != p.frameSize.height())
+            return playing;
+        m_surface.notifyContentWillChange(SkSurface::kRetain_ContentChangeMode);
+        auto canvas = SkCanvas::MakeRasterDirect(m_surface.imageInfo(), m_pixels, pageWidth * 4);
+        if (!canvas) return playing;
+        auto &rect = p.rect;
+        canvas->clipIRect(SkIRect::MakeXYWH(rect.x(), rect.y(), rect.width(), rect.height()));
+        SkPaint copy;
+        copy.setBlendMode(SkBlendMode::kSrc);
+        canvas->drawImage(image, p.origin.x(), p.origin.y(), SkSamplingOptions(), &copy);
+        if (p.overlaid)
+            canvas->drawImage(
+                SkImages::RasterFromPixmap(m_compositor.overlay().pixmap(), nullptr, nullptr), 0,
+                0);
+        user_pixel_scroll scroll{};
+        user_pixel_rect damage{unsigned(rect.x()), unsigned(rect.y()), unsigned(rect.width()),
+                               unsigned(rect.height())};
+        if (sos2_present_frame(m_pixels, &scroll, &damage, 1)) {
+            // The next composite draws the frame again and presents it.
+            p.valid = false;
+            return playing;
+        }
+        for (int y = rect.y(); y < rect.maxY(); ++y)
+            std::memcpy(m_presented + y * pageWidth + rect.x(), m_pixels + y * pageWidth + rect.x(),
+                        rect.width() * 4);
+        p.shown = WTF::move(frame);
+        return playing;
+    }
+
+    SOS2::LayerCompositor &m_compositor;
+    SkSurface &m_surface;
+    uint32_t *const m_pixels;
+    uint32_t *const m_presented;
+    std::atomic<bool> m_enabled{false};
+};
+
 class NativeChromeClient final : public EmptyChromeClient {
     WTF_DEPRECATED_MAKE_FAST_ALLOCATED(NativeChromeClient);
     FrameSchedule &schedule;
@@ -400,6 +492,15 @@ int main() {
         settings.setAcceleratedCompositingForFixedPositionEnabled(true);
         compositors.current = compositors.gpu.get();
     }
+    auto &presenter =
+        *new VideoPresenter(compositors.cpu, *surface, pixels.data(), presentedPixels.data());
+
+    // Returning from here destroys what the presenter draws into, and in
+    // this order: first keep it from drawing again.
+    struct PresenterStop {
+        ~PresenterStop() { SOS2::surfaceLock().lock(); }
+    } presenterStop;
+
     bool blendFallback = false;
     bool handBackAnimations = false;
     // Lost for good: repaint and present everything on the CPU.
@@ -428,7 +529,6 @@ int main() {
         // Drive WebKit's actual event loop: timers, promise jobs and DOM events.
         RunLoop::cycle();
         SOS2::handleBrowserCommands(page.get());
-        SOS2::HTTP::closeIdleConnections();
         SOS2::saveStorage();
         // Bound work per frame even when a device or page produces continuous input.
         for (unsigned budget = 0; budget < 64; ++budget) {
@@ -444,6 +544,7 @@ int main() {
         // The display's GPU failed: an idle page would present nothing more
         // and stay blank, so lose the GPU now, as a failed present would.
         if (gpu && !(surfaceState & USER_SURFACE_GPU_FRAMES)) loseGPU();
+        presenter.setEnabled(visible && !gpu);
         // The shell and compositor retain the last presented page. Hidden-page
         // invalidations remain in schedule.damage; visibility alone only needs
         // a rendering update, not a full raster/upload of unchanged content.
@@ -500,6 +601,8 @@ int main() {
             if ((composited ? compositor->needsComposite() || schedule.presentScroll.rect.width
                             : schedule.hasDamage()) &&
                 (visible || !painted)) {
+                // The video presenter draws into the surface and presents too.
+                std::lock_guard surfaceGuard(SOS2::surfaceLock());
                 // Retain the rest of the backing store. Invalidations raised by
                 // paint itself remain queued for the following frame.
                 auto damage = std::exchange(schedule.damage, Region());

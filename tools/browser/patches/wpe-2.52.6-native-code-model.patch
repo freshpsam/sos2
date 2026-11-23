@@ -1,0 +1,20 @@
+WebKit builds position-dependent code for SOS2: its engine is a static
+program linked at a fixed address, which needs no GOT.
+
+--- a/Source/cmake/WebKitCommon.cmake
++++ b/Source/cmake/WebKitCommon.cmake
+@@ -176,7 +176,13 @@
+     set(WebKit_LIBRARY_TYPE SHARED)
+     set(WebCoreTestSupport_LIBRARY_TYPE STATIC)
+ 
+-    set(CMAKE_POSITION_INDEPENDENT_CODE True)
++    if (PORT STREQUAL "SOS2")
++        # A static program at a fixed address (sdk/runtime/linker.ld): no GOT,
++        # which costs ARM32 a register and a load at each use of a global.
++        set(CMAKE_POSITION_INDEPENDENT_CODE False)
++    else ()
++        set(CMAKE_POSITION_INDEPENDENT_CODE True)
++    endif ()
+ 
+     # -----------------------------------------------------------------------------
+     # Install JavaScript shell

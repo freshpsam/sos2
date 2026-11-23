@@ -100,7 +100,7 @@ void battery_standby(bool active) {
 #endif
 }
 
-bool battery_pending(void) { return battery_supported() && time_us() >= next_poll; }
+bool battery_pending(void) { return battery_supported() && loop_time_us() >= next_poll; }
 
 void battery_service(void *unused) {
     (void)unused;

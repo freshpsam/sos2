@@ -3,6 +3,7 @@
 
 #include "web_clock.h"
 #include "web_scrolling.h"
+#include "MediaPlayerPrivateSOS2.h"
 #include <WebCore/FloatQuad.h>
 #include <WebCore/FloatRoundedRect.h>
 #include <WebCore/FontRenderOptions.h>
@@ -32,6 +33,14 @@ constexpr uint64_t budgetRetryUs = 5000000;
 constexpr uint64_t refineDelayUs = 150000;
 }
 
+std::atomic<unsigned> presentationsMade;
+
+std::recursive_mutex &surfaceLock() {
+    // Never destroyed: the video presenter may wait on it as the process ends.
+    static auto *lock = new std::recursive_mutex;
+    return *lock;
+}
+
 Ref<GraphicsLayer> LayerCompositor::Factory::createGraphicsLayer(GraphicsLayerType type,
                                                                  GraphicsLayerClient &client) {
     return adoptRef(*new CompositingLayer(type, client, m_compositor));
@@ -43,6 +52,7 @@ CompositingLayer::CompositingLayer(Type type, GraphicsLayerClient &client,
 
 CompositingLayer::~CompositingLayer() {
     willBeDestroyed();
+    if (m_compositor.m_presentedVideo == this) m_compositor.invalidatePresentation();
     m_compositor.m_videoLayers.remove(this);
     m_compositor.releaseBacking(*this);
     m_compositor.addDamage(m_drawnBounds);
@@ -199,6 +209,18 @@ RefPtr<NativeImage> CompositingLayer::currentVideoFrame() const {
     return player ? player->nativeImageForCurrentTime() : nullptr;
 }
 
+// The renderer behind a video's frames: SOS2's media engine, the only one,
+// made the frame the layer shows.
+RefPtr<MediaRendererSOS2> CompositingLayer::videoRenderer() const {
+    if (!m_showsVideo || !m_videoFrame) return nullptr;
+    auto &backing = static_cast<RenderLayerBacking &>(client());
+    auto *video = dynamicDowncast<RenderVideo>(backing.owningLayer().renderer());
+    RefPtr player = video ? video->videoElement().player() : nullptr;
+    auto *engine =
+        player ? dynamicDowncast<MediaPlayerPrivateSOS2>(player->playerPrivate()) : nullptr;
+    return engine ? &engine->renderer() : nullptr;
+}
+
 void CompositingLayer::flushCompositingState(const FloatRect &visibleRect) {
     // WebCore flushes the root of each frame's tree. Subframe roots are children
     // of the main tree, so updating from the attached root covers every layer.
@@ -211,6 +233,17 @@ LayerCompositor::LayerCompositor(unsigned width, unsigned height)
     : m_viewport(width, height), m_fullCoverPixels(2ull * width * height),
       m_budget(backingBudgetBytes) { }
 
+// Only the main thread gives the presentation a renderer: this read needs no
+// lock. (The presenter may end it on its own, when a present fails.)
+void LayerCompositor::invalidatePresentation() {
+    if (!m_presentation.renderer) return;
+    std::lock_guard lock(surfaceLock());
+    m_presentation.valid = false;
+    m_presentation.renderer = nullptr;
+    m_presentation.shown = nullptr;
+    m_presentedVideo = nullptr;
+}
+
 void LayerCompositor::setRoot(GraphicsLayer *root) {
     m_root = root;
     m_changed = true;
@@ -220,27 +253,42 @@ void LayerCompositor::setRoot(GraphicsLayer *root) {
 }
 
 // New video frames come from the player, not from WebCore's layer changes;
-// videos outside the tree (a hidden frame's) show none.
+// videos outside the tree (a hidden frame's) show none, and one the video
+// presenter already put in the surface needs no composite.
 bool LayerCompositor::needsComposite() const {
     if (m_changed) return true;
-    for (auto *layer : m_videoLayers)
-        if (layer->m_reached && layer->currentVideoFrame() != layer->m_videoFrame) return true;
+    std::lock_guard lock(surfaceLock());
+    for (auto *layer : m_videoLayers) {
+        if (!layer->m_reached) continue;
+        auto frame = layer->currentVideoFrame();
+        if (frame != layer->m_videoFrame &&
+            !(m_presentation.valid && frame == m_presentation.shown))
+            return true;
+    }
     return false;
 }
 
-// A new frame: its contents rectangle is drawn again. The layer keeps the
-// frame it drew, so a new one can never reuse its address.
+// A new frame: its contents rectangle is drawn again, unless the video
+// presenter already drew it there. The layer keeps the frame it drew, so a
+// new one can never reuse its address. Under the lock, the presenter shows no
+// newer frame meanwhile, which drawing this one would then cover.
 bool LayerCompositor::takeVideoFrame(CompositingLayer &layer) {
+    std::lock_guard lock(surfaceLock());
     auto frame = layer.currentVideoFrame();
     if (frame == layer.m_videoFrame) return false;
+    bool presented = m_presentation.valid && frame == m_presentation.shown;
     layer.m_videoFrame = WTF::move(frame);
-    addDamage(layer.m_videoBounds);
+    if (presented) return false;
+    addDamage(layer.m_videoBounds, &layer == m_presentedVideo);
     return true;
 }
 
-void LayerCompositor::addDamage(const FloatRect &rect) {
+void LayerCompositor::addDamage(const FloatRect &rect, bool presentedFrame) {
     auto damage = intersection(enclosingIntRect(rect), IntRect(IntPoint(), m_viewport));
     if (damage.isEmpty()) return;
+    // Only the main thread gives the presentation a renderer and a rectangle.
+    if (!presentedFrame && m_presentation.renderer && damage.intersects(m_presentation.rect))
+        m_presentationStale = true;
     m_damage.unite(Region(damage));
     if (m_damage.gridSize() > 32) m_damage = Region(m_damage.bounds());
 }
@@ -448,7 +496,10 @@ Composition LayerCompositor::composite(SkCanvas &canvas) {
     m_changed = false;
     Composition composition{std::exchange(m_damage, Region()), m_flatten || !m_root};
     auto &damage = composition.damage;
-    if (damage.isEmpty()) return composition;
+    if (damage.isEmpty()) {
+        updatePresentation();
+        return composition;
+    }
     // Sparse damage goes rectangle by rectangle, dense damage as its bounds.
     auto rects = damage.rects();
     auto extent = damage.bounds();
@@ -456,7 +507,10 @@ Composition LayerCompositor::composite(SkCanvas &canvas) {
         damage = Region(extent);
         rects = {extent};
     }
-    if (composition.flatten) return composition;
+    if (composition.flatten) {
+        invalidatePresentation();
+        return composition;
+    }
     // Draw only the damage: the rest of the surface already shows these layers.
     auto &root = static_cast<CompositingLayer &>(*m_root);
     for (auto &rect : rects) {
@@ -474,7 +528,23 @@ Composition LayerCompositor::composite(SkCanvas &canvas) {
         canvas.restore();
         m_occluded = false;
     }
+    updatePresentation();
     return composition;
+}
+
+// After a composite. Unless it drew more than the video's frames into the
+// presented rectangle, the overlay holds, as long as frames keep their size.
+void LayerCompositor::updatePresentation() {
+    std::lock_guard lock(surfaceLock());
+    auto &p = m_presentation;
+    auto *video = m_presentedVideo;
+    auto image = video && video->m_videoFrame ? video->m_videoFrame->platformImage() : nullptr;
+    if (p.valid && !m_presentationStale && video->m_reached && image &&
+        IntSize(image->width(), image->height()) == p.frameSize &&
+        video->videoRenderer() == p.renderer)
+        p.shown = video->m_videoFrame;
+    else preparePresentation();
+    m_presentationStale = false;
 }
 
 // The topmost layer that draws all of `damage` opaquely, with no group
@@ -632,6 +702,144 @@ void LayerCompositor::drawContents(SkCanvas &canvas, CompositingLayer &layer, fl
                              &imagePaint, SkCanvas::kFast_SrcRectConstraint);
     }
     canvas.restore();
+}
+
+// The playing video the presenter may take over, when the surface shows it as
+// the presenter would draw it: one video, its frames opaque and unscaled at
+// whole pixels, under no transform, group opacity or clip short of whole
+// pixels; rounded clips only where their corners stay outside. The layers
+// drawn above it within its rectangle go to the overlay. Under surfaceLock(),
+// after a composite.
+void LayerCompositor::preparePresentation() {
+    auto &p = m_presentation;
+    std::lock_guard lock(surfaceLock());
+    p.valid = false;
+    p.renderer = nullptr;
+    p.shown = nullptr;
+    p.overlaid = false;
+    m_presentedVideo = nullptr;
+    if (m_flatten || !m_root) return;
+    CompositingLayer *video = nullptr;
+    for (auto *layer : m_videoLayers) {
+        if (!layer->m_reached || !layer->m_videoFrame) continue;
+        if (video) return;
+        video = layer;
+    }
+    if (!video) return;
+    auto &layer = *video;
+    auto image = layer.m_videoFrame->platformImage();
+    auto contents = layer.contentsRect();
+    if (!image || !image->isOpaque() || !layer.contentsAreVisible() || layer.opacity() < 1 ||
+        layer.renderingIsSuppressedIncludingDescendants() ||
+        contents.size() != FloatSize(image->width(), image->height()))
+        return;
+    // Where drawLayer and drawContents leave the frame, clip by clip.
+    FloatRect shown{FloatPoint(), FloatSize(m_viewport)};
+    auto clipTo = [&](const FloatRoundedRect &clip, const TransformationMatrix &matrix) {
+        if (!matrix.isIdentityOrTranslation() || matrix.m43() ||
+            matrix.m41() != std::round(matrix.m41()) || matrix.m42() != std::round(matrix.m42()))
+            return false;
+        FloatSize offset(matrix.m41(), matrix.m42());
+        auto local = shown;
+        local.move(-offset);
+        if (clip.isRounded() && !clip.intersectionIsRectangular(local)) return false;
+        auto rect = clip.rect();
+        rect.move(offset);
+        shown.intersect(rect);
+        return true;
+    };
+    if (!clipTo(FloatRoundedRect(contents), layer.m_combined)) return;
+    auto clipping = layer.contentsClippingRect();
+    if ((clipping.isRounded() || !clipping.rect().contains(contents)) &&
+        !clipTo(clipping, layer.m_combined))
+        return;
+    for (auto *at = layer.parent(); at; at = at->parent()) {
+        auto &ancestor = static_cast<const CompositingLayer &>(*at);
+        if (ancestor.opacity() < 1 || ancestor.preserves3D() ||
+            ancestor.renderingIsSuppressedIncludingDescendants())
+            return;
+        auto clip = ancestor.contentsClippingRect();
+        if (ancestor.contentsRectClipsDescendants() &&
+            (clip.isRounded() || !clip.rect().contains(ancestor.contentsRect()))) {
+            if (!clipTo(clip, ancestor.m_combined)) return;
+        } else if (ancestor.masksToBounds()) {
+            auto matrix = ancestor.m_combined;
+            matrix.translate(ancestor.boundsOrigin().x(), ancestor.boundsOrigin().y());
+            if (!clipTo(FloatRoundedRect(FloatRect(FloatPoint(), ancestor.size())), matrix)) return;
+        }
+    }
+    IntRect rect = enclosingIntRect(shown);
+    if (rect.isEmpty() || FloatRect(rect) != shown) return;
+    if (m_overlay.isNull() &&
+        !m_overlay.tryAllocPixels(SkImageInfo::Make(m_viewport.width(), m_viewport.height(),
+                                                    kBGRA_8888_SkColorType, kPremul_SkAlphaType)))
+        return;
+    auto area = SkIRect::MakeXYWH(rect.x(), rect.y(), rect.width(), rect.height());
+    m_overlay.erase(SK_ColorTRANSPARENT, area);
+    auto canvas =
+        SkCanvas::MakeRasterDirect(m_overlay.info(), m_overlay.getPixels(), m_overlay.rowBytes());
+    if (!canvas) return;
+    canvas->clipIRect(area);
+    bool above = false, drew = false;
+    drawAbove(*canvas, static_cast<CompositingLayer &>(*m_root), rect, layer, above, drew);
+    p.renderer = layer.videoRenderer();
+    if (!p.renderer) return;
+    p.rect = rect;
+    p.origin =
+        IntPoint(layer.m_combined.m41() + contents.x(), layer.m_combined.m42() + contents.y());
+    p.frameSize = IntSize(contents.width(), contents.height());
+    p.overlaid = drew;
+    p.shown = layer.m_videoFrame;
+    p.valid = true;
+    m_presentedVideo = &layer;
+    presentationsMade.fetch_add(1, std::memory_order_release);
+    presentationsMade.notify_all();
+}
+
+// As drawLayer, but only what comes after the video's own contents: its
+// children and the layers painted after it.
+void LayerCompositor::drawAbove(SkCanvas &canvas, CompositingLayer &layer, const IntRect &rect,
+                                const CompositingLayer &video, bool &above, bool &drew) {
+    bool contentsVisible = layer.contentsAreVisible();
+    if ((!contentsVisible && layer.children().isEmpty()) ||
+        layer.renderingIsSuppressedIncludingDescendants() || layer.opacity() <= 0 ||
+        !layer.m_subtreeBounds.intersects(rect))
+        return;
+    float alpha = layer.opacity();
+    bool group = above && alpha < 1 && !layer.children().isEmpty();
+    int saved = canvas.getSaveCount();
+    if (group) {
+        SkRect bounds = layer.m_subtreeBounds;
+        canvas.saveLayerAlphaf(&bounds, alpha);
+    }
+    if (&layer == &video) above = true;
+    else if (above && contentsVisible &&
+             (layer.backfaceVisibility() || !layer.m_combined.isBackFaceVisible())) {
+        drawContents(canvas, layer, group ? 1 : alpha);
+        drew = true;
+    }
+    if (!layer.children().isEmpty()) {
+        auto clipping = layer.contentsClippingRect();
+        bool clipsToContents =
+            !layer.preserves3D() && layer.contentsRectClipsDescendants() &&
+            (clipping.isRounded() || !clipping.rect().contains(layer.contentsRect()));
+        bool masks = !layer.preserves3D() && layer.masksToBounds();
+        if (clipsToContents || masks) {
+            canvas.save();
+            TransformationMatrix clipTransform = layer.m_combined;
+            if (!clipsToContents)
+                clipTransform.translate(layer.boundsOrigin().x(), layer.boundsOrigin().y());
+            bool exact;
+            canvas.setMatrix(drawingMatrix(clipTransform, exact));
+            if (clipsToContents) canvas.clipRRect(SkRRect(clipping), !exact);
+            else canvas.clipRect(SkRect(FloatRect(FloatPoint(), layer.size())), !exact);
+            canvas.resetMatrix();
+        }
+        for (auto &child : layer.children())
+            drawAbove(canvas, static_cast<CompositingLayer &>(child.get()), rect, video, above,
+                      drew);
+    }
+    canvas.restoreToCount(saved);
 }
 
 }

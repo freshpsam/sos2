@@ -1,0 +1,93 @@
+The HTML parser waits for a frame before scripts that may run long, so
+that what a page opens with shows while they run.
+
+--- a/Source/WebCore/html/parser/HTMLParserScheduler.cpp
++++ b/Source/WebCore/html/parser/HTMLParserScheduler.cpp
+@@ -37,6 +37,9 @@
+ #include "ScriptElement.h"
+ #include <wtf/TZoneMallocInlines.h>
+ #include "FrameDestructionObserverInlines.h"
++#if OS(SOS2)
++#include "Page.h"
++#endif
+ 
+ namespace WebCore {
+ 
+@@ -105,6 +108,19 @@
+     ASSERT(!m_suspended);
+     ASSERT(m_parser);
+ 
++#if OS(SOS2)
++    if (m_frameWaitStart) {
++        constexpr auto frameWaitLimit = 100_ms;
++        RefPtr page = m_parser->document()->page();
++        if (page && page->lastRenderingUpdateTimestamp() < m_frameWaitStart && MonotonicTime::now() - m_frameWaitStart < frameWaitLimit) {
++            page->scheduleRenderingUpdate(RenderingUpdateStep::LayerFlush);
++            m_continueNextChunkTimer.startOneShot(1_ms);
++            return;
++        }
++        m_frameWaitStart = { };
++    }
++#endif
++
+     // FIXME: The timer class should handle timer priorities instead of this code.
+     // If a layout is scheduled, wait again to let the layout timer run first.
+     if (m_parser->document()->isLayoutPending()) {
+@@ -124,6 +140,31 @@
+     return false;
+ }
+ 
++#if OS(SOS2)
++// The browser draws frames between turns of the event loop, and parsing goes
++// on at the next one, so a script that holds the parser hid what came before
++// it until it ended: YouTube's skeleton, 8 s on a Nexus 5. A layout, which
++// isVisuallyNonEmpty() needs, had not run either. Before such a script the
++// parser waits for a frame, a few times a load.
++bool HTMLParserScheduler::shouldWaitForFrame(Document& document, const ScriptElement* script, PumpSession& session)
++{
++    constexpr unsigned frameWaitsPerDocument = 3;
++    constexpr unsigned longInlineScript = 1024;
++    if (m_frameWaits >= frameWaitsPerDocument || !script || script->hasAsyncAttribute() || script->hasDeferAttribute())
++        return false;
++    if (!script->hasSourceAttribute() && script->scriptContent().length() < longInlineScript)
++        return false;
++    RefPtr page = document.page();
++    if (!page || !page->isVisible() || !document.frame()->isMainFrame())
++        return false;
++    if (!parsingProgressedSinceLastYield(session))
++        return false;
++    ++m_frameWaits;
++    m_frameWaitStart = MonotonicTime::now();
++    return true;
++}
++#endif
++
+ bool HTMLParserScheduler::shouldYieldBeforeExecutingScript(const ScriptElement* scriptElement, PumpSession& session)
+ {
+     // If we've never painted before and a layout is pending, yield prior to running
+@@ -144,6 +185,11 @@
+     if (m_documentHasActiveParserYieldTokens) [[unlikely]]
+         return true;
+ 
++#if OS(SOS2)
++    if (shouldWaitForFrame(*document, scriptElement, session))
++        return true;
++#endif
++
+     // Yield if we have never painted and there is meaningful content
+     if (document->view() && !document->view()->hasEverPainted() && document->view()->isVisuallyNonEmpty())
+         return parsingProgressedSinceLastYield(session);
+--- a/Source/WebCore/html/parser/HTMLParserScheduler.h
++++ b/Source/WebCore/html/parser/HTMLParserScheduler.h
+@@ -135,6 +135,11 @@
+     bool m_suspended;
+ #endif
+     bool m_documentHasActiveParserYieldTokens { false };
++#if OS(SOS2)
++    bool shouldWaitForFrame(Document&, const ScriptElement*, PumpSession&);
++    unsigned m_frameWaits { 0 };
++    MonotonicTime m_frameWaitStart; // Null: not waiting.
++#endif
+ };
+ 
+ } // namespace WebCore

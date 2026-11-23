@@ -61,6 +61,7 @@ void kernel_main(const void *dtb) {
     struct pointer_event event;
     if (board_processes_ready(&devices, &screen)) enter_standby(&event);
     for (;;) {
+        loop_time_update();
         board_poll();
         (void)haptics_poll();
         enum board_power power = board_power_poll();
@@ -75,8 +76,10 @@ void kernel_main(const void *dtb) {
             board_standby_sleep();
             continue;
         }
+        process_turnaround();
         board_input(&event);
         page_host_render();
+        process_turnaround();
         display_poll();
         board_after_frame();
         /* A tap's buzz ends here, not after process_step, whose service

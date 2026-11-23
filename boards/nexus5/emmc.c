@@ -14,9 +14,9 @@
  * ready (sector addressing, its 1.8 V I/O), its CID, address 2, selected;
  * its EXT_CSD, then high-speed timing at 50 MHz and an 8-bit bus, checked
  * by reading the EXT_CSD again. A read of several sectors is one CMD18,
- * which the host stops with its own CMD12, and of one sector CMD17; writes
- * move a sector at a time (CMD24, then CMD13 until programming ends). The
- * card's cache stays off, so a written sector is on the flash. */
+ * which the host stops with its own CMD12, and of one sector CMD17; so are
+ * writes (CMD25 or CMD24, then CMD13 until programming ends). The card's
+ * cache stays off, so a written sector is on the flash. */
 
 enum {
     GCC = 0xfc400000,
@@ -166,6 +166,23 @@ static bool write_sector(uint64_t sector, const void *data) {
     return done;
 }
 
+/* CMD25: count sectors in one transfer, which the host stops with CMD12,
+ * then CMD13 until the card has programmed them all (one sector is CMD24's,
+ * as one read is CMD17's). */
+static bool write_sectors(uint64_t sector, const void *data, unsigned count) {
+    if (count == 1) return write_sector(sector, data);
+    if (!ready || busy || !count || count > 8 || sector >= sector_count ||
+        count > sector_count - sector)
+        return false;
+    busy = true;
+    bool done = sdhci_data(&host, 25, (uint32_t)sector, R1_ERRORS, (uint8_t *)(uintptr_t)data, 512,
+                           count, true) ||
+                stop();
+    done = done && card_ready();
+    busy = false;
+    return done;
+}
+
 static bool flush(void) {
     if (!ready || busy) return false;
     busy = true;
@@ -181,6 +198,7 @@ const struct emmc_card emmc_card = {.adopt = adopt,
                                     .read = read_sector,
                                     .read_many = read_sectors,
                                     .write = write_sector,
+                                    .write_many = write_sectors,
                                     .flush = flush,
                                     .loader_sectors = 0,
                                     .dedicated_partition = false};

@@ -14,6 +14,9 @@ bool process_init(struct platform_devices *devices, uintptr_t dtb);
 /* Collect worker completions and dispatch bounded slices between UI iterations.
  * On one CPU, executes one slice locally. Kernel services stay on the boot CPU. */
 void process_step(void);
+/* Between the main loop's other work: system calls that workers brought are
+ * handled and their threads sent back at once, not once a turn. */
+void process_turnaround(void);
 /* User time all processes have run, in microseconds, as of their last
  * completed slices: the tablet's CPU clocks follow it. */
 uint64_t process_user_us(void);

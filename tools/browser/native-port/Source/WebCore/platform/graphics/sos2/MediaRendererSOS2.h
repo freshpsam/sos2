@@ -7,6 +7,7 @@
 #include "IntSize.h"
 #include "NativeImage.h"
 #include "PlatformImage.h"
+#include "YUVScalerSOS2.h"
 #include <array>
 #include <wtf/Condition.h>
 #include <wtf/Deque.h>
@@ -100,8 +101,17 @@ public:
         AVCodecContext* m_context { nullptr };
         AVPacket* m_packet { nullptr };
         AVFrame* m_frame { nullptr };
-        SwsContext* m_scaler { nullptr };
-        std::array<int, 7> m_scalerSetup { }; // what m_scaler's colorspace was set for
+        // A 4:2:0 frame is scaled in YUV (m_yuvScaler, into m_planes), then
+        // converted to RGB at the size shown (m_converter, FFmpeg's NEON
+        // code for unscaled YUV): FFmpeg scaling straight to packed RGB runs
+        // C code, 70 ms a 480p frame on the Nexus 5. Other formats convert in
+        // one step.
+        YUVScalerSOS2 m_yuvScaler;
+        SwsContext* m_converter { nullptr };
+        std::array<int, 7> m_scalerSetup { }; // what m_converter's colorspace was set for
+        uint8_t* m_planes[4] { };
+        int m_planeStrides[4] { };
+        std::array<int, 3> m_planesSetup { }; // m_planes' width, height and format
         SwrContext* m_resampler { nullptr };
         Vector<int16_t> m_pcm;
         Vector<uint8_t> m_configuration;
@@ -128,12 +138,14 @@ public:
     bool hasAudio() const;
     bool hasVideo() const;
 
-    // Main thread, at each display frame: takes the newest decoded video
-    // frame the clock has reached. True when the frame to show changed.
+    // At each display frame, from the main thread or from the browser's video
+    // presenter (programs/browser/web_main.cpp), which shows frames while the
+    // main thread runs scripts: takes the newest decoded video frame the clock
+    // has reached. True when the frame to show changed.
     bool advance();
-    RefPtr<NativeImage> currentFrame() const { return m_current; }
-    unsigned shownFrames() const { return m_shownFrames; }
-    unsigned droppedFrames() const { return m_droppedFrames; }
+    RefPtr<NativeImage> currentFrame() const;
+    unsigned shownFrames() const;
+    unsigned droppedFrames() const;
 
 private:
     MediaRendererSOS2() = default;
@@ -185,11 +197,11 @@ private:
     std::atomic<float> m_volume { 1 };
     std::atomic<bool> m_muted { false };
 
-    // Main thread.
-    RefPtr<NativeImage> m_current;
-    IntSize m_decodedSize; // of the frame shown
-    unsigned m_shownFrames { 0 };
-    unsigned m_droppedFrames { 0 };
+    // The frame shown, which advance() takes on either thread.
+    RefPtr<NativeImage> m_current WTF_GUARDED_BY_LOCK(m_lock);
+    IntSize m_decodedSize WTF_GUARDED_BY_LOCK(m_lock); // of the frame shown
+    unsigned m_shownFrames WTF_GUARDED_BY_LOCK(m_lock) { 0 };
+    unsigned m_droppedFrames WTF_GUARDED_BY_LOCK(m_lock) { 0 };
 };
 
 } // namespace WebCore

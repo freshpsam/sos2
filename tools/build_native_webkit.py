@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Build the real WebKit engine against the native SOS2 SDK, for the browser."""
 import argparse
+import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -67,9 +69,12 @@ def prepare():
                          ('network', '.sos2-network-port'), ('clock', '.sos2-clock-port'),
                          ('wait', '.sos2-wait-port'), ('fonts', '.sos2-font-port'),
                          ('rendering', '.sos2-rendering-port'), ('cores', '.sos2-cores-port'),
+                         ('code-model', '.sos2-code-model-port'),
                          ('workers', '.sos2-workers-port'), ('neon', '.sos2-neon-port'),
                          ('scrolling', '.sos2-scrolling-port'),
+                         ('first-paint', '.sos2-first-paint-port'),
                          ('filter-bounds', '.sos2-filter-bounds-port'),
+                         ('blur', '.sos2-blur-port'),
                          ('llint', '.sos2-llint-port'),
                          ('compositing', '.sos2-compositing-port'),
                          ('gpu-compositing', '.sos2-gpu-compositing-port'),
@@ -84,6 +89,7 @@ def prepare():
                          ('jsc-host-call', '.sos2-jsc-host-call-port'),
                          ('jsc-bytecode-metadata', '.sos2-jsc-bytecode-metadata-port'),
                          ('jsc-dfg', '.sos2-jsc-dfg-port'),
+                         ('jsc-profiles', '.sos2-jsc-profiles-port'),
                          ('yarr-unicode', '.sos2-yarr-unicode-port'),
                          ('svg-repeat', '.sos2-svg-repeat-port'),
                          # WebKit 2.54's universal pseudo-element rule bucket.
@@ -174,8 +180,19 @@ def pack_web():
     files={'/bin/sos2-web':executable,'/fonts/LICENSE':fonts/'LICENSE'}
     roots=ROOT/'third_party/ca-certificates/mozilla.pem'
     if digest(roots)!='427c064216761a1e72a8b30f0d954d08cb6e4435a82091fb865afd20c8497285':raise RuntimeError('Unexpected Mozilla trust bundle digest')
-    # Web content and runtime configuration cannot change trust anchors.
-    files['/certs/roots.pem']=roots
+    # Web content and runtime configuration cannot change trust anchors. The
+    # roots go as their DER certificates, back to back, each a SEQUENCE with
+    # a two-byte length: every page and the updater parse them at start, and
+    # PEM's base64 cost the phones tens of milliseconds a page.
+    der=b''.join(base64.b64decode(block) for block in
+                 re.findall(rb'-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----',roots.read_bytes(),re.S))
+    at=0
+    while at<len(der):
+        if der[at:at+2]!=b'\x30\x82':raise RuntimeError('Unexpected root certificate encoding')
+        at+=4+int.from_bytes(der[at+2:at+4],'big')
+    if at!=len(der) or not der:raise RuntimeError('Unexpected root certificate encoding')
+    roots_der=BASE/'roots.der';roots_der.write_bytes(der)
+    files['/certs/roots.der']=roots_der
     # DejaVu's upright faces cut to English text (tools/browser_fonts.py):
     # WebKit slants them for italics (FontCacheSkia.cpp's synthetic oblique).
     for family in ('DejaVuSans','DejaVuSerif','DejaVuSansMono'):

@@ -1,7 +1,10 @@
 #ifndef SOS2_MBEDTLS_CONFIG_H
 #define SOS2_MBEDTLS_CONFIG_H
 /* Native client only. Entropy and I/O come from SOS2, never Unix devices.
- * Certificate dates use the native RTC. No verification bypass or legacy TLS. */
+ * Certificate dates use the native RTC. No verification bypass or legacy TLS.
+ * Bignum arithmetic uses the CPU's multiply-accumulate (bn_mul.h: UMAAL on
+ * ARMv7, AArch64's own): handshakes' RSA and elliptic-curve math. */
+#define MBEDTLS_HAVE_ASM
 #define MBEDTLS_HAVE_TIME
 #define MBEDTLS_HAVE_TIME_DATE
 #define MBEDTLS_PLATFORM_MS_TIME_ALT

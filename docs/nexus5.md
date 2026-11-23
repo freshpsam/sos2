@@ -7,7 +7,7 @@ phone, keeping its data in the cache partition, or starts from the computer
 with `fastboot boot` as a RAM session, whose data clears when it restarts.
 The desktop draws on the phone's screen and responds to touch, with a buzz
 for buttons and keys; it joins open and WPA2 networks over [Wi-Fi](#wi-fi),
-where pages load on all four cores at 1.5 GHz; the header shows the
+where pages load on all four cores at up to 2.26 GHz; the header shows the
 battery; the power key's standby turns off the backlight, the panel and the
 radio; and its USB port is a fastboot link to the computer. Packaging only
 writes files on the computer; it never touches the phone.
@@ -63,7 +63,7 @@ with the other devices' (`PUBLISH=nexus5` publishes the Nexus 5 alone):
 - `install.json`: the release, the files' sizes and SHA-256s, and these
   commands.
 
-The image (22.7 MB) fits the boot partition (22 MiB, 23.1 MB) whole, because
+The image (22.1 MB) fits the boot partition (22 MiB, 23.1 MB) whole, because
 SOS2 keeps English alone ([Architecture](architecture.md)). First keep
 Android's boot image: from a RAM session, read the boot partition over the
 USB link (15.6 s; nothing is written):
@@ -168,6 +168,10 @@ it stays private. Otherwise a RAM session forgets its network when it
 restarts; the installed system keeps the networks it joined in its data
 volume.
 
+The service worker polls the chip every 2 ms. A poll reads up to 50 frames
+waiting in it, a superframe whole, and gives CPU 0's loop a turn every
+0.5 ms between them: a burst read at once held the loop for up to 9 ms.
+
 While joined, the firmware saves power itself (PM_FAST: the radio sleeps
 between beacons while the link is idle, as Android runs this chip). In
 standby the station leaves its network, as on the other devices, and the
@@ -211,6 +215,14 @@ management frames (the firmware has neither).
   start (vm_init). Under
   load the cores read a spurious interrupt ID (1023) a few times in 10 s,
   which the scheduler takes as a preemption point (arch/arm/timer.c).
+  Reading the timer's count (virtual or physical) takes 468 cycles, 0.3 µs.
+- **Caches:** Krait keeps Outer Shareable memory out of its L1 data cache,
+  and without TEX remap a shareable descriptor (S=1) is Outer Shareable.
+  With every normal page shareable, every load went to the L2: a loop over
+  4 KiB took 7.3 cycles a load, 2.0 with the page non-shareable, and
+  JavaScript ran ten times slower. Linux marks shareable memory Inner
+  Shareable through TEX remap, as SOS2's ARM32 kernel now does
+  (include/arm_cache.h): the cores stay coherent and the L1 caches it.
 - **Other cores:** started as the stock kernel starts them
   (boards/nexus5/smp.c, Google's platsmp.c and krait-regulator.c): their
   entry through TrustZone's legacy SCM boot address (the call shared with
@@ -224,20 +236,38 @@ management frames (the firmware has neither).
 - **CPU clocks:** each core and the L2 have their own HFPLL (L x 19.2 MHz)
   and a mux in an L2 indirect register (CPMR, CP15's indirect window), which
   parks a clock on GPLL0's 300 MHz while its HFPLL restarts
-  (boards/nexus5/cpu_clock.c, the stock acpuclock-krait.c). The bootloader
-  leaves CPU 0 at 960 MHz and the L2 at 729.6 MHz, the CPU rail (PM8841 S5)
-  at 900 mV, the memory rail (S1) at 1.05 V and the logic rail (S2) at
-  1.03 V, its NORMAL level. This phone's part is speed bin 1, voltage class
-  2 (fuses at 0xFC4B80B0). Its table pairs each core rate with an L2 rate,
-  and L2 rates above 1036.8 MHz need the logic rail above NORMAL, which
-  only the RPM sets (the stock kernel's SMD messages); a core's own HFPLL
-  needs NORMAL up to L 104, and the memory rail is at the table's highest
-  already. So at boot the L2 moves to 1036.8 MHz and every core to
-  1497.6 MHz, which the table gives 910 mV: the CPU rail rises 10 mV first,
-  written to PM8841 S5 over SPMI, read back, given its slew time and
-  confirmed ready (without that the cores take 1190.4 MHz, 865 mV). That
-  shortens the boot by about 11 s. In standby CPU 0 and the L2 wait on
-  300 MHz with their HFPLLs off.
+  (boards/nexus5/cpu_clock.c, the stock acpuclock-krait.c with
+  acpuclock-8974.c's tables). The bootloader leaves CPU 0 at 960 MHz and the
+  L2 at 729.6 MHz, the CPU rail (PM8841 S5) at 900 mV, the memory rail (S1)
+  at 1.05 V and the logic rail (S2) at 1.03 V. The CPU rail each rate needs
+  follows the part's speed bin and voltage class, fused at 0xFC4B80B0 (this
+  phone's: bin 1, class 2, up to 2265.6 MHz). L2 rates above 1036.8 MHz and
+  HFPLLs above L 104 need the logic rail at its SUPER_TURBO corner
+  (nominally 1.05 V, so the bootloader's 1.03 V is about there), which only
+  the RPM sets. SOS2 asks for it as the stock kernel does, once, and never
+  takes the vote back (boards/nexus5/rpm.c: rpm-smd.c's request over
+  smd.c's channel rpm_requests, whose records and FIFOs the RPM keeps in its
+  message RAM; the bootloader leaves our side closed). At boot every core
+  moves to 1497.6 MHz and the L2 to 1036.8 MHz, the floor, the CPU rail
+  rising first (910 mV for this part): written to S5 over SPMI, read back,
+  given its slew time and confirmed ready; without that the cores keep
+  960 MHz. That shortens the boot by about 11 s. While pages work (2 ms of
+  user time in a 20 ms window, as on the tablet) every core rises to
+  2265.6 MHz with the L2 at 1728 MHz (1050 mV), and goes back to the floor
+  a second after: the browser's steady benchmark runs 1.5 times as fast,
+  YouTube's mobile home page shows its first videos 4.9 s after OPEN, and
+  its watch page plays from 4.3 s.
+- **Temperature:** TSENS's sensors 5 to 8, one in each core, which the
+  bootloader leaves measuring, converted with the part's two-point
+  calibration from the QFPROM as the stock msm8974-tsens.c does
+  (boards/nexus5/thermal.c). Every 250 ms the hottest core sets a cap on the
+  rate: from 80 C it falls a point (1958.4, 1728, 1574.4 MHz) down to the
+  floor; from 90 C (the stock kernel's own limit), or without a reading, to
+  960 MHz with the L2 at 960 MHz; below 70 C it rises again. All four cores
+  working reached 80 C within 15 s at the top and settled at the floor,
+  where they warmed from 77 to 82 C over five minutes; YouTube's video kept
+  the top for a minute at 64 C. In standby the cores wait at the floor or
+  below, CPU 0 and the L2 on 300 MHz with their HFPLLs off.
 - **Display:** a command-mode DSI panel, 1080x1920. The bootloader's splash
   is MDP pipe RGB0, RGB888 at 0x0D200000, and becomes the screen, drawn at
   full resolution. A command-mode panel shows a new picture only when the
@@ -356,15 +386,19 @@ management frames (the firmware has neither).
   its own CMD12 (auto CMD12): the boot partition reads in about 4.5 s over
   the USB link, against 15.6 s a sector at a time. One sector is CMD17: a
   CMD18 for one, never stopped, left the card sending, and the next command
-  timed out. Writes move a sector at a time, about 0.6 MB/s.
+  timed out. Writes to the data volume move a littlefs block (8 sectors) in
+  one CMD25, also ended by auto CMD12, then CMD13 until the card has
+  programmed them: about 2.4 MB/s, against 0.5 MB/s a sector at a time
+  (CMD24), which the installed system's own writes (updates) still use.
 - **Randomness:** jitterentropy's CPU timing jitter seeding an HMAC_DRBG, as
-  on the other devices. At the bootloader's 960 MHz 32 bytes of it took
-  about 1.2 s, so about 4 s with CPU 0 and the L2 parked at 300 MHz in
-  standby, and a read gets 8 s here.
+  on the other devices. Its 1 MiB of noise memory is uncached: cached, all of
+  it would fit the 2 MiB L2, while jitterentropy wants its accesses to reach
+  the DRAM. The startup test, a collector and 32 bytes take about 0.7 s at
+  1497.6 MHz; with CPU 0 and the L2 parked at 300 MHz in standby a read may
+  take several times that, and gets 8 s here.
 - **Not yet:** sound (the WCD9320 codec on SLIMbus behind the audio DSP,
   whose firmware, its messaging and the codec's setup would all have to
-  run first); the GPU (an Adreno 330, the Redmi 2's family); CPU levels
-  above 1497.6 MHz (the RPM, and a temperature watch); the cores'
+  run first); the GPU (an Adreno 330, the Redmi 2's family); the cores'
   power-down in standby (TrustZone's power collapse through each core's
   SPM, as on the Redmi 2); the Wi-Fi chip's own sleep in standby
   (brcmfmac's KSO, with the HT clock released); the panel's sleep and wake

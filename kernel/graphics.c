@@ -256,6 +256,56 @@ enum { SCANOUT_WIDTH = 800, SCANOUT_HEIGHT = 1340 };
 enum { SCANOUT_WIDTH = 1080, SCANOUT_HEIGHT = 1920 };
 #endif
 
+/* Words that may alias the scanout's bytes and a row's pixels. */
+typedef uint32_t scan_word __attribute__((__may_alias__));
+typedef uint16_t scan_half __attribute__((__may_alias__));
+
+/* One scanout row's pixels, built once from the source row it samples, then
+ * stored to every scanout row that samples the same row: 2.4 of them on the
+ * Nexus 5, 1.7 on the tablet. In the scanout's byte layout and at its word
+ * phase, in cached CPU-private memory: building rows pixel by pixel in the
+ * uncached scanout itself cost the Nexus 5 47 ms a full frame. */
+#if __STDC_HOSTED__ /* the apps, which draw with this file too, have no such section */
+static scan_word scaled_row[SCANOUT_WIDTH + 2];
+#else
+static scan_word scaled_row[SCANOUT_WIDTH + 2] __attribute__((section(".cpu_private")));
+#endif
+
+/* n bytes from the row to the scanout, both at one word phase: aligned words
+ * eight at a time, which the write buffer merges, and bytes at the ends. */
+static void store_row(unsigned char *dst, const unsigned char *src, size_t n) {
+    while (n && ((uintptr_t)dst & 3)) {
+        *dst++ = *src++;
+        --n;
+    }
+    scan_word *d = (scan_word *)dst;
+    const scan_word *s = (const scan_word *)src;
+#if defined(__arm__) && !__STDC_HOSTED__
+    for (; n >= 32; n -= 32)
+        __asm__ volatile("ldmia %1!, {r2, r3, r4, r5, r6, r7, r8, r9}\n\t"
+                         "stmia %0!, {r2, r3, r4, r5, r6, r7, r8, r9}"
+                         : "+r"(d), "+r"(s)
+                         :
+                         : "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "memory");
+#else
+    for (; n >= 32; n -= 32, d += 8, s += 8) {
+        scan_word a = s[0], b = s[1], c = s[2], e = s[3], f = s[4], g = s[5], h = s[6], i = s[7];
+        d[0] = a;
+        d[1] = b;
+        d[2] = c;
+        d[3] = e;
+        d[4] = f;
+        d[5] = g;
+        d[6] = h;
+        d[7] = i;
+    }
+#endif
+    for (; n >= 4; n -= 4) *d++ = *s++;
+    dst = (unsigned char *)d;
+    src = (const unsigned char *)s;
+    while (n--) *dst++ = *src++;
+}
+
 bool gfx_present_scaled_region(struct framebuffer *visible, const struct framebuffer *source,
                                uint32_t left, uint32_t top, uint32_t width, uint32_t height) {
     if (!gfx_framebuffer_valid(visible) || !gfx_framebuffer_valid(source) ||
@@ -269,15 +319,13 @@ bool gfx_present_scaled_region(struct framebuffer *visible, const struct framebu
     if (left >= source->width || top >= source->height || !width || !height) return true;
     if (width > source->width - left) width = source->width - left;
     if (height > source->height - top) height = source->height - top;
-    /* Copy geometry before writing scanout; stores must not force an uncached
-     * reload of framebuffer metadata in every iteration. */
     const uint32_t vw = visible->width, vh = visible->height, sw = source->width,
                    sh = source->height;
     const size_t vs = visible->stride, ss = source->stride;
     const enum pixel_format format = visible->format;
     const unsigned bytes = bytes_per_pixel(format);
     const unsigned char *src = source->pixels;
-    volatile unsigned char *dst = visible->pixels;
+    unsigned char *dst = visible->pixels;
     if (!left && !top && width == sw && height == sh && vw == sw && vh == sh &&
         format == source->format)
         return gfx_present(visible, source);
@@ -287,53 +335,64 @@ bool gfx_present_scaled_region(struct framebuffer *visible, const struct framebu
              x1 = ((uint64_t)(left + width) * vw + sw - 1) / sw;
     unsigned y0 = ((uint64_t)top * vh + sh - 1) / sh,
              y1 = ((uint64_t)(top + height) * vh + sh - 1) / sh;
+    if (x0 >= x1 || y0 >= y1) return true;
     unsigned columns[SCANOUT_WIDTH];
     for (unsigned x = x0; x < x1; ++x) columns[x] = (uint64_t)x * sw / vw;
+    /* The row is built at its scanout row's word phase, the same for every
+     * row when the stride is whole words, as the devices' are; a row at
+     * another phase is built again. */
+    size_t row_bytes = (size_t)(x1 - x0) * bytes;
+    uint32_t built = UINT32_MAX, built_phase = 0;
+    uint32_t alpha = format == PIXEL_ARGB8888 ? 0xff000000 : 0;
     for (unsigned y = y0; y < y1; ++y) {
-        const uint32_t *row = (const uint32_t *)(src + (size_t)((uint64_t)y * sh / vh) * ss);
-        volatile unsigned char *out = dst + (size_t)y * vs;
-        /* Damage is already known. Reading uncached scanout to compare every
-         * pixel costs more than publishing it, especially with packed RGB888. */
-        if (bytes == 2) {
-            volatile uint16_t *to = (volatile uint16_t *)out;
-            for (unsigned x = x0; x < x1; ++x) {
-                uint32_t value = row[columns[x]];
-                uint16_t pixel =
-                    ((value >> 8) & 0xf800) | ((value >> 5) & 0x7e0) | ((value >> 3) & 0x1f);
-                to[x] = pixel;
+        unsigned char *out = dst + (size_t)y * vs + (size_t)x0 * bytes;
+        unsigned phase = (unsigned)((uintptr_t)out & 3);
+        uint32_t sy = (uint32_t)((uint64_t)y * sh / vh);
+        if (sy != built || phase != built_phase) {
+            const uint32_t *row = (const uint32_t *)(src + (size_t)sy * ss);
+            unsigned char *line = (unsigned char *)scaled_row + phase;
+            if (bytes == 4) {
+                scan_word *to = (scan_word *)line;
+                for (unsigned x = x0; x < x1; ++x) *to++ = row[columns[x]] | alpha;
+            } else if (bytes == 2) {
+                scan_half *to = (scan_half *)line;
+                for (unsigned x = x0; x < x1; ++x) {
+                    uint32_t value = row[columns[x]];
+                    *to++ = (uint16_t)(((value >> 8) & 0xf800) | ((value >> 5) & 0x7e0) |
+                                       ((value >> 3) & 0x1f));
+                }
+            } else {
+                /* Three bytes a pixel, four pixels to three words once the
+                 * line is word-aligned: a byte at a time took the Nexus 5
+                 * 8 cycles a pixel, 1.4 ms of the 1.8 a video frame (shown
+                 * 1080x608) took to draw. */
+                unsigned x = x0;
+                for (; x < x1 && ((uintptr_t)line & 3); ++x, line += 3) {
+                    uint32_t value = row[columns[x]];
+                    line[0] = (uint8_t)value;
+                    line[1] = (uint8_t)(value >> 8);
+                    line[2] = (uint8_t)(value >> 16);
+                }
+                scan_word *to = (scan_word *)line;
+                for (; x + 4 <= x1; x += 4, to += 3) {
+                    uint32_t a = row[columns[x]], b = row[columns[x + 1]], c = row[columns[x + 2]],
+                             d = row[columns[x + 3]];
+                    to[0] = (a & 0xffffff) | b << 24;
+                    to[1] = (b >> 8 & 0xffff) | c << 16;
+                    to[2] = (c >> 16 & 0xff) | d << 8;
+                }
+                line = (unsigned char *)to;
+                for (; x < x1; ++x, line += 3) {
+                    uint32_t value = row[columns[x]];
+                    line[0] = (uint8_t)value;
+                    line[1] = (uint8_t)(value >> 8);
+                    line[2] = (uint8_t)(value >> 16);
+                }
             }
-        } else if (bytes == 4) {
-            volatile uint32_t *to = (volatile uint32_t *)out;
-            uint32_t alpha = format == PIXEL_ARGB8888 ? 0xff000000 : 0;
-            for (unsigned x = x0; x < x1; ++x) to[x] = row[columns[x]] | alpha;
-        } else {
-            unsigned x = x0;
-            volatile unsigned char *to = out + x * 3;
-            while (x < x1 && ((uintptr_t)to & 3)) {
-                uint32_t value = row[columns[x++]];
-                *to++ = value;
-                *to++ = value >> 8;
-                *to++ = value >> 16;
-            }
-            /* Four packed pixels occupy three aligned words. No padding or
-             * neighboring damage pixels are read or overwritten. */
-            volatile uint32_t *words = (volatile uint32_t *)to;
-            while (x1 - x >= 4) {
-                uint32_t a = row[columns[x]], b = row[columns[x + 1]], c = row[columns[x + 2]],
-                         d = row[columns[x + 3]];
-                *words++ = (a & 0xffffff) | (b << 24);
-                *words++ = ((b >> 8) & 0xffff) | (c << 16);
-                *words++ = ((c >> 16) & 0xff) | (d << 8);
-                x += 4;
-            }
-            to = (volatile unsigned char *)words;
-            while (x < x1) {
-                uint32_t value = row[columns[x++]];
-                *to++ = value;
-                *to++ = value >> 8;
-                *to++ = value >> 16;
-            }
+            built = sy;
+            built_phase = phase;
         }
+        store_row(out, (const unsigned char *)scaled_row + phase, row_bytes);
     }
     return true;
 }

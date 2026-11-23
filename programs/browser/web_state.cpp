@@ -6,11 +6,17 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <optional>
+#include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 namespace SOS2::State {
@@ -353,13 +359,23 @@ bool sameSite(const Address &a, const Address &b) {
 // The database pages use lives in /tmp, in RAM. On the eMMC, littlefs copies
 // a file's whole tail for each write inside it, and sites that store as they
 // load (YouTube) spent half their load in SQLite's writes. The first page
-// after boot copies the durable database from /data. A copy goes back 3 s
-// after the last change, or 30 s after the first unsaved one, as one
-// front-to-back write and a rename, by one page at a time: the one that
-// changed it, or any open page once SQLite's change counter in the working
-// copy's header differs from the one the last copy recorded. A power loss or
-// restart loses at most those last seconds, unless the page that made a
-// change closed before saving it and no page stayed open.
+// after boot copies the durable database's bytes from /data. A copy goes back
+// 3 s after the last change, or 30 s after the first unsaved one, by one page
+// at a time: the one that changed it, or any open page once SQLite's change
+// counter in the working copy's header differs from the one the last copy
+// recorded. A thread of the page's own makes it (saveDurable): it reads the
+// working copy's bytes under a read lock, RAM to RAM, so that a commit waits
+// at most that long, then, with no lock held, while the page goes on, writes
+// what changed. The durable copy is the database in 32 KiB pieces, kept in a
+// directory as packs, a file for each save holding the pieces it wrote, and
+// a manifest naming each piece's pack: a save writes only the pieces whose
+// bytes changed, to a new pack, then renames a new manifest over the old one
+// and removes the packs it no longer names (writeDurable). The database holds
+// what sites keep: Wikipedia's 2 MB module cache was written again for each
+// of YouTube's few-byte changes, five seconds of the Nexus 5's eMMC every
+// half minute. A power loss or restart loses at most those last seconds,
+// unless the page that made a change closed before saving it and no page
+// stayed open.
 struct Store::Impl {
     enum class Status { Retry, Ready, Broken };
     using Clock = std::chrono::steady_clock;
@@ -375,12 +391,31 @@ struct Store::Impl {
     int64_t sequence = 0;
     int64_t dataVersion = 0;
     Versions versions;
+    // The saving thread, started at the first save, and what it shares with
+    // the main thread under saveMutex: a request, then its outcome.
+    enum class Saved { Pending, Done, Busy, Failed };
+    std::thread saver;
+    std::mutex saveMutex;
+    std::condition_variable saveWake;
+    bool saveRequested = false, saving = false, saverStop = false;
+    Saved saveResult = Saved::Pending;
+    Clock::time_point saveStarted;
 
     Impl(std::string file, std::string copy) : path(std::move(file)), durable(std::move(copy)) {
         open();
     }
 
-    ~Impl() { sqlite3_close(db); }
+    ~Impl() {
+        if (saver.joinable()) {
+            {
+                std::lock_guard lock(saveMutex);
+                saverStop = true;
+            }
+            saveWake.notify_one();
+            saver.join();
+        }
+        sqlite3_close(db);
+    }
 
     static int64_t lookup(const Versions &map, std::string_view scope) {
         auto at = map.find(scope);
@@ -443,40 +478,217 @@ struct Store::Impl {
         ::close(fd);
     }
 
-    // Writes path's database to target in one pass, as VACUUM INTO does,
-    // then syncs it: the step that moves it between /data and /tmp.
-    static bool copy(sqlite3 *source, const std::string &target) {
-        ::unlink(target.c_str());
-        std::string sql = "VACUUM INTO '" + target + "'";
-        bool good = sqlite3_exec(source, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK;
-        if (good) {
-            int fd = ::open(target.c_str(), O_RDWR);
-            good = fd >= 0 && ::fsync(fd) == 0;
-            if (fd >= 0) ::close(fd);
+    // A whole file's bytes, read front to back and added to bytes; at most
+    // 8 MiB in all (the database stays under 6 MiB).
+    static bool readFile(const std::string &file, std::vector<char> &bytes) {
+        int fd = ::open(file.c_str(), O_RDONLY);
+        if (fd < 0) return false;
+        bool good = true;
+        for (;;) {
+            size_t at = bytes.size();
+            if (at >= 8 * 1024 * 1024) {
+                good = false;
+                break;
+            }
+            bytes.resize(at + 65536);
+            ssize_t n = ::read(fd, bytes.data() + at, 65536);
+            bytes.resize(at + (n > 0 ? size_t(n) : 0));
+            if (n <= 0) {
+                good = n == 0;
+                break;
+            }
         }
-        if (!good) ::unlink(target.c_str());
+        ::close(fd);
         return good;
     }
 
-    // The durable database copied to part, then renamed into place.
-    Status restore(const std::string &part) {
-        sqlite3 *source = nullptr;
-        Status result = Status::Broken;
-        if (sqlite3_open_v2(durable.c_str(), &source, SQLITE_OPEN_READWRITE, nullptr) ==
-            SQLITE_OK) {
-            sqlite3_busy_timeout(source, 5000);
-            if (copy(source, part))
-                result = ::rename(part.c_str(), path.c_str()) ? Status::Retry : Status::Ready;
-            else if ((sqlite3_extended_errcode(source) & 0xff) == SQLITE_BUSY)
-                result = Status::Retry;
+    using Span = std::pair<const char *, size_t>;
+
+    // target written front to back from spans, then synced. 16 KiB at a
+    // time: the kernel's file service runs one call at a time for every page,
+    // and on the eMMC a piece takes ~10 ms, as long as anyone's next call
+    // waits behind it.
+    static bool writeFile(const std::string &target, const std::vector<Span> &spans) {
+        int fd = ::open(target.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) return false;
+        bool good = true;
+        for (auto [data, size] : spans)
+            for (size_t at = 0; good && at < size;) {
+                ssize_t n = ::write(fd, data + at, std::min<size_t>(size - at, 16384));
+                good = n > 0;
+                if (good) at += size_t(n);
+            }
+        good = good && ::fsync(fd) == 0;
+        ::close(fd);
+        return good;
+    }
+
+    // size bytes at offset in fd.
+    static bool readAt(int fd, char *data, size_t size, uint32_t offset) {
+        for (size_t at = 0; at < size;) {
+            ssize_t n = ::pread(fd, data + at, size - at, off_t(offset + at));
+            if (n <= 0) return false;
+            at += size_t(n);
         }
-        sqlite3_close(source);
-        return result;
+        return true;
+    }
+
+    // The durable copy (see above): a manifest, which only a rename replaces,
+    // and the packs it names, one for each save, holding the pieces that save
+    // wrote, each pack's file named for its save and never rewritten.
+    static constexpr size_t pieceSize = 32 * 1024;
+    static constexpr size_t packsKept = 4;
+    static constexpr uint32_t manifestMagic = 0x50534f53; // "SOSP"
+
+    struct Piece {
+        uint32_t pack, size, offset; // the save that wrote it, where in its pack
+        uint64_t hash;
+    };
+
+    struct Manifest {
+        uint32_t counter = 0, generation = 0; // the copy's change counter; the last save's
+        std::vector<Piece> pieces;
+    };
+
+    // FNV-1a: a changed piece keeps its old hash by chance once in 2^64.
+    static uint64_t hash(const char *data, size_t size) {
+        uint64_t value = 0xcbf29ce484222325;
+        for (size_t i = 0; i < size; ++i) value = (value ^ uint8_t(data[i])) * 0x100000001b3;
+        return value;
+    }
+
+    std::string manifestPath() const { return durable + "/manifest"; }
+
+    std::string packPath(uint32_t pack) const { return durable + "/" + std::to_string(pack); }
+
+    // Little-endian words, the manifest's hash of all before it last.
+    std::optional<Manifest> readManifest() const {
+        std::vector<char> bytes;
+        // 12 bytes, 24 for each piece, then the hash's 8.
+        if (!readFile(manifestPath(), bytes) || bytes.size() < 44 || (bytes.size() - 20) % 24)
+            return std::nullopt;
+        auto word = [&](size_t at) {
+            uint64_t value = 0;
+            for (unsigned i = 0; i < 8; ++i) value |= uint64_t(uint8_t(bytes[at + i])) << (8 * i);
+            return value;
+        };
+        size_t end = bytes.size() - 8;
+        Manifest manifest;
+        uint64_t head = word(0);
+        manifest.counter = uint32_t(head >> 32);
+        manifest.generation = uint32_t(word(8));
+        if (uint32_t(head) != manifestMagic || word(end) != hash(bytes.data(), end) ||
+            (end - 12) / 24 > 8 * 1024 * 1024 / pieceSize)
+            return std::nullopt;
+        for (size_t at = 12; at < end; at += 24) {
+            uint64_t sizes = word(at);
+            manifest.pieces.push_back(
+                {uint32_t(sizes), uint32_t(sizes >> 32), uint32_t(word(at + 8)), word(at + 16)});
+        }
+        return manifest;
+    }
+
+    bool writeManifest(const Manifest &manifest) const {
+        std::vector<char> bytes;
+        auto put = [&](uint64_t value, unsigned length) {
+            for (unsigned i = 0; i < length; ++i) bytes.push_back(char(value >> (8 * i)));
+        };
+        put(manifestMagic | uint64_t(manifest.counter) << 32, 8);
+        put(manifest.generation, 4);
+        for (auto &piece : manifest.pieces) {
+            put(piece.pack | uint64_t(piece.size) << 32, 8);
+            put(piece.offset, 8);
+            put(piece.hash, 8);
+        }
+        put(hash(bytes.data(), bytes.size()), 8);
+        std::string part = manifestPath() + ".part";
+        if (writeFile(part, {{bytes.data(), bytes.size()}}) &&
+            !::rename(part.c_str(), manifestPath().c_str()))
+            return true;
+        ::unlink(part.c_str());
+        return false;
+    }
+
+    // The working copy's bytes as the durable copy: the pieces that changed
+    // go to a new pack, then a manifest naming it replaces the old one. A
+    // save that would leave more than packsKept packs in use writes every
+    // piece to its pack instead. Files no manifest names go after, a save
+    // that stopped short's included. littlefs commits to the directory for
+    // each file made, synced or removed, and on the Nexus 5 such a commit
+    // took 100 ms among a hundred files: a file for each piece made saving
+    // 1.5 MB take 10 s, most of it in commits.
+    bool writeDurable(const std::vector<char> &bytes, uint32_t counter) const {
+        ::mkdir(durable.c_str(), 0700);
+        Manifest old = readManifest().value_or(Manifest{});
+        Manifest next{counter, old.generation + 1, {}};
+        std::vector<uint32_t> packs;
+        for (size_t index = 0, at = 0; at < bytes.size(); ++index, at += pieceSize) {
+            Piece piece{next.generation, uint32_t(std::min(pieceSize, bytes.size() - at)), 0, 0};
+            piece.hash = hash(bytes.data() + at, piece.size);
+            if (index < old.pieces.size() && old.pieces[index].size == piece.size &&
+                old.pieces[index].hash == piece.hash)
+                piece = old.pieces[index];
+            if (std::find(packs.begin(), packs.end(), piece.pack) == packs.end())
+                packs.push_back(piece.pack);
+            next.pieces.push_back(piece);
+        }
+        bool whole = packs.size() > packsKept;
+        std::vector<Span> written;
+        uint32_t offset = 0;
+        for (size_t index = 0; index < next.pieces.size(); ++index) {
+            auto &piece = next.pieces[index];
+            if (!whole && piece.pack != next.generation) continue;
+            piece.pack = next.generation;
+            piece.offset = offset;
+            offset += piece.size;
+            written.emplace_back(bytes.data() + index * pieceSize, piece.size);
+        }
+        if (!written.empty() && !writeFile(packPath(next.generation), written)) return false;
+        if (!writeManifest(next)) return false;
+        std::vector<std::string> names{"manifest"};
+        for (auto &piece : next.pieces) names.push_back(std::to_string(piece.pack));
+        std::vector<std::string> unused;
+        if (DIR *directory = ::opendir(durable.c_str())) {
+            while (auto *entry = ::readdir(directory)) {
+                std::string_view name = entry->d_name;
+                if (name != "." && name != ".." &&
+                    std::find(names.begin(), names.end(), name) == names.end())
+                    unused.emplace_back(name);
+            }
+            ::closedir(directory);
+        }
+        for (auto &name : unused) ::unlink((durable + "/" + name).c_str());
+        return true;
+    }
+
+    // The durable copy's pieces joined into part, then renamed into place.
+    // Pieces whose bytes no longer match the manifest fail the copy.
+    Status restore(const std::string &part) {
+        std::vector<char> bytes;
+        auto manifest = readManifest();
+        bool good = manifest.has_value();
+        std::map<uint32_t, int> packs;
+        for (size_t index = 0; good && index < manifest->pieces.size(); ++index) {
+            auto &piece = manifest->pieces[index];
+            auto [pack, added] = packs.try_emplace(piece.pack, -1);
+            if (added) pack->second = ::open(packPath(piece.pack).c_str(), O_RDONLY);
+            size_t at = bytes.size();
+            bytes.resize(at + piece.size);
+            good = pack->second >= 0 &&
+                   readAt(pack->second, bytes.data() + at, piece.size, piece.offset) &&
+                   hash(bytes.data() + at, piece.size) == piece.hash;
+        }
+        for (auto &[pack, fd] : packs)
+            if (fd >= 0) ::close(fd);
+        if (!good || !writeFile(part, {{bytes.data(), bytes.size()}})) {
+            ::unlink(part.c_str());
+            return Status::Broken;
+        }
+        return ::rename(part.c_str(), path.c_str()) ? Status::Retry : Status::Ready;
     }
 
     // The first page after boot copies the durable database into /tmp under
-    // a lock that ends with its process. Opening it read-write first rolls
-    // back a journal that a crash left. A page that finds the copy already
+    // a lock that ends with its process. A page that finds the copy already
     // there saves it soon if it holds changes the durable copy lacks.
     Status seed() {
         if (!::access(path.c_str(), F_OK)) {
@@ -492,7 +704,7 @@ struct Store::Impl {
         Status result = Status::Ready;
         if (::access(path.c_str(), F_OK)) {
             if (errno != ENOENT) result = Status::Retry;
-            else if (!::access(durable.c_str(), F_OK)) {
+            else if (!::access(manifestPath().c_str(), F_OK)) {
                 result = restore(part);
                 if (result == Status::Ready) recordSaved(changes());
             } else if (errno != ENOENT) result = Status::Retry;
@@ -501,13 +713,11 @@ struct Store::Impl {
         return result;
     }
 
-    // The durable copy, written beside it and renamed over it, under a lock
-    // that ends with its process, so that two pages never write one copy.
-    // Failures retry later and later, up to a minute apart.
+    // Brings the durable copy up to date through the saving thread, when due.
     void save() {
         if (status != Status::Ready) return;
         auto now = Clock::now();
-        if (now < retryAt) return;
+        if (saverBusy(now) || now < retryAt) return;
         if (!unsaved) {
             // Changes another page made and closed without saving.
             if (now - looked < std::chrono::seconds(2)) return;
@@ -518,28 +728,95 @@ struct Store::Impl {
         if (now - lastChange < std::chrono::seconds(3) &&
             now - firstUnsaved < std::chrono::seconds(30))
             return;
-        std::string lock = durable + ".save";
-        if (sos2_file_lock(lock.c_str(), 1)) {
-            retryAt = now + std::chrono::seconds(1); // another page is saving
-            return;
+        if (!saver.joinable()) saver = std::thread([this] { saveLoop(); });
+        {
+            std::lock_guard lock(saveMutex);
+            saveRequested = saving = true;
+            saveResult = Saved::Pending;
         }
-        // Read before the copy: a later commit only makes another one due.
-        uint32_t current = changes();
-        bool good = current && current == saved();
-        if (!good) {
-            std::string part = durable + ".part";
-            good = copy(db, part) && !::rename(part.c_str(), durable.c_str());
-            if (good) recordSaved(current);
-            else ::unlink(part.c_str());
+        saveStarted = now;
+        saveWake.notify_one();
+    }
+
+    // Whether a save is still running; a finished one's outcome is taken.
+    // Changes committed after it started may be missing from its copy, so
+    // they stay unsaved, due 30 s from its start at the latest. Failures
+    // retry later and later, up to a minute apart.
+    bool saverBusy(Clock::time_point now) {
+        Saved result;
+        {
+            std::lock_guard lock(saveMutex);
+            if (!saving) return false;
+            if (saveResult == Saved::Pending) return true;
+            result = saveResult;
+            saving = false;
         }
-        sos2_file_lock(lock.c_str(), 0);
-        if (good) {
-            unsaved = false;
+        if (result == Saved::Done) {
+            if (lastChange > saveStarted) firstUnsaved = saveStarted;
+            else unsaved = false;
             retryDelay = std::chrono::seconds(3);
+        } else if (result == Saved::Busy) {
+            retryAt = now + std::chrono::seconds(1); // another page is saving
         } else {
-            retryAt = Clock::now() + retryDelay;
+            retryAt = now + retryDelay;
             retryDelay = std::min(retryDelay * 2, std::chrono::seconds(60));
         }
+        return false;
+    }
+
+    // The saving thread: one save per request, on a connection of its own.
+    void saveLoop() {
+        sqlite3 *reader = nullptr;
+        std::unique_lock lock(saveMutex);
+        for (;;) {
+            saveWake.wait(lock, [&] { return saveRequested || saverStop; });
+            if (saverStop) break;
+            saveRequested = false;
+            lock.unlock();
+            Saved result = saveDurable(reader);
+            lock.lock();
+            saveResult = result;
+        }
+        lock.unlock();
+        sqlite3_close(reader);
+    }
+
+    // One save: the working copy's bytes, read inside a read transaction so
+    // that no commit changes them meanwhile, then, with no lock held, written
+    // as the durable copy (writeDurable), under a lock that ends with its
+    // process, so that two pages never write one copy. A copy whose change
+    // counter the last one recorded is not written again.
+    Saved saveDurable(sqlite3 *&reader) {
+        if (!reader) {
+            if (sqlite3_open_v2(path.c_str(), &reader, SQLITE_OPEN_READWRITE, nullptr) !=
+                SQLITE_OK) {
+                sqlite3_close(reader);
+                reader = nullptr;
+                return Saved::Failed;
+            }
+            sqlite3_busy_timeout(reader, 5000);
+        }
+        std::string lock = durable + ".save";
+        if (sos2_file_lock(lock.c_str(), 1)) return Saved::Busy;
+        std::vector<char> bytes;
+        bool good = sqlite3_exec(reader, "BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK;
+        if (good) {
+            {
+                Statement read(reader, "SELECT count(*) FROM sqlite_master");
+                good = read.step() == SQLITE_ROW && readFile(path, bytes) && bytes.size() >= 100;
+            }
+            sqlite3_exec(reader, "COMMIT", nullptr, nullptr, nullptr);
+        }
+        if (good) {
+            auto byte = [&](size_t at) { return uint32_t(uint8_t(bytes[at])); };
+            uint32_t counter = byte(24) << 24 | byte(25) << 16 | byte(26) << 8 | byte(27);
+            if (!counter || counter != saved()) {
+                good = writeDurable(bytes, counter);
+                if (good) recordSaved(counter);
+            }
+        }
+        sos2_file_lock(lock.c_str(), 0);
+        return good ? Saved::Done : Saved::Failed;
     }
 
     void open() {

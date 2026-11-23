@@ -309,7 +309,7 @@ static void snapshot(struct wifi_radio_view *out) {
 static bool running(void) { return state.enabled && !state.failed; }
 
 static bool service_pending(void) {
-    return state.stopping || (running() && time_us() >= next_service) ||
+    return state.stopping || (running() && loop_time_us() >= next_service) ||
            (running() && random_wanted && state.random_bytes < 256 && entropy_available());
 }
 

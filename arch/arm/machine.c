@@ -94,8 +94,11 @@ bool arm_machine_init(const struct platform_devices *d) {
         {0xfe805000, 0x1000},  /* IMEM: the restart reason the bootloader reads */
         {0xf9010000, 0x10000}, /* APCS: its clock control, the L2's SAW2 and HFPLL */
         {0xf9088000, 0x40000}, /* each CPU's ACC, SAW2 and HFPLL (n at 0x10000 n) */
-        {0xfc4b8000, 0x1000},  /* QFPROM: the CPUs' speed and voltage bins */
+        {0xfc4b8000, 0x1000},  /* QFPROM: the CPUs' speed and voltage bins, TSENS's calibration */
         {0xfc4ab000, 0x1000},  /* MPM2 PS_HOLD: dropped to restart */
+        {0xfc4a8000, 0x2000},  /* TSENS: the cores' temperatures (thermal.c) */
+        {0x0fa00000, 0x200000}, /* shared memory with the RPM (rpm.c), in the firmware hole */
+        {0xfc428000, 0x4000},  /* the RPM's message RAM: its request channel */
     };
     for (unsigned i = 0; i < sizeof(phone) / sizeof(phone[0]); ++i)
         if (!device(phone[i].start, phone[i].size)) return false;

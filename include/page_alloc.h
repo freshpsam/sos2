@@ -23,4 +23,15 @@ void *pages_alloc(unsigned count, unsigned alignment_pages);
 void *pages_reserve(unsigned count, unsigned alignment_pages);
 bool pages_free(void *start, unsigned count);
 unsigned pages_available(void);
+/* Single pages promised to a mapping that installs them later (vm.h): taken
+ * out of pages_available now, so that no other allocation can use them up,
+ * and allocated (zeroed) one at a time. */
+bool pages_promise(unsigned count);
+void pages_unpromise(unsigned count);
+void *pages_alloc_promised(void);
+/* count single pages that lie in one run aligned to count, a power of two,
+ * from the pool's top, away from where single pages are taken; not zeroed,
+ * each freed alone. pages_zero zeroes one through its uncached alias. */
+void *pages_reserve_run(unsigned count);
+void pages_zero(void *page);
 #endif

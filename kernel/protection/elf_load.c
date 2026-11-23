@@ -1,11 +1,14 @@
 #include "elf_load.h"
 #include "platform.h"
 #include "kernel_io.h"
+#include "arch/context.h"
 #include "arch/elf.h"
 
 /* Every page process runs the same immutable engine image. Its read-only
- * segments (code and constants) are loaded once into the shared block and
- * mapped by each page, instead of copying ~90 MiB per Open. Apps load private
+ * segment (code and constants) is mapped from the resources where the
+ * packager aligned it for sections (tools/package_redmi2.py's sorb); else
+ * such segments are loaded once into the shared block, which each Open with
+ * no other page copies again (0.4 s for 70 MiB on the Nexus 5). Apps load private
  * copies, so an app opened first cannot take the block. */
 static const void *shared_image;
 static size_t shared_size;
@@ -14,14 +17,23 @@ static uint32_t shared_first[8];
 static bool share_segments(const void *image, size_t size, const struct program_header *headers,
                            unsigned count) {
     if (vm_shared_active()) return shared_image == image && shared_size == size;
-    unsigned pages = 0;
+    unsigned pages = 0, segments = 0;
+    const struct program_header *only = 0;
     for (unsigned i = 0; i < count; ++i) {
         const struct program_header *p = &headers[i];
         if (p->type != 1 || (p->flags & 2)) continue;
         shared_first[i] = pages;
         pages += (p->memsz + PAGE_SIZE - 1) / PAGE_SIZE;
+        only = p;
+        ++segments;
     }
     if (!pages) return false;
+    if (segments == 1 && only->filesz == only->memsz &&
+        vm_shared_adopt((const unsigned char *)image + only->offset, pages)) {
+        shared_image = image;
+        shared_size = size;
+        return true;
+    }
     unsigned char *block = vm_shared_create(pages);
     if (!block) return false; /* No contiguous block: load private copies. */
     for (unsigned i = 0; i < count; ++i) {
@@ -51,11 +63,16 @@ static bool load_segments(struct vm_space *space, const void *image, size_t size
         unsigned permissions =
             VM_READ | ((p->flags & 2) ? VM_WRITE : 0) | ((p->flags & 1) ? VM_EXEC : 0);
         if (share && !(p->flags & 2)) {
-            for (user_ptr offset = 0; offset < p->memsz; offset += PAGE_SIZE) {
-                if (!vm_map_shared(space, p->vaddr + offset,
-                                   shared_first[i] + (unsigned)(offset / PAGE_SIZE), permissions))
-                    return false;
-                if ((offset & 0xffffu) == 0xf000u) kernel_io_wait();
+            unsigned pages = (unsigned)((p->memsz + PAGE_SIZE - 1) / PAGE_SIZE);
+            for (unsigned done = 0, yielded = 0; done < pages;) {
+                unsigned n = vm_map_shared(space, p->vaddr + (user_ptr)done * PAGE_SIZE,
+                                           shared_first[i] + done, pages - done, permissions);
+                if (!n) return false;
+                done += n;
+                if (done - yielded >= 16) {
+                    yielded = done;
+                    kernel_io_wait();
+                }
             }
             continue;
         }
@@ -75,7 +92,7 @@ static bool load_segments(struct vm_space *space, const void *image, size_t size
                 return false;
             /* Open runs on the service worker. Bound copying/zeroing between
              * desktop polls, including large BSS segments. At boot this is a
-             * no-op; the worker's owner remains frozen until loading finishes. */
+             * no-op; the process has no thread to run until loading finishes. */
             if ((offset & 0xffffu) == 0xf000u) kernel_io_wait();
         }
     }
@@ -91,7 +108,8 @@ static bool parse(const void *image, size_t size, struct elf_header *out,
     if (memcmp(h.ident, ELF_IDENT, 7) || h.type != 2 || h.machine != ELF_MACHINE ||
         h.version != 1 || h.ehsize != sizeof(h) || h.phentsize != sizeof(struct program_header) ||
         !h.phnum || h.phnum > 8 || h.phoff > size ||
-        h.phnum > (size - h.phoff) / sizeof(struct program_header) || (h.entry & 3))
+        h.phnum > (size - h.phoff) / sizeof(struct program_header) ||
+        !arch_user_entry_valid(h.entry))
         return false;
     memcpy(headers, (const unsigned char *)image + h.phoff, h.phnum * sizeof(headers[0]));
     bool executable_entry = false;

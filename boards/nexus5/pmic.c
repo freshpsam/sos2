@@ -93,7 +93,7 @@ static bool key_down;
 static uint64_t key_polled;
 
 bool nexus5_power_key_pressed(void) {
-    uint64_t now = time_us();
+    uint64_t now = loop_time_us();
     if (now - key_polled < KEY_POLL_US) return false;
     key_polled = now;
     uint8_t status;

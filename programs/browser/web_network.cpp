@@ -79,7 +79,7 @@ public:
     // The 120 s cap starts with the first transport or cache hit. Waiting in
     // the six-load queue is not charged: loads behind slow ones must still start.
     std::optional<MonotonicTime> started;
-    std::unique_ptr<SOS2::HTTP::Client> transport;
+    std::unique_ptr<SOS2::HTTP::Fetch> transport;
     bool receivedResponse = false;
     std::string cacheKey;
     std::optional<CacheEntry> cached, saving;
@@ -188,7 +188,7 @@ public:
             native.body.assign(bytes.begin(), bytes.end());
         }
         receivedResponse = false;
-        transport = std::make_unique<SOS2::HTTP::Client>(std::move(native));
+        transport = std::make_unique<SOS2::HTTP::Fetch>(std::move(native));
         ++activeLoads;
         return true;
     }
@@ -372,7 +372,8 @@ bool ResourceHandle::start() {
     }
     auto load = std::make_shared<NetworkLoad>(*this, d->m_defersLoading);
     loads.emplace(this, load);
-    load->timer.startRepeating(10_ms);
+    // Begun on the event loop's next turn, then looked at every 10 ms.
+    load->timer.start(0_s, 10_ms);
     return true;
 }
 

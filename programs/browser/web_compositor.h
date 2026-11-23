@@ -21,9 +21,15 @@
 #include <WebCore/TransformationMatrix.h>
 #include <skia/core/SkBitmap.h>
 #include <wtf/HashSet.h>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 
 class SkCanvas;
+
+namespace WebCore {
+class MediaRendererSOS2;
+}
 
 namespace SOS2 {
 
@@ -35,6 +41,33 @@ class LayerCompositor;
 struct Composition {
     WebCore::Region damage;
     bool flatten{false};
+};
+
+// The page surface's lock: the main thread holds it while it paints,
+// composites, scrolls or presents the surface, the video presenter
+// (web_main.cpp) while it draws a frame into it and presents that.
+std::recursive_mutex &surfaceLock();
+
+// Counts the presentations made valid, which the presenter waits on while
+// it has none (std::atomic::wait).
+extern std::atomic<unsigned> presentationsMade;
+
+// A playing video as the last composite left it in the surface, for the
+// video presenter, which draws and presents the video's new frames while the
+// main thread runs scripts: the video's whole-pixel rectangle, where its
+// frames go, its renderer, and the layers above it within the rectangle
+// (YouTube's player keeps some there), drawn apart into the compositor's
+// overlay() to blend over each frame. Until a composite draws anything else
+// into the rectangle, the surface holds there what the presenter draws: the
+// changes WebCore makes meanwhile show at that composite. Under surfaceLock().
+struct VideoPresentation {
+    bool valid{false};
+    WebCore::IntRect rect;      // surface coordinates
+    WebCore::IntPoint origin;   // where a frame's top left goes
+    WebCore::IntSize frameSize; // frames go there unscaled
+    RefPtr<WebCore::MediaRendererSOS2> renderer;
+    bool overlaid{false};               // overlay() holds layers over rect
+    RefPtr<WebCore::NativeImage> shown; // the frame the surface holds in rect
 };
 
 // What web_main.cpp drives each frame, on either compositor.
@@ -135,6 +168,7 @@ private:
     void willModifyChildren() final;
     void noteChange();
     RefPtr<WebCore::NativeImage> currentVideoFrame() const;
+    RefPtr<WebCore::MediaRendererSOS2> videoRenderer() const;
 
     LayerCompositor &m_compositor;
     WebCore::Color m_solidColor;
@@ -167,6 +201,14 @@ public:
         m_changed = true;
         m_damage = WebCore::Region(WebCore::IntRect(WebCore::IntPoint(), m_viewport));
     }
+
+    // Under surfaceLock(), as is the overlay.
+    VideoPresentation &presentation() { return m_presentation; }
+
+    const SkBitmap &overlay() const { return m_overlay; }
+
+    // Main thread, when the presented video's layer goes or cannot be drawn.
+    void invalidatePresentation();
 
     bool needsComposite() const final;
 
@@ -202,13 +244,18 @@ private:
     bool moveCover(CompositingLayer &, const WebCore::IntRect &cover);
     void paintDirty(CompositingLayer &);
     void releaseBacking(CompositingLayer &);
-    void addDamage(const WebCore::FloatRect &);
+    // Damage from the presented video's own new frames leaves the overlay be.
+    void addDamage(const WebCore::FloatRect &, bool presentedFrame = false);
     bool takeVideoFrame(CompositingLayer &);
     void findOccluder(CompositingLayer &, const WebCore::IntRect &damage,
                       Vector<CompositingLayer *> &path);
     bool coversOpaquely(const CompositingLayer &, const WebCore::IntRect &damage) const;
     void drawLayer(SkCanvas &, CompositingLayer &, const WebCore::IntRect &damage);
     void drawContents(SkCanvas &, CompositingLayer &, float alpha);
+    void updatePresentation();
+    void preparePresentation();
+    void drawAbove(SkCanvas &, CompositingLayer &, const WebCore::IntRect &,
+                   const CompositingLayer &video, bool &above, bool &drew);
 
     Factory m_factory{*this};
     WebCore::IntSize m_viewport;
@@ -227,6 +274,10 @@ private:
     // that hides all of it, and whether drawing has yet to reach that layer.
     Vector<CompositingLayer *> m_occluder;
     bool m_occluded{false};
+    VideoPresentation m_presentation;
+    CompositingLayer *m_presentedVideo{nullptr}; // its layer, while it has a renderer
+    bool m_presentationStale{false};             // damage reached its rectangle
+    SkBitmap m_overlay; // the surface's size, transparent but over the video
 };
 
 }

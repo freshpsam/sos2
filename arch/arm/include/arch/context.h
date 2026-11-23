@@ -32,8 +32,15 @@ _Static_assert(offsetof(struct arm_context, pc) == 60, "assembly PC");
 _Static_assert(offsetof(struct arm_context, cpsr) == 64, "assembly CPSR");
 
 /* Designated initializers for a new user thread's context, after any .r:
- * user mode, ARM state, asynchronous aborts and FIQs masked. */
-#define USER_CONTEXT_FIELDS(entry, stack) .sp = (stack), .pc = (entry), .cpsr = 0x150
+ * user mode, asynchronous aborts and FIQs masked, in the instruction set the
+ * entry selects, as BX does: Thumb when its bit 0 is set (the SDK's code is
+ * Thumb-2), ARM otherwise. */
+#define USER_CONTEXT_FIELDS(entry, stack) \
+    .sp = (stack), .pc = (entry) & ~1u, .cpsr = 0x150u | ((entry) & 1u) << 5
+
+/* A user entry point: an ARM instruction's word, or a Thumb one's halfword
+ * with bit 0 set. */
+static inline int arch_user_entry_valid(user_reg entry) { return (entry & 3) != 2; }
 
 /* Whether the trap interrupted user mode. */
 static inline int arch_trap_from_user(const struct arm_trap *trap) {

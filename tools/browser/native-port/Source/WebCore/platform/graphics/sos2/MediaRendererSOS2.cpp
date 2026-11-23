@@ -16,6 +16,7 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/mem.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
@@ -27,10 +28,13 @@ namespace WebCore {
 namespace {
 
 // Decoded frames waiting for the clock, and coded samples waiting for a
-// decoder: about half a second of video, a second and a half of AAC.
+// decoder: about three seconds of video and four of AAC. Source buffers
+// refill the queues on the main thread, which a page's scripts may hold for
+// most of a second (YouTube's on the Nexus 5): shorter ones ran dry, and
+// video stopped while sound went on. Samples share the source buffer's bytes.
 constexpr size_t maximumFrames = 4;
-constexpr size_t videoQueueLimit = 16;
-constexpr size_t audioQueueLimit = 64;
+constexpr size_t videoQueueLimit = 96;
+constexpr size_t audioQueueLimit = 192;
 
 int64_t microseconds(const MediaTime& time)
 {
@@ -229,10 +233,28 @@ void MediaRendererSOS2::setOutputSize(const IntSize& size)
 
 FloatSize MediaRendererSOS2::naturalSize() const
 {
+    Locker locker { m_lock };
     if (!m_decodedSize.isEmpty())
         return m_decodedSize;
-    Locker locker { m_lock };
     return m_video ? FloatSize(m_video->info().width, m_video->info().height) : FloatSize();
+}
+
+RefPtr<NativeImage> MediaRendererSOS2::currentFrame() const
+{
+    Locker locker { m_lock };
+    return m_current;
+}
+
+unsigned MediaRendererSOS2::shownFrames() const
+{
+    Locker locker { m_lock };
+    return m_shownFrames;
+}
+
+unsigned MediaRendererSOS2::droppedFrames() const
+{
+    Locker locker { m_lock };
+    return m_droppedFrames;
 }
 
 bool MediaRendererSOS2::hasAudio() const
@@ -292,14 +314,14 @@ bool MediaRendererSOS2::advance()
             shown = WTF::move(m_frames[0]);
             m_frames.removeAt(0);
         }
-        if (shown)
-            m_frameTaken.notifyAll();
+        if (!shown)
+            return false;
+        m_frameTaken.notifyAll();
+        // Under the lock: two threads advancing never show frames out of order.
+        m_current = NativeImage::create(WTF::move(shown->image));
+        m_decodedSize = shown->decodedSize;
+        ++m_shownFrames;
     }
-    if (!shown)
-        return false;
-    m_current = NativeImage::create(WTF::move(shown->image));
-    m_decodedSize = shown->decodedSize;
-    ++m_shownFrames;
     return true;
 }
 
@@ -576,7 +598,8 @@ void MediaRendererSOS2::Track::run()
     avcodec_free_context(&m_context);
     av_packet_free(&m_packet);
     av_frame_free(&m_frame);
-    sws_freeContext(std::exchange(m_scaler, nullptr));
+    sws_freeContext(std::exchange(m_converter, nullptr));
+    av_freep(&m_planes[0]);
     swr_free(&m_resampler);
 }
 
@@ -629,23 +652,42 @@ void MediaRendererSOS2::Track::outputVideo(unsigned generation)
     if (!renderer)
         return;
     IntSize size = renderer->frameSize(m_frame->width, m_frame->height);
-    m_scaler = sws_getCachedContext(m_scaler, m_frame->width, m_frame->height, static_cast<AVPixelFormat>(m_frame->format),
+    auto format = static_cast<AVPixelFormat>(m_frame->format);
+    const uint8_t* const* source = m_frame->data;
+    const int* sourceStrides = m_frame->linesize;
+    int width = m_frame->width, height = m_frame->height;
+    if ((format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P) && (width != size.width() || height != size.height())) {
+        std::array<int, 3> planesSetup { size.width(), size.height(), format };
+        if (planesSetup != m_planesSetup) {
+            av_freep(&m_planes[0]);
+            m_planesSetup = { };
+            if (av_image_alloc(m_planes, m_planeStrides, size.width(), size.height(), format, 64) < 0)
+                return;
+            m_planesSetup = planesSetup;
+        }
+        m_yuvScaler.scale(m_frame->data, m_frame->linesize, { width, height }, m_planes, m_planeStrides, size);
+        source = m_planes;
+        sourceStrides = m_planeStrides;
+        width = size.width();
+        height = size.height();
+    }
+    m_converter = sws_getCachedContext(m_converter, width, height, format,
         size.width(), size.height(), AV_PIX_FMT_BGRA, SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!m_scaler)
+    if (!m_converter)
         return;
     // HD video is BT.709, which the scaler does not assume.
     bool fullRange = m_frame->color_range == AVCOL_RANGE_JPEG;
     int colorspace = m_frame->colorspace == AVCOL_SPC_BT709 || (m_frame->colorspace == AVCOL_SPC_UNSPECIFIED && m_frame->height > 576) ? SWS_CS_ITU709 : SWS_CS_DEFAULT;
-    std::array<int, 7> setup { m_frame->width, m_frame->height, m_frame->format, size.width(), size.height(), colorspace, fullRange };
+    std::array<int, 7> setup { width, height, m_frame->format, size.width(), size.height(), colorspace, fullRange };
     if (setup != m_scalerSetup) {
-        sws_setColorspaceDetails(m_scaler, sws_getCoefficients(colorspace), fullRange, sws_getCoefficients(SWS_CS_DEFAULT), 1, 0, 1 << 16, 1 << 16);
+        sws_setColorspaceDetails(m_converter, sws_getCoefficients(colorspace), fullRange, sws_getCoefficients(SWS_CS_DEFAULT), 1, 0, 1 << 16, 1 << 16);
         m_scalerSetup = setup;
     }
     size_t stride = static_cast<size_t>(size.width()) * 4;
     auto* pixels = static_cast<uint8_t*>(fastMalloc(stride * size.height()));
     uint8_t* planes[4] = { pixels, nullptr, nullptr, nullptr };
     int strides[4] = { static_cast<int>(stride), 0, 0, 0 };
-    sws_scale(m_scaler, m_frame->data, m_frame->linesize, 0, m_frame->height, planes, strides);
+    sws_scale(m_converter, source, sourceStrides, 0, height, planes, strides);
     auto info = SkImageInfo::Make(size.width(), size.height(), kBGRA_8888_SkColorType, kOpaque_SkAlphaType, SkColorSpace::MakeSRGB());
     auto image = SkImages::RasterFromPixmap(SkPixmap(info, pixels, stride), [](const void* pixels, void*) {
         fastFree(const_cast<void*>(pixels));

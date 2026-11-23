@@ -97,6 +97,7 @@ private:
     bool m_ended { false };
     bool m_rendererRunning { false }; // as updateRendererClock last set it
     bool m_waitingForFrame { true }; // no frame shown since loading or seeking
+    unsigned m_shownFrames { 0 }; // the renderer's count as tick() last saw it
 };
 
 } // namespace WebCore

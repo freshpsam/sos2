@@ -141,7 +141,7 @@ bool system_clock_synchronize(uint64_t us) {
     return true;
 }
 
-bool system_clock_pending(void) { return requested || (tracking && time_us() >= next_poll); }
+bool system_clock_pending(void) { return requested || (tracking && loop_time_us() >= next_poll); }
 
 void system_clock_service(void *unused) {
     (void)unused;

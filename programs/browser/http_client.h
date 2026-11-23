@@ -71,7 +71,7 @@ private:
     void append(const uint8_t *, size_t);
 };
 
-// Called only from the browser's main event loop. poll never waits for a socket.
+// Called only from the network thread (Fetch). poll never waits for a socket.
 class Client {
 public:
     explicit Client(Request);
@@ -91,7 +91,37 @@ private:
     std::unique_ptr<Impl> impl;
 };
 
+struct FetchState;
+
+// A request run on the browser's network thread, which owns every Client,
+// socket, TLS session and HTTP/2 connection: it reads, decrypts and decodes
+// while the main thread runs WebCore, which would otherwise leave the
+// sockets unread through every long script or layout, until the kernel's
+// TCP window closed. The main thread takes the progress with poll(); the
+// rest reads what that took. Destroying a Fetch cancels its request.
+class Fetch {
+public:
+    explicit Fetch(Request);
+    ~Fetch();
+    Fetch(const Fetch &) = delete;
+    Fetch &operator=(const Fetch &) = delete;
+    void poll();
+    // Finished, with every decoded byte taken (an error reports itself first).
+    bool done() const { return finished && data.empty(); }
+    bool headersReady() const { return headers; }
+    std::vector<uint8_t> takeData() { return std::exchange(data, {}); }
+    const std::string &error() const { return failure; }
+    int errorCode() const { return code; }
+    Response &response() { return result; }
+
+private:
+    std::shared_ptr<FetchState> state;
+    bool headers = false, finished = false;
+    Response result;
+    std::vector<uint8_t> data;
+    std::string failure;
+    int code = 0;
+};
+
 std::string lower(std::string_view);
-// Close keep-alive connections idle past their limit; call regularly from the main loop.
-void closeIdleConnections();
 }

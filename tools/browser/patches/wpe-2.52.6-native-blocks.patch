@@ -17,42 +17,94 @@
  namespace JSC { 
  
  AlignedMemoryAllocator::AlignedMemoryAllocator() = default;
-@@ -55,6 +63,42 @@ void AlignedMemoryAllocator::registerSubspace(Subspace* subspace)
+@@ -55,6 +63,94 @@
      m_subspaces.append(std::mem_fn(&Subspace::setNextSubspaceInAlignedMemoryAllocator), subspace);
  }
  
 +#if OS(SOS2)
 +
-+// Each block is a mapping of its own, which the kernel aligns (MAP_ALIGNED),
-+// and up to 16 freed blocks are kept for reuse: SOS2 frees memory only when it
-+// is unmapped, and unmapping pauses the process's other threads.
-+static constexpr unsigned sos2CachedBlocks = 16;
++// Blocks are cut from 1 MiB chunks, each an aligned mapping of its own, which
++// the ARM32 kernel maps as one section. Mapped a block at a time, the heap
++// took a TLB entry a page and a system call a block: 5,600 as YouTube opened.
++// A chunk whose blocks are all free is unmapped if another such is at hand:
++// SOS2 frees memory only when it is unmapped, and unmapping pauses the
++// process's other threads. Without room for a chunk, a block is mapped alone.
++static constexpr size_t sos2ChunkSize = 1024 * 1024;
++static constexpr unsigned sos2ChunkBlocks = sos2ChunkSize / MarkedBlock::blockSize;
++static_assert(sos2ChunkBlocks && sos2ChunkBlocks <= 64);
++static constexpr uint64_t sos2AllFree = ~0ULL >> (64 - sos2ChunkBlocks);
++static constexpr unsigned sos2MaximumChunks = 1024; // past any process's quota
++struct SOS2Chunk {
++    char* base;
++    uint64_t free;
++};
 +static Lock sos2BlockLock;
-+static void* sos2FreeBlocks[sos2CachedBlocks];
-+static unsigned sos2FreeBlockCount;
++static SOS2Chunk sos2Chunks[sos2MaximumChunks];
++static unsigned sos2ChunkCount;
++
++static void* sos2Map(size_t size)
++{
++    void* memory = mmap(nullptr, size, PROT_READ | PROT_WRITE,
++        MAP_PRIVATE | MAP_ANON | MAP_ALIGNED(std::countr_zero(size)), -1, 0);
++    return memory == MAP_FAILED ? nullptr : memory;
++}
 +
 +void* tryAllocateSOS2Block()
 +{
 +    {
 +        Locker locker { sos2BlockLock };
-+        if (sos2FreeBlockCount)
-+            return sos2FreeBlocks[--sos2FreeBlockCount];
++        for (unsigned i = 0; i < sos2ChunkCount; ++i) {
++            auto& chunk = sos2Chunks[i];
++            if (!chunk.free)
++                continue;
++            unsigned block = std::countr_zero(chunk.free);
++            chunk.free &= chunk.free - 1;
++            return chunk.base + block * MarkedBlock::blockSize;
++        }
 +    }
-+    void* memory = mmap(nullptr, MarkedBlock::blockSize, PROT_READ | PROT_WRITE,
-+        MAP_PRIVATE | MAP_ANON | MAP_ALIGNED(std::countr_zero(MarkedBlock::blockSize)), -1, 0);
-+    return memory == MAP_FAILED ? nullptr : memory;
++    // Not under the lock: the thread waits while the kernel maps and zeroes.
++    if (void* memory = sos2Map(sos2ChunkSize)) {
++        {
++            Locker locker { sos2BlockLock };
++            if (sos2ChunkCount < sos2MaximumChunks) {
++                sos2Chunks[sos2ChunkCount++] = { static_cast<char*>(memory), sos2AllFree & ~1ULL };
++                return memory;
++            }
++        }
++        munmap(memory, sos2ChunkSize);
++    }
++    return sos2Map(MarkedBlock::blockSize);
 +}
 +
 +void freeSOS2Block(void* block)
 +{
++    char* base = reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(block) & ~(sos2ChunkSize - 1));
++    void* unused = nullptr;
++    bool cut = false;
 +    {
 +        Locker locker { sos2BlockLock };
-+        if (sos2FreeBlockCount < sos2CachedBlocks) {
-+            sos2FreeBlocks[sos2FreeBlockCount++] = block;
-+            return;
++        for (unsigned i = 0; i < sos2ChunkCount; ++i) {
++            auto& chunk = sos2Chunks[i];
++            if (chunk.base != base)
++                continue;
++            cut = true;
++            chunk.free |= 1ULL << ((static_cast<char*>(block) - base) / MarkedBlock::blockSize);
++            if (chunk.free != sos2AllFree)
++                break;
++            for (unsigned j = 0; j < sos2ChunkCount; ++j) {
++                if (j != i && sos2Chunks[j].free == sos2AllFree) {
++                    unused = base;
++                    sos2Chunks[i] = sos2Chunks[--sos2ChunkCount];
++                    break;
++                }
++            }
++            break;
 +        }
 +    }
-+    munmap(block, MarkedBlock::blockSize);
++    if (unused)
++        munmap(unused, sos2ChunkSize);
++    else if (!cut)
++        munmap(block, MarkedBlock::blockSize);
 +}
 +
 +#endif // OS(SOS2)

@@ -47,27 +47,39 @@ Open work; the other documents describe what exists.
    browser, sound for more than one element at a time (a second video plays
    silently), and volume and mute that reach the half second already queued,
    which needs `SYS_AUDIO` to take them.
-9. **Power.** Standby draws 6.0 mA. The tablet raises its CPU clocks only
-   while pages work. Next: Wi-Fi's share in power save, the display's power
-   domain, the phone's clock and voltage scaling, sleep with the screen on,
-   and thermal handling.
-10. **Speed.** The kernel's mutable data and page tables are uncached, which
-    slows CPU 0's loop (every syscall waits for it) and every TLB miss. In the
-    browser, a playing video's frames are still blended with the page's
-    overlays above them, and layers with CSS shadows or filters blur them
-    again at each repaint: YouTube's player controls, while shown, hold
-    playback near 8 frames per second on the tablet. The browser saves its
-    cookie and storage database (up to 6 MiB) on the page's main thread,
-    which holds the page while the copy is written.
+9. **Power.** Standby draws 6.0 mA. The tablet and the Nexus 5 raise their
+   CPU clocks only while pages work, the Nexus 5 within what its cores'
+   temperature allows. Next: Wi-Fi's share in power save, the display's
+   power domain, the Nexus 5's cores below their 1497.6 MHz floor while
+   idle, sleep with the screen on, and a temperature watch on the tablet.
+10. **Speed.** The kernel's mutable data is uncached, apart from the network
+    stack's and the audio mixer's, which slows CPU 0's loop (about 22 µs a
+    turn on the Nexus 5 while YouTube plays), and every syscall waits for
+    it; DMA buffers in each board's BSS have to move out first. Syscalls
+    wait longest behind CPU 0's long steps (YouTube's waited 14 µs on
+    average, at most 2.3 ms): a full redraw scales the whole screen at once
+    (about 6 ms), and a socket call can copy for up to 3 ms. CPU 0 also scales each page frame to the panel, 1.4 ms of a video
+    frame on the Nexus 5 (in bands), mostly two loads a pixel building rows;
+    the display engines' own scalers would take that off it. In the browser, a playing video's frames
+    are still blended with the page's layers above them, and filters are
+    painted with their layer, so a blurred element is blurred again whenever
+    something near it repaints; composited filters, kept once blurred, would
+    spare that. The first page after boot waits about 1.3 s on
+    the Nexus 5 while it reads the durable database from the eMMC (4 KiB a
+    command), and pages re-download and re-parse every script: an HTTP cache
+    shared by pages and a bytecode cache would spare both (parsing and
+    generating bytecode take a quarter of YouTube's main thread). The
+    Nexus 5's Wi-Fi brings YouTube's 3.4 MB in about 1.3 s.
 11. **Nexus 5.** The [Nexus 5](nexus5.md) runs installed, its data in the
-    cache partition, or from RAM, on four cores at 1497.6 MHz, with touch,
+    cache partition, or from RAM, on four cores at 1497.6 MHz and up to
+    2265.6 MHz while pages work (RPM vote, temperature watch), with touch,
     Wi-Fi (open and WPA2 on 2.4 GHz, power saving), the battery, the
     vibrator and standby (backlight, panel, radio). Next there: the cores'
     power-down in standby (TrustZone's power collapse through each core's
-    SPM); faster CPU levels (the RPM's logic rail over SMD, the CPU rail,
-    and a temperature watch); Wi-Fi's 5 GHz and speed (an update downloaded
+    SPM); Wi-Fi's 5 GHz and speed (an update downloaded
     at about 0.2 MB/s before the driver read glommed frames, not measured
-    since); the eMMC's writes (a sector at a time in PIO, about 0.6 MB/s;
-    reads take up to 256 sectors per command); the Wi-Fi chip's own sleep
+    since); an update's boot-partition writes, still a sector at a time
+    (about 0.5 MB/s; the data volume's go 8 sectors a command, and reads up
+    to 256); the Wi-Fi chip's own sleep
     in standby (KSO), once the phone's standby current can be measured; the
     Adreno 330; sound (the WCD9320 behind the audio DSP).

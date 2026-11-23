@@ -19,6 +19,13 @@ static inline void mmio_write8(uintptr_t p, uint8_t v) { *(volatile uint8_t *)p 
 struct framebuffer;
 void platform_set_framebuffer(struct framebuffer *fb);
 uint64_t time_us(void);
+/* time_us() as this turn of CPU 0's main loop began (kernel/main.c), so that
+ * the loop's periodic checks share one reading of the timer, which takes
+ * 0.3 us on the Nexus 5. At most a turn old: for comparing with deadlines in
+ * the loop, never for measuring time, nor on other CPUs. Before the loop
+ * starts, time_us(). */
+uint64_t loop_time_us(void);
+void loop_time_update(void);
 /* Spins for at least us microseconds. */
 void delay_us(uint64_t us);
 /* A PSCI or SiP call into the firmware with arguments a and b (and 0 after

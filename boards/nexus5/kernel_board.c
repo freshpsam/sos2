@@ -7,13 +7,14 @@
 #include "nexus5.h"
 #include "wifi_setup.h"
 #include "wifi_device.h"
+#include "process.h"
 
 /* The Nexus 5's part of the kernel's start and main loop (kernel/main.c):
  * the stock bootloader's handoff, the panel kept fed with frames and the USB
  * link answering from the first frame (through the long boot work too), the
- * CPUs' faster clocks before it, and touch. Its standby: touch asleep, the
- * backlight off and the panel asleep, Wi-Fi's radio down once quiet, CPU 0
- * and the L2 at 300 MHz. */
+ * CPUs' faster clocks before it and their rise while pages work, and touch.
+ * Its standby: touch asleep, the backlight off and the panel asleep, Wi-Fi's
+ * radio down once quiet, CPU 0 and the L2 at 300 MHz. */
 extern char __image_start[], __image_end[];
 
 static const char *usb; /* why the USB link is unavailable, or NULL */
@@ -79,6 +80,7 @@ enum board_power board_power_poll(void) {
 
 void board_input(struct pointer_event *event) {
     if (nexus5_touch_poll(event)) page_host_input(event);
+    nexus5_cpu_clock_poll(process_user_us());
 }
 
 void board_after_frame(void) { }

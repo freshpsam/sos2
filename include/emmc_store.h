@@ -20,6 +20,10 @@ struct emmc_card {
     /* count (at most 256) consecutive sectors read in one transfer into a
      * word-aligned buffer; NULL where the driver has no such read. */
     bool (*read_many)(uint64_t sector, void *data, unsigned count);
+    /* count (at most 8) consecutive sectors written in one transfer from a
+     * word-aligned buffer, their programming finished; NULL where the driver
+     * has no such write. */
+    bool (*write_many)(uint64_t sector, const void *data, unsigned count);
     /* The card's cache written back. */
     bool (*flush)(void);
     /* The boot partition's first sectors, which the loader keeps. */

@@ -97,8 +97,12 @@ bool phone_browser_arena(const struct platform_devices *d, uintptr_t dtb, uintpt
 bool phone_resource_arena(const struct platform_devices *d, uintptr_t dtb, uintptr_t ks,
                           uintptr_t ke, size_t size, uintptr_t *out) {
     size_t ignored;
-    uint64_t aligned = ((uint64_t)size + 4095) & ~4095ull;
-    return size && arena(d, dtb, ks, ke, aligned, aligned, out, &ignored);
+    /* On a megabyte, for the engine's sections (kernel/protection/elf_load.c). */
+    uint64_t room = (((uint64_t)size + 4095) & ~4095ull) + 0x100000 - 4096;
+    uintptr_t start;
+    if (!size || !arena(d, dtb, ks, ke, room, room, &start, &ignored)) return false;
+    *out = (start + 0xfffffu) & ~(uintptr_t)0xfffffu;
+    return true;
 }
 #endif
 

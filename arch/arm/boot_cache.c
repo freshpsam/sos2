@@ -71,6 +71,7 @@ static bool kernel_tables(void) {
 /* The tables in use (client domain 0, TTBR0 alone), the TLB emptied. */
 static void install(void) {
     uint32_t zero = 0, domain = 1, ttbr = (uintptr_t)root;
+    arm_memory_types();
     __asm__ volatile("mcr p15, 0, %0, c2, c0, 2\n mcr p15, 0, %1, c3, c0, 0\n"
                      "mcr p15, 0, %2, c2, c0, 0\n mcr p15, 0, %0, c8, c7, 0\n dsb sy\n isb"
                      :
@@ -79,9 +80,10 @@ static void install(void) {
 }
 
 /* SCTLR with translation, the instruction cache and branch prediction on,
- * TEX remap and the access flag off, XP and WXN on, and caches as asked. */
+ * the access flag off, TEX remap (arm_cache.h's types, set by install), XP
+ * and WXN on, and caches as asked. */
 static uint32_t translated(uint32_t control, bool data_cache) {
-    return (control & ~((1u << 29) | (1u << 28))) | (1u << 23) | (1u << 19) | (1u << 12) |
+    return (control & ~(1u << 29)) | ARM_SCTLR_TRE | (1u << 23) | (1u << 19) | (1u << 12) |
            (1u << 11) | 1 | (data_cache ? 4 : 0);
 }
 

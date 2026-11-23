@@ -13,9 +13,12 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <mutex>
+#include <thread>
 #include <unistd.h>
 
 namespace {
@@ -47,15 +50,22 @@ struct TLS {
         mbedtls_ssl_config_init(&config);
         const unsigned char personal[] = "SOS2 native HTTPS";
         if (mbedtls_ctr_drbg_seed(&random, entropy, nullptr, personal, sizeof(personal))) return;
-        FILE *file = fopen("/certs/roots.pem", "rb");
+        // DER certificates back to back, each a SEQUENCE with a two-byte
+        // length (tools/build_native_webkit.py).
+        FILE *file = fopen("/certs/roots.der", "rb");
         if (!file) return;
-        std::vector<unsigned char> pem(384 * 1024 + 1);
-        size_t size = fread(pem.data(), 1, pem.size(), file);
-        bool bad = ferror(file) || size == pem.size();
+        std::vector<unsigned char> der(384 * 1024);
+        size_t size = fread(der.data(), 1, der.size(), file);
+        bool bad = ferror(file) || size == der.size();
         fclose(file);
         if (bad || !size) return;
-        pem[size] = 0;
-        if (mbedtls_x509_crt_parse(&roots, pem.data(), size + 1)) return;
+        for (size_t at = 0; at < size;) {
+            if (size - at < 4 || der[at] != 0x30 || der[at + 1] != 0x82) return;
+            size_t length = 4 + (size_t(der[at + 2]) << 8 | der[at + 3]);
+            if (length > size - at || mbedtls_x509_crt_parse_der(&roots, der.data() + at, length))
+                return;
+            at += length;
+        }
         if (mbedtls_ssl_config_defaults(&config, MBEDTLS_SSL_IS_CLIENT,
                                         MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT))
             return;
@@ -244,10 +254,10 @@ static std::vector<std::shared_ptr<Connection>> idleConnections;
 // extra idle sockets beyond the same two-entry limit used by HTTP/1.1.
 static std::vector<std::weak_ptr<Connection>> activeHTTP2;
 
-// Called from the renderer loop: an idle page must not keep kernel sockets
+// From the network thread's loop: an idle page must not keep kernel sockets
 // beyond the 15 s idle limit just because it starts no new request. Age-only
 // and at most once per second, so it adds no syscalls to an idle loop.
-void closeIdleConnections() {
+static void closeIdleConnections() {
     static uint64_t checked = 0;
     uint64_t now = milliseconds();
     if (now - checked < 1000) return;
@@ -309,8 +319,8 @@ void Connection::pollHTTP2() {
         h2Sent += result;
         if (h2Sent == h2Output.size()) h2Output.clear();
     }
-    for (unsigned budget = 0; budget < 4; ++budget) {
-        std::array<uint8_t, 4096> bytes;
+    for (unsigned budget = 0; budget < 8; ++budget) {
+        std::array<uint8_t, 16384> bytes; // a whole TLS record
         int result = mbedtls_ssl_read(&ssl, bytes.data(), bytes.size());
         if (result == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) {
             saveSession(*this);
@@ -524,11 +534,13 @@ struct Client::Impl {
         // bombs. Keep encoded input until its output has been drained by WebCore.
         inflater.next_in = input.data();
         inflater.avail_in = input.size();
-        for (unsigned budget = 0; !inflateFinished && decoded.size() < 65536 && budget < 4;
+        // An HTTP/2 stream may hold its window, so decode a good piece of it.
+        const size_t output = h2Stream ? 256 * 1024 : 65536, steps = h2Stream ? 16 : 4;
+        for (unsigned budget = 0; !inflateFinished && decoded.size() < output && budget < steps;
              ++budget) {
             std::array<uint8_t, 16384> buffer;
             inflater.next_out = buffer.data();
-            inflater.avail_out = std::min(buffer.size(), 65536 - decoded.size());
+            inflater.avail_out = std::min(buffer.size(), output - decoded.size());
             size_t capacity = inflater.avail_out;
             auto before = inflater.avail_in;
             int result = inflate(&inflater, complete() ? Z_FINISH : Z_NO_FLUSH);
@@ -730,4 +742,131 @@ const std::string &Client::error() const { return impl->failure; }
 int Client::errorCode() const { return impl->code; }
 
 Response &Client::response() { return impl->response(); }
+
+// A Fetch's request and progress, shared with the network thread under
+// network.mutex; the network thread alone touches client.
+struct FetchState {
+    Request request;
+    std::unique_ptr<Client> client;
+    bool cancelled = false, headersReady = false, done = false;
+    Response response;
+    std::vector<uint8_t> data;
+    std::string error;
+    int code = 0;
+};
+
+namespace {
+// Decoded bytes a request may hold for the main thread before the network
+// thread stops reading it: a big script arrives whole while the main thread
+// is busy, and backpressure (HTTP/2 windows, TCP) still applies beyond.
+constexpr size_t fetchBuffer = 4 * 1024 * 1024;
+
+// Never destroyed: the thread runs until the process ends, and a joinable
+// std::thread destroyed at exit would terminate the process.
+struct Network {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::vector<std::shared_ptr<FetchState>> added;
+    std::thread thread;
+} &network = *new Network;
+
+// One pass over a request: its client polled, then its progress published.
+// Returns whether anything moved, and sets finished once the request is over.
+bool advance(FetchState &f, bool &finished) {
+    if (!f.client) f.client = std::make_unique<Client>(std::move(f.request));
+    f.client->poll();
+    std::lock_guard lock(network.mutex);
+    bool moved = false;
+    if (!f.client->error().empty()) {
+        f.error = f.client->error();
+        f.code = f.client->errorCode();
+        f.done = finished = true;
+        return true;
+    }
+    if (!f.headersReady && f.client->headersReady()) {
+        auto &source = f.client->response();
+        f.response.status = source.status;
+        f.response.reason = source.reason;
+        f.response.headers = source.headers;
+        f.response.persistent = source.persistent;
+        f.response.http2 = source.http2;
+        f.headersReady = moved = true;
+    }
+    if (f.headersReady && f.data.size() < fetchBuffer) {
+        auto chunk = f.client->takeData();
+        if (!chunk.empty()) {
+            if (f.data.empty()) f.data = std::move(chunk);
+            else f.data.insert(f.data.end(), chunk.begin(), chunk.end());
+            moved = true;
+        }
+        // Every decoded byte has moved: done() follows takeData() at once.
+        if (f.client->done()) f.done = finished = moved = true;
+    }
+    return moved;
+}
+
+// The network thread: polls its requests until none made progress, then
+// sleeps 2 ms (SOS2 cannot wait for a socket), or until a request comes
+// when it has none.
+void networkLoop() {
+    std::vector<std::shared_ptr<FetchState>> active;
+    for (;;) {
+        {
+            std::unique_lock lock(network.mutex);
+            if (active.empty() && network.added.empty())
+                network.wake.wait_for(lock, std::chrono::seconds(1));
+            for (auto &f : network.added) active.push_back(std::move(f));
+            network.added.clear();
+            // Its client goes here, on this thread, whoever drops the state last.
+            std::erase_if(active, [](auto &f) {
+                if (f->cancelled) f->client.reset();
+                return f->cancelled;
+            });
+        }
+        closeIdleConnections();
+        bool moved = false;
+        for (auto at = active.begin(); at != active.end();) {
+            bool finished = false;
+            moved = advance(**at, finished) || moved;
+            if (finished) {
+                (*at)->client.reset();
+                at = active.erase(at);
+            } else ++at;
+        }
+        if (!moved && !active.empty()) usleep(2000);
+    }
+}
+}
+
+Fetch::Fetch(Request request) : state(std::make_shared<FetchState>()) {
+    state->request = std::move(request);
+    std::lock_guard lock(network.mutex);
+    if (!network.thread.joinable()) network.thread = std::thread(networkLoop);
+    network.added.push_back(state);
+    network.wake.notify_one();
+}
+
+// The client goes with the network thread's next pass: it owns the sockets.
+Fetch::~Fetch() {
+    std::lock_guard lock(network.mutex);
+    state->cancelled = true;
+}
+
+void Fetch::poll() {
+    std::lock_guard lock(network.mutex);
+    if (!headers && state->headersReady) {
+        result = std::move(state->response);
+        headers = true;
+    }
+    if (headers && !state->data.empty()) {
+        if (data.empty()) data = std::move(state->data);
+        else data.insert(data.end(), state->data.begin(), state->data.end());
+        state->data.clear();
+    }
+    if (!state->error.empty() && failure.empty()) {
+        failure = state->error;
+        code = state->code;
+    }
+    finished = state->done;
+}
 }

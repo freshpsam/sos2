@@ -332,7 +332,7 @@ static bool failed(struct pointer_event *event) {
 }
 
 bool nexus5_touch_poll(struct pointer_event *event) {
-    if (!touch.ready || touch.asleep || time_us() < touch.retry_after) return false;
+    if (!touch.ready || touch.asleep || loop_time_us() < touch.retry_after) return false;
     uint8_t state[1 + IRQ_BYTES];
     if (touch.waking) {
         /* A sleeping sensor raises no attention: wake it again. */

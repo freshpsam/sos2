@@ -182,6 +182,8 @@ arm_warm_entry:
     .equ CTX_CNTKCTL, 36
     .equ CTX_TPIDRURW, 40
     .equ CTX_TPIDRURO, 44
+    .equ CTX_PRRR, 48
+    .equ CTX_NMRR, 52
 
 /* int arm_cpu0_suspend(void (*power_down)(void)): saves CPU 0's context and
  * calls power_down. Returns 1 if power_down returns (the CPU stayed on), or 0
@@ -219,6 +221,10 @@ arm_cpu0_suspend:
     str     r1, [r4, #CTX_TPIDRURW]
     mrc     p15, 0, r1, c13, c0, 3  @ TPIDRURO
     str     r1, [r4, #CTX_TPIDRURO]
+    mrc     p15, 0, r1, c10, c2, 0  @ PRRR
+    str     r1, [r4, #CTX_PRRR]
+    mrc     p15, 0, r1, c10, c2, 1  @ NMRR
+    str     r1, [r4, #CTX_NMRR]
     /* The context is uncached memory; clean it to the point of coherency
      * anyway, so the resume never depends on that mapping. */
     dsb     sy
@@ -261,6 +267,10 @@ cpu0_resume:
     mcr     p15, 0, r0, c13, c0, 2
     ldr     r0, [r4, #CTX_TPIDRURO]
     mcr     p15, 0, r0, c13, c0, 3
+    ldr     r0, [r4, #CTX_PRRR]
+    mcr     p15, 0, r0, c10, c2, 0
+    ldr     r0, [r4, #CTX_NMRR]
+    mcr     p15, 0, r0, c10, c2, 1
     mov     r0, #0
     mcr     p15, 0, r0, c8, c7, 0        @ TLBIALL
     dsb     sy

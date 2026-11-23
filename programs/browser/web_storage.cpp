@@ -64,8 +64,7 @@ State::Store &store() {
     static auto *instance = [] {
         mkdir("/data/browser", 0700);
         mkdir("/tmp/browser", 0700);
-        return opened =
-                   new State::Store("/tmp/browser/state.sqlite3", "/data/browser/state.sqlite3");
+        return opened = new State::Store("/tmp/browser/state.sqlite3", "/data/browser/saved");
     }();
     return *instance;
 }

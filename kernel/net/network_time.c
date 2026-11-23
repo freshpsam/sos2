@@ -146,8 +146,7 @@ void network_time_init(void) {
     next_attempt = earliest_request = deadline = sent_at = 0;
 }
 
-void network_time_poll(bool online) {
-    uint64_t now = time_us();
+void network_time_poll(bool online, uint64_t now) {
     if (connected != online) {
         connected = online;
         cancel();

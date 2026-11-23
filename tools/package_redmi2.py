@@ -567,12 +567,26 @@ def resource_bundle(data,extra_files=None,ram_only=False,release=None,strip_apps
     return data
 
 
+def code_offset(program):
+    """The file offset of an ARM32 executable's one read-only segment, or None."""
+    if len(program)<52 or program[:7]!=b'\x7fELF\x01\x01\x01':return None
+    phoff,=struct.unpack_from('<I',program,28);size,count=struct.unpack_from('<HH',program,42)
+    if size!=32 or phoff+count*size>len(program):return None
+    headers=[struct.unpack_from('<8I',program,phoff+i*size) for i in range(count)]
+    fixed=[h[1] for h in headers if h[0]==1 and not h[6]&2]
+    return fixed[0] if len(fixed)==1 else None
+
+
 def sorb(files):
     """A SORB of these files, each page-aligned after the table, as the kernel
-    reads it (kernel/protection/runtime_files.c)."""
+    reads it (kernel/protection/runtime_files.c), and the engine's code on a
+    megabyte, as the phones' kernels place the whole (phone_resource_arena),
+    so that pages map it in place (kernel/protection/elf_load.c)."""
     if len(files)>128:raise PackagingError('no room for board resources in the resource table')
     table=bytearray();payload=bytearray();offset=align(16+136*len(files),4096)
     for name,content in files.items():
+        code=code_offset(content) if name==b'/bin/sos2-web' else None
+        if code is not None:payload+=bytes(-(offset+len(payload)+code)%0x100000)
         table+=struct.pack('<128sII',name,offset+len(payload),len(content))
         payload+=content;payload+=bytes(align(len(payload),4096)-len(payload))
     return (struct.pack('<4I',0x42524f53,1,offset+len(payload),len(files))+table).ljust(offset,b'\0')+payload

@@ -231,15 +231,22 @@ static bool tls_init(void) {
         seeded = true;
     }
     if (!loaded) {
-        FILE *file = fopen("/certs/roots.pem", "rb");
+        /* DER certificates back to back, each a SEQUENCE with a two-byte
+         * length (tools/build_native_webkit.py). */
+        FILE *file = fopen("/certs/roots.der", "rb");
         if (!file) return false;
-        static unsigned char pem[384 * 1024 + 1];
-        size_t size = fread(pem, 1, sizeof(pem) - 1, file);
-        bool bad = ferror(file) || !size || size == sizeof(pem) - 1;
+        static unsigned char der[384 * 1024];
+        size_t size = fread(der, 1, sizeof(der), file);
+        bool bad = ferror(file) || !size || size == sizeof(der);
         fclose(file);
         if (bad) return false;
-        pem[size] = 0;
-        if (mbedtls_x509_crt_parse(&roots, pem, size + 1)) return false;
+        for (size_t at = 0; at < size;) {
+            if (size - at < 4 || der[at] != 0x30 || der[at + 1] != 0x82) return false;
+            size_t length = 4 + ((size_t)der[at + 2] << 8 | der[at + 3]);
+            if (length > size - at || mbedtls_x509_crt_parse_der(&roots, der + at, length))
+                return false;
+            at += length;
+        }
         loaded = true;
     }
     if (!configured) {

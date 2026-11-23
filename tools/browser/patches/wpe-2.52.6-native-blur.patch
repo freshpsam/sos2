@@ -1,0 +1,73 @@
+--- a/Source/WebCore/platform/graphics/filters/skia/FEGaussianBlurSkiaApplier.cpp
++++ b/Source/WebCore/platform/graphics/filters/skia/FEGaussianBlurSkiaApplier.cpp
+@@ -35,6 +35,7 @@
+ #include "NativeImage.h"
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN // GLib/Win ports
+ #include <skia/core/SkCanvas.h>
++#include <skia/core/SkSurface.h>
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ #include <skia/effects/SkImageFilters.h>
+ #include <wtf/TZoneMallocInlines.h>
+@@ -43,6 +44,49 @@
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(FEGaussianBlurSkiaApplier);
+ 
++#if OS(SOS2)
++// A blur's work grows with its area, which grows with its width, and pages
++// blur whole backdrops: YouTube's mobile player blurs its poster 66 pixels
++// wide over 1240x1044 pixels, which took 250 ms on the Nexus 5 at every
++// repaint near it. Along an axis whose deviation is above largeSigma, the
++// source is reduced, through mipmaps so that every pixel counts, until the
++// deviation is reducedSigma, blurred there, and drawn back enlarged: so wide
++// a blur leaves nothing the reduction loses.
++static constexpr float largeSigma = 8;
++static constexpr float reducedSigma = 4;
++
++static float reduction(float sigma)
++{
++    return sigma > largeSigma ? reducedSigma / sigma : 1;
++}
++
++static bool drawReducedBlur(SkCanvas& canvas, const sk_sp<SkImage>& image, FloatSize sigma, IntPoint offset)
++{
++    int width = std::max(1, static_cast<int>(std::ceil(image->width() * reduction(sigma.width()))));
++    int height = std::max(1, static_cast<int>(std::ceil(image->height() * reduction(sigma.height()))));
++    float scaleX = static_cast<float>(width) / image->width();
++    float scaleY = static_cast<float>(height) / image->height();
++    int outsetX = static_cast<int>(std::ceil(3 * sigma.width() * scaleX));
++    int outsetY = static_cast<int>(std::ceil(3 * sigma.height() * scaleY));
++    // In the result's color space, where the blur runs unreduced too: an SVG
++    // filter's linearRGB, which mixes colors otherwise than sRGB.
++    auto info = image->imageInfo().makeColorSpace(canvas.imageInfo().refColorSpace());
++    auto reduced = SkSurfaces::Raster(info.makeWH(width, height));
++    auto blurred = SkSurfaces::Raster(info.makeWH(width + 2 * outsetX, height + 2 * outsetY));
++    if (!reduced || !blurred)
++        return false;
++    reduced->getCanvas()->clear(SK_ColorTRANSPARENT);
++    reduced->getCanvas()->drawImageRect(image, SkRect::MakeIWH(width, height), SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear));
++    SkPaint paint;
++    paint.setImageFilter(SkImageFilters::Blur(sigma.width() * scaleX, sigma.height() * scaleY, nullptr));
++    blurred->getCanvas()->clear(SK_ColorTRANSPARENT);
++    blurred->getCanvas()->drawImage(reduced->makeImageSnapshot(), outsetX, outsetY, { }, &paint);
++    auto destination = SkRect::MakeXYWH(offset.x() - outsetX / scaleX, offset.y() - outsetY / scaleY, (width + 2 * outsetX) / scaleX, (height + 2 * outsetY) / scaleY);
++    canvas.drawImageRect(blurred->makeImageSnapshot(), destination, SkSamplingOptions(SkFilterMode::kLinear));
++    return true;
++}
++#endif
++
+ bool FEGaussianBlurSkiaApplier::apply(const Filter& filter, std::span<const Ref<FilterImage>> inputs, FilterImage& result) const
+ {
+     ASSERT(inputs.size() == 1);
+@@ -59,6 +103,12 @@
+ 
+     FloatSize sigma = FloatSize(m_effect->stdDeviationX(), m_effect->stdDeviationY()) * filter.filterScale();
+ 
++#if OS(SOS2)
++    if ((sigma.width() > largeSigma || sigma.height() > largeSigma)
++        && drawReducedBlur(*resultImage->context().platformContext(), nativeImage->platformImage(), sigma, input.absoluteImageRectRelativeTo(result).location()))
++        return true;
++#endif
++
+     SkPaint paint;
+     paint.setImageFilter(SkImageFilters::Blur(sigma.width(), sigma.height(), nullptr));
+ 

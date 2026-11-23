@@ -60,9 +60,10 @@ void audio_init(const struct platform_devices *devices) {
 
 /* Each call runs this first too: STATUS then reports the present, and frames
  * written to an empty stream are not played for time that passed before they
- * came. */
+ * came. The present is the main loop's turn (loop_time_us), in which calls
+ * run as well, so every reading of the silent clock comes from one source. */
 void audio_poll(void) {
-    uint64_t now = time_us() * (USER_AUDIO_RATE / 1000) / 1000, due = now - clock_frames;
+    uint64_t now = loop_time_us() * (USER_AUDIO_RATE / 1000) / 1000, due = now - clock_frames;
     clock_frames = now;
     if (online) {
         online = device.poll();
