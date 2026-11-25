@@ -138,7 +138,9 @@ loss before it ends (likely about a minute of single-sector writes; not yet
 timed on the handset) leaves lk2nd in fastboot, where flashing
 `flash-boot.img` finishes the job. Updates are not signed: their SHA-256s guard against damage, and
 whoever can publish to the Pages site can install software on the phone.
-Pages is public, so `make publish` refuses a build with a Wi-Fi profile. A
+Pages is public, so `make publish` refuses a build with a Wi-Fi profile; and
+since the updater downloads over Wi-Fi, it refuses one without the Wi-Fi
+firmware, which would leave a device that installed it unable to update. A
 RAM session or QEMU shows updates but installs nothing.
 
 ## Apps

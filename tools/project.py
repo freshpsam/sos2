@@ -55,7 +55,8 @@ tablet:   GTA7LITE_STOCK=folder with the stock firmware's boot.img and vbmeta.im
           Optional GTA7LITE_WIFI_PROFILE=file, joined at boot
           Optional GTA7LITE_JSC=options: JavaScriptCore options for pages
 nexus5:   NEXUS5_STOCK=folder with wifi-firmware/: the stock system's
-          fw_bcmdhd.bin and bcmdhd.cal (docs/nexus5.md)
+          fw_bcmdhd.bin and bcmdhd.cal (default build/nexus5-stock once
+          copied there, docs/nexus5.md)
           NEXUS5_WIFI_FIRMWARE=folder (default NEXUS5_STOCK/wifi-firmware)
           gives the phone Wi-Fi
           Optional NEXUS5_WIFI_PROFILE=file (open or WPA2), joined at boot

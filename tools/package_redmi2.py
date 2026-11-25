@@ -763,18 +763,19 @@ def update_header(release, boot, board=BOARD):
     return (fields + struct.pack("<I", zlib.crc32(fields))).ljust(UPDATE_HEADER, b"\0")
 
 
-def install_outputs(release, board, names, boot, profile, cmdline=None, update_image=None):
+def install_outputs(release, board, names, boot, profile, cmdline=None, update_image=None, *, wifi_firmware):
     """What tools/publish_pages.py publishes of a device's installed system:
     names' boot image, the updater's file (update_header, then update_image,
     the boot image unless given) and install.json, which lists both with
-    their sizes and SHA-256s, the boot command line when given, whether a
-    Wi-Fi profile is inside, and the commands of a first install from the
-    loader's fastboot."""
+    their sizes and SHA-256s, the boot command line when given, whether the
+    Wi-Fi firmware and a Wi-Fi profile are inside, and the commands of a
+    first install from the loader's fastboot."""
     image = boot if update_image is None else update_image
     outputs = dict(zip(names, (boot, update_header(release, image, board) + image)))
     manifest = {"release": release, "board": board.decode("ascii")}
     if cmdline is not None:
         manifest["boot_cmdline"] = cmdline.decode("ascii")
+    manifest["wifi_firmware"] = wifi_firmware
     manifest["wifi_profile"] = profile
     manifest["files"] = {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                          for name, data in outputs.items()}
@@ -808,7 +809,8 @@ def make_install_files(kernel, elf, dtb, ramdisk, release, jsc=None):
     if len(boot) > BOOT_PARTITION_SPACE:
         raise PackagingError(f"flash-boot.img needs {len(boot)} bytes; the boot partition holds "
                              f"{BOOT_PARTITION_SPACE} after lk2nd")
-    return install_outputs(release, BOARD, INSTALL_FILES, boot, b"/system/wifi-profile" in files, cmdline)
+    return install_outputs(release, BOARD, INSTALL_FILES, boot, b"/system/wifi-profile" in files, cmdline,
+                           wifi_firmware=any(name.startswith(b"/firmware/wcnss/") for name in files))
 
 
 def write_outputs(outputs):

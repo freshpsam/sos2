@@ -178,14 +178,14 @@ def tablet_resources(bundle, release, touch=None, wifi=None, profile=None):
     return resources.sorz(data), packages
 
 
-def install_files(release, image, profile):
+def install_files(release, image, profile, wifi):
     """The installed system for publishing (tools/package_redmi2.py's
-    install_outputs); the updater's file carries the image padded with zeros
-    to whole 2 KiB pages, as the kernel's header check wants
-    (kernel/protection/system_update.c)."""
+    install_outputs; wifi: whether the image carries the Wi-Fi firmware); the
+    updater's file carries the image padded with zeros to whole 2 KiB pages,
+    as the kernel's header check wants (kernel/protection/system_update.c)."""
     padded = image + bytes(-len(image) % PAGE_SIZE)
     return resources.install_outputs(release, BOARD, INSTALL_FILES, image, profile is not None,
-                                     update_image=padded)
+                                     update_image=padded, wifi_firmware=wifi)
 
 
 def check_device_trees(section):
@@ -398,8 +398,8 @@ def main(argv=None):
                             'flash-boot.img': installed_image(stock, kernel, ramdisk)})
         extra = []
         if args.install_dir:
-            extra += [(args.install_dir / name, data)
-                      for name, data in install_files(args.release, outputs['flash-boot.img'], profile).items()]
+            installed = install_files(args.release, outputs['flash-boot.img'], profile, wifi is not None)
+            extra += [(args.install_dir / name, data) for name, data in installed.items()]
         if args.apps_dir:
             extra += [(args.apps_dir / f'{app_id}.sos2app', package) for app_id, package in packages.items()]
             extra.append((args.apps_dir / 'index.txt', resources.app_index(packages)))

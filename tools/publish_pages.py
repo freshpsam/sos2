@@ -10,7 +10,9 @@ folders and index.html are replaced, and every other file already on the
 branch, another device's included, is kept. The updater (programs/updater)
 downloads https://<owner>.github.io/<repository>/<device>/sos2-<device>.update
 and the packages its architecture's apps folder lists. Pages is public, so a
-build with a bootstrap Wi-Fi profile is refused. The commit is built in a
+build with a bootstrap Wi-Fi profile is refused; and the updater downloads
+over Wi-Fi, so a build without the Wi-Fi firmware is refused too: a device
+that installed it could not update again. The commit is built in a
 temporary index; the checkout's own index and files are untouched. --device
 limits it to the devices named (redmi2, gta7lite, nexus5).
 """
@@ -59,6 +61,10 @@ def load(directory):
     if manifest.get('wifi_profile') is not False:
         raise RuntimeError(f'{directory} carries a Wi-Fi profile, and Pages is public; '
                            'build it without REDMI2_WIFI_PROFILE, GTA7LITE_WIFI_PROFILE or NEXUS5_WIFI_PROFILE')
+    if manifest.get('wifi_firmware') is not True:
+        raise RuntimeError(f'{directory}/install.json does not list the Wi-Fi firmware, and a device without it '
+                           'could not update again; build it again with REDMI2_WIFI_FIRMWARE, GTA7LITE_STOCK '
+                           'or NEXUS5_STOCK')
     files = {}
     for name, entry in manifest['files'].items():
         content = (directory/name).read_bytes()

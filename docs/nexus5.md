@@ -16,7 +16,7 @@ writes files on the computer; it never touches the phone.
 
 ```sh
 make fetch && make engine                      # once
-make nexus5 NEXUS5_STOCK=build/nexus5-stock    # build/nexus5/boot.img and more
+make nexus5                                    # build/nexus5/boot.img and more
 ```
 
 `boot.img` is an Android boot v0 image (2 KiB pages) for the stock
@@ -29,8 +29,9 @@ the image: its addresses, sizes and hashes. As on the Redmi 2, the images
 build in no apps: `make nexus5` writes them to `build/apps` as the Redmi 2's
 ARM32 packages, and the installed system and its update to
 `build/nexus5-install` ([Installing](#installing)). `NEXUS5_STOCK=folder`
-names a folder with the Wi-Fi firmware ([below](#wi-fi)); without it the
-phone has no Wi-Fi.
+names a folder with the Wi-Fi firmware ([below](#wi-fi)), by default
+`build/nexus5-stock` once the firmware is there; without it the phone has no
+Wi-Fi, and `make publish` refuses the build.
 `NEXUS5_JSC=options` passes JavaScriptCore options to pages, as `REDMI2_JSC`
 does on the Redmi 2.
 

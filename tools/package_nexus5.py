@@ -168,7 +168,8 @@ def main(argv=None):
             # (kernel/protection/system_update.c).
             outputs += [(args.install_dir / name, data) for name, data in
                         resources.install_outputs(args.release, BOARD, INSTALL_FILES, installed,
-                                                  bool(args.wifi_profile), installed_cmdline).items()]
+                                                  bool(args.wifi_profile), installed_cmdline,
+                                                  wifi_firmware=bool(args.wifi_firmware)).items()]
         packages = {}
         if args.apps_dir:
             packages = resources.app_packages(resources.bundle_files(bundle))
@@ -193,6 +194,8 @@ def main(argv=None):
     print(f"{args.output_dir / 'boot.img'}: {len(image)} bytes, sha256 {manifest['sha256']['boot_image']}")
     if args.install_dir:
         print(f"{args.install_dir / 'flash-boot.img'}: {len(installed)} bytes, and its update and install.json")
+    if not args.wifi_firmware:
+        print('No Wi-Fi firmware: the Nexus 5 has no Wi-Fi without NEXUS5_STOCK (docs/nexus5.md)')
 
 
 if __name__ == '__main__':

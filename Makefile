@@ -35,6 +35,9 @@ REDMI2_ADRENO_FIRMWARE ?= $(if $(wildcard build/redmi2-adreno/a300_pm4.fw),build
 # The tablet's touch firmware (docs/gta7lite.md): without it there is no touch.
 GTA7LITE_TOUCH_FIRMWARE ?= $(if $(GTA7LITE_STOCK),$(GTA7LITE_STOCK)/touch-firmware)
 GTA7LITE_WIFI_FIRMWARE ?= $(if $(GTA7LITE_STOCK),$(GTA7LITE_STOCK)/wifi-firmware)
+# The Nexus 5's Wi-Fi firmware, once copied from its Android (docs/nexus5.md):
+# without it there is no Wi-Fi.
+NEXUS5_STOCK ?= $(if $(wildcard build/nexus5-stock/wifi-firmware),build/nexus5-stock)
 NEXUS5_WIFI_FIRMWARE ?= $(if $(NEXUS5_STOCK),$(NEXUS5_STOCK)/wifi-firmware)
 include tools/build.mk
 export SOS2_ARCH := $(ARCH)
