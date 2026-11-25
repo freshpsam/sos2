@@ -149,7 +149,7 @@ static enum wcnss_boot_state failed(struct wcnss_boot *b, const char *why) {
     if (b->pas_initialized) {
         progress(b, "Wi-Fi: stopping firmware after failure");
         crypto_clocks(b, true);
-        (void)qcom_scm_pas_stop();
+        (void)qcom_scm_pas_stop(QCOM_PAS_WCNSS);
         b->authenticated = false;
         b->pas_initialized = false;
     }
@@ -524,13 +524,13 @@ enum wcnss_boot_state wcnss_boot_poll(struct wcnss_boot *b, uint64_t now) {
             advance(b, WB_METADATA);
             break;
         case WB_METADATA:
-            if (!qcom_scm_pas_init(b->metadata_physical))
+            if (!qcom_scm_pas_init(QCOM_PAS_WCNSS, b->metadata_physical))
                 return failed(b, scm_error("WCNSS metadata rejected"));
             b->pas_initialized = true;
             advance(b, WB_MEMORY);
             break;
         case WB_MEMORY:
-            if (!qcom_scm_pas_memory(b->physical, b->plan.span))
+            if (!qcom_scm_pas_memory(QCOM_PAS_WCNSS, b->physical, b->plan.span))
                 return failed(b, scm_error("WCNSS relocation rejected"));
             advance(b, WB_COPY);
             break;
@@ -642,7 +642,7 @@ enum wcnss_boot_state wcnss_boot_poll(struct wcnss_boot *b, uint64_t now) {
         case WB_AUTH:
             b->watchdog_clear_seen = !(b->io.read(b->io.context, WDOG_PENDING) & WDOG_BIT);
             barrier();
-            if (!qcom_scm_pas_start())
+            if (!qcom_scm_pas_start(QCOM_PAS_WCNSS))
                 return failed(b, scm_error("WCNSS authentication/start failed"));
             b->authenticated = true;
             crypto_clocks(b, false);

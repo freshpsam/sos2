@@ -7,7 +7,7 @@
  * Secure monitor calls are privileged and serialized. An individual SMC is
  * trusted firmware execution; software cannot impose a deadline inside it.
  * init probes the convention and the PAS (peripheral image) calls, which
- * only the Redmi 2's Wi-Fi uses. */
+ * the Redmi 2's Wi-Fi and the Nexus 5's audio DSP use. */
 bool qcom_scm_init(void);
 /* Cold-boot entry for the CPUs of the single cluster (cpu_mask: bit n is
  * CPU n). Independent of WCNSS PAS. */
@@ -27,9 +27,14 @@ bool qcom_scm_gpu_restore(unsigned context_bank);
 void qcom_scm_halt_pmic_arbiter(void);
 /* First failure is retained across cleanup calls, until the next safe init. */
 const char *qcom_scm_error(void);
-/* Metadata must occupy dedicated, contiguous, uncached 4 KiB-aligned pages. */
-bool qcom_scm_pas_init(uintptr_t metadata);
-bool qcom_scm_pas_memory(uintptr_t memory, unsigned size);
-bool qcom_scm_pas_start(void);
-bool qcom_scm_pas_stop(void);
+
+/* A peripheral's image, by its PAS ID (scm-pas.h): the audio DSP's
+ * (QDSP6 in LPASS) or WCNSS's. Metadata must occupy dedicated, contiguous,
+ * uncached 4 KiB-aligned pages. */
+enum { QCOM_PAS_ADSP = 1, QCOM_PAS_WCNSS = 6 };
+
+bool qcom_scm_pas_init(unsigned peripheral, uintptr_t metadata);
+bool qcom_scm_pas_memory(unsigned peripheral, uintptr_t memory, unsigned size);
+bool qcom_scm_pas_start(unsigned peripheral);
+bool qcom_scm_pas_stop(unsigned peripheral);
 #endif

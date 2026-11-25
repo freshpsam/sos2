@@ -40,9 +40,9 @@ LIBRARIES := third_party/littlefs/lfs.c third_party/lzma/LzmaDec.c \
     $(wildcard third_party/lwip/src/core/*.c third_party/lwip/src/core/ipv4/*.c) third_party/lwip/src/netif/ethernet.c
 ARM_SOURCES := arch/arm/mmu.c arch/arm/machine.c arch/arm/timer.c arch/arm/boot_cache.c arch/arm/smp.c
 # QEMU's randomness is virtio's (entropy.c), its disk virtio's (block.c) and
-# its sound virtio's (virtio_snd.c); the devices measure CPU jitter and keep
-# their data on the eMMC (emmc_store.c), and the phone has no audio driver yet
-# (audio.c alone).
+# its sound virtio's (virtio_snd.c); the devices measure CPU jitter, keep
+# their data on the eMMC (emmc_store.c) and play sound through their boards'
+# drivers.
 QEMU_SOURCES := $(wildcard kernel/*.c) \
     $(filter-out kernel/protection/jitter_entropy.c kernel/protection/emmc_store.c,$(wildcard kernel/protection/*.c kernel/net/*.c)) \
     kernel/audio/audio.c kernel/audio/virtio_snd.c $(ARM_SOURCES) $(LIBRARIES)
@@ -52,7 +52,7 @@ QEMU_SOURCES := $(wildcard kernel/*.c) \
 # randomness.
 PHONE_KERNEL = $(filter-out kernel/ramfb.c kernel/input.c kernel/virtio_gpu.c kernel/qemu_board.c,$(wildcard kernel/*.c)) \
     $(filter-out kernel/protection/block.c kernel/protection/entropy.c,$(wildcard kernel/protection/*.c)) \
-    $(wildcard boards/$(1)/*.c) boards/qcom/qup_i2c.c boards/qcom/scm.c boards/qcom/sdhci.c kernel/net/network.c kernel/net/network_time.c kernel/net/strings.c kernel/audio/audio.c \
+    $(wildcard boards/$(1)/*.c) boards/qcom/qup_i2c.c boards/qcom/scm.c boards/qcom/sdhci.c boards/qcom/smd.c kernel/net/network.c kernel/net/network_time.c kernel/net/strings.c kernel/audio/audio.c \
     $(ARM_SOURCES) $(LIBRARIES) $(wildcard third_party/jitterentropy/src/*.c) $(WIFI_SOURCES) \
     $(HOSTAP_SOURCES) $(WIFI_MBEDTLS_SOURCES)
 PHONE_SOURCES := $(call PHONE_KERNEL,redmi2)

@@ -102,6 +102,9 @@ bool arm_machine_init(const struct platform_devices *d) {
         {0xfc4a8000, 0x2000},  /* TSENS: the cores' temperatures (thermal.c) */
         {0x0fa00000, 0x200000}, /* shared memory with the RPM (rpm.c), in the firmware hole */
         {0xfc428000, 0x4000},  /* the RPM's message RAM: its request channel */
+        {0x0dc00000, 0x1400000}, /* the audio DSP's firmware, until TrustZone takes it (adsp.c) */
+        {0xfd484000, 0x1000},  /* TCSR's hardware mutexes: shared memory allocation (rpm.c) */
+        {0xfe12f000, 0x2000},  /* SLIMbus: its version and this processor's NGD (slimbus.c) */
     };
     for (unsigned i = 0; i < sizeof(phone) / sizeof(phone[0]); ++i)
         if (!device(phone[i].start, phone[i].size)) return false;

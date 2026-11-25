@@ -1,4 +1,5 @@
 #include "kernel_board.h"
+#include "audio.h"
 #include "platform.h"
 #include "display.h"
 #include "page_host.h"
@@ -79,8 +80,14 @@ enum board_power board_power_poll(void) {
 }
 
 void board_input(struct pointer_event *event) {
-    if (nexus5_touch_poll(event)) page_host_input(event);
+    if (nexus5_touch_poll(event)) {
+        nexus5_cpu_clock_touch();
+        page_host_input(event);
+    }
     nexus5_cpu_clock_poll(process_user_us());
+    /* The volume keys step the loudspeaker's level, which the header shows. */
+    int step = nexus5_volume_key();
+    if (step) page_host_volume(nexus5_audio_volume(step), AUDIO_VOLUME_STEPS, false);
 }
 
 void board_after_frame(void) { }

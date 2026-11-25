@@ -82,4 +82,5 @@ Open work; the other documents describe what exists.
     (about 0.5 MB/s; the data volume's go 8 sectors a command, and reads up
     to 256); the Wi-Fi chip's own sleep
     in standby (KSO), once the phone's standby current can be measured; the
-    Adreno 330; sound (the WCD9320 behind the audio DSP).
+    Adreno 330; sound beyond the loudspeaker (earpiece, headset jack,
+    microphones).

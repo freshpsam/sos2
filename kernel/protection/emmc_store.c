@@ -139,3 +139,14 @@ bool system_store_write(enum system_region region, uint64_t sector, const void *
 }
 
 bool system_store_sync(void) { return store_ready && emmc_card.serving() && emmc_card.flush(); }
+
+bool emmc_store_find(const struct platform_devices *devices, const char *name,
+                     struct disk_partition *out) {
+    return emmc_card.adopt(devices, &card_sectors) &&
+           disk_partition_named(read_sector, 0, card_sectors, name, out);
+}
+
+bool emmc_store_read(const struct disk_partition *in, uint64_t sector, void *data, unsigned count) {
+    return emmc_card.serving() && data && count && sector < in->sectors &&
+           count <= in->sectors - sector && read_sectors(in->start + sector, data, count);
+}

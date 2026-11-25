@@ -27,7 +27,9 @@
  * the bootloader's 960 MHz and the L2 its 729.6 MHz, and go no higher.
  * Above the floor, the table's points up to 2265.6 MHz pair each core rate
  * with its L2 rate; the cores rise while pages work and go back a second
- * after, as the tablet's do, within a cap that the cores' temperature sets
+ * after, as the tablet's do; work that goes on past 15 s with no touch for
+ * 3 s (a playing video) steps them back to the floor, a point every 2 s, until
+ * a quiet second or a touch; all within a cap that the cores' temperature sets
  * (thermal.c): it falls a point every 250 ms from 80 C, to the floor, and
  * from 90 C (the stock kernel's own limit), or without a reading, below it
  * to 960 MHz with the L2 at 960 MHz, as all four cores working can reach
@@ -91,6 +93,13 @@ enum {
     BUSY_US = 2000,
     IDLE_US = 1000000,
     WATCH_US = 250000,
+    THERMAL_RETRY_US = 1000000,
+    /* Work that goes on for 15 s with no touch for 3 s (a playing video,
+     * whose page keeps the main thread busy at any rate) steps the
+     * ceiling down a point every 2 s, to the floor. */
+    SUSTAINED_US = 15000000,
+    TOUCH_US = 3000000,
+    STEP_US = 2000000,
 };
 /* The cores' temperatures for the watch, in degrees. */
 enum { COOL_C = 70, HOT_C = 80, EMERGENCY_C = 90 };
@@ -153,6 +162,11 @@ static struct {
     unsigned top, cap, point; /* indices into points */
     unsigned started;         /* cores whose clocks run, by bit */
     uint64_t window_at, window_user, busy_at, watch_at;
+    /* Sustained work: since when the cores have worked without a quiet
+     * second, the last touch, the ceiling it has stepped down to and when. */
+    uint64_t working_since, touched_at, stepped_at;
+    unsigned ceiling;
+    bool thermal; /* the temperature watch has its calibration */
 } clock;
 
 /* The part's voltages, as select_freq_plan and get_krait_bin_format_b read
@@ -325,8 +339,11 @@ bool nexus5_cpu_clock_init(void) {
         clock.governed = false;
     } else if (!cores_and_l2(&clock.floor, &boot))
         return false;
-    if (!nexus5_thermal_init()) clock.governed = false;
+    /* The sensors are ready once their first round is in: a round takes
+     * 62.5 ms. */
+    clock.thermal = nexus5_thermal_init(70000);
     clock.cap = clock.top;
+    clock.ceiling = clock.top;
     clock.point = FLOOR;
     clock.ready = true;
     return true;
@@ -353,20 +370,38 @@ static void watch(void) {
     if (clock.point > clock.cap) move(clock.cap);
 }
 
+void nexus5_cpu_clock_touch(void) { clock.touched_at = loop_time_us(); }
+
 void nexus5_cpu_clock_poll(uint64_t user_us) {
     if (!clock.ready || !clock.governed) return;
     uint64_t now = loop_time_us();
-    if (now - clock.watch_at >= WATCH_US) {
+    /* Without the sensors' calibration the cores keep the floor; sensors
+     * that were not ready at boot are looked at again each second. */
+    if (!clock.thermal && now - clock.watch_at >= THERMAL_RETRY_US) {
+        clock.watch_at = now;
+        clock.thermal = nexus5_thermal_init(0);
+    }
+    if (clock.thermal && now - clock.watch_at >= WATCH_US) {
         clock.watch_at = now;
         watch();
     }
-    if (now - clock.window_at < WINDOW_US) return;
+    if (!clock.thermal || now - clock.window_at < WINDOW_US) return;
     bool busy = user_us - clock.window_user >= BUSY_US;
     clock.window_at = now;
     clock.window_user = user_us;
+    bool was_working = now - clock.busy_at < IDLE_US;
     if (busy) clock.busy_at = now;
-    bool working = busy || now - clock.busy_at < IDLE_US;
-    move(working || clock.cap < FLOOR ? clock.cap : FLOOR);
+    bool working = busy || was_working;
+    if (!was_working || !working || now - clock.touched_at < TOUCH_US) {
+        clock.working_since = now;
+        clock.ceiling = clock.top;
+    } else if (now - clock.working_since >= SUSTAINED_US && now - clock.stepped_at >= STEP_US &&
+               clock.ceiling > FLOOR) {
+        --clock.ceiling;
+        clock.stepped_at = now;
+    }
+    unsigned target = clock.cap < clock.ceiling ? clock.cap : clock.ceiling;
+    move(working || clock.cap < FLOOR ? target : FLOOR);
 }
 
 void nexus5_cpu_clock_standby(bool on) {

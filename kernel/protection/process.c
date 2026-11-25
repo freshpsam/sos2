@@ -1025,6 +1025,10 @@ static void background_work(void *unused) {
         battery_service(0);
         return;
     }
+    if (audio_service_pending()) {
+        audio_service();
+        return;
+    }
     if (system_clock_pending() && (clock_turn || !network_service_pending())) {
         clock_turn = false;
         system_clock_service(0);
@@ -1038,8 +1042,8 @@ static void service_step(void) {
     if (!kernel_io_busy()) {
         io_owner = 0;
         io_thread = 0;
-        bool background_pending =
-            battery_pending() || system_clock_pending() || network_service_pending();
+        bool background_pending = battery_pending() || audio_service_pending() ||
+                                  system_clock_pending() || network_service_pending();
         /* Choose the background turn before advancing either process cursor.
          * Selecting then discarding a process skips the same busy page forever
          * when both page queues and the background queue stay ready. */

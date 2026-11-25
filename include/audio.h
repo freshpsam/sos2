@@ -31,14 +31,23 @@ struct audio_device {
     bool (*poll)(void);
     /* Frames the device holds, still to be heard. */
     uint32_t (*latency)(void);
+    /* Slow work of the device's (the Nexus 5's audio DSP firmware, read
+     * from the eMMC), a step at a time on the service worker while pending
+     * says so; NULL where there is none. */
+    bool (*pending)(void);
+    void (*service)(void);
 };
 
 /* QEMU's virtio-sound (kernel/audio/virtio_snd.c), the tablet's speakers
- * (boards/gta7lite/audio.c) and the Redmi 2's loudspeaker
- * (boards/redmi2/audio.c); the Nexus 5 has no audio driver yet. */
+ * (boards/gta7lite/audio.c), the Redmi 2's loudspeaker
+ * (boards/redmi2/audio.c) and the Nexus 5's (boards/nexus5/audio.c). */
 bool virtio_snd_init(const struct platform_devices *, struct audio_device *);
 bool gta7lite_audio_init(struct audio_device *);
 bool redmi2_audio_init(struct audio_device *);
+bool nexus5_audio_init(struct audio_device *);
+/* For the service worker (process.c): the device's slow work. */
+bool audio_service_pending(void);
+void audio_service(void);
 /* For the device's driver: the most frames a playing stream holds, which the
  * mixer could take now; and the mix of the playing streams' next count
  * frames, silence where one runs short, which counts them played. */

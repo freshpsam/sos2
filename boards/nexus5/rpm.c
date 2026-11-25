@@ -68,7 +68,7 @@ static struct {
 } rpm;
 
 /* An item's address, inside shared memory or the RPM's message RAM. */
-static uintptr_t item(unsigned id, uint32_t *size) {
+uintptr_t nexus5_smem_item(unsigned id, uint32_t *size) {
     uintptr_t entry = SMEM_TOC + TOC_ENTRY * id;
     if (!mmio_read32(entry)) return 0;
     uint32_t offset = mmio_read32(entry + 4), bytes = mmio_read32(entry + 8);
@@ -78,6 +78,50 @@ static uintptr_t item(unsigned id, uint32_t *size) {
     if (!limit || offset > limit || bytes > limit - offset || offset & 3) return 0;
     *size = bytes;
     return base + offset;
+}
+
+/* An item allocated in the global heap, as smem.c's smem_alloc2 allocates
+ * it: under TCSR's hardware mutex 3, which the apps processor owns while it
+ * reads 1 (its PID) back, the item's table entry then the heap's free
+ * offset and what remains. An item already there is taken if its size
+ * matches. */
+enum {
+    MUTEX_SMEM = 0xfd484000 + 3 * 0x80,
+    APPS_PID = 1,
+    HEAP_INFO = SMEM + 192, /* initialized, free offset, remaining */
+    FIRST_ALLOCATED_ITEM = 8,
+    ITEMS = 512
+};
+
+uintptr_t nexus5_smem_alloc(unsigned id, uint32_t size) {
+    size = (size + 7) & ~7u;
+    if (id < FIRST_ALLOCATED_ITEM || id >= ITEMS || !size) return 0;
+    uint64_t start = time_us();
+    for (;;) {
+        nexus5_store(MUTEX_SMEM, APPS_PID);
+        if (mmio_read32(MUTEX_SMEM) == APPS_PID) break;
+        if (time_us() - start >= WAIT_US) return 0;
+    }
+    uintptr_t entry = SMEM_TOC + TOC_ENTRY * id, address = 0;
+    uint32_t free = mmio_read32(HEAP_INFO + 4), remaining = mmio_read32(HEAP_INFO + 8);
+    if (mmio_read32(entry)) {
+        uint32_t found = 0;
+        address = nexus5_smem_item(id, &found);
+        if (found != size) address = 0;
+    } else if (mmio_read32(HEAP_INFO) == 1 && !(free & 7) && free <= SMEM_SIZE &&
+               remaining >= size && remaining <= SMEM_SIZE - free) {
+        nexus5_store(entry + 4, free);
+        nexus5_store(entry + 8, size);
+        nexus5_store(entry + 12, 0);
+        __asm__ volatile("dsb" ::: "memory");
+        nexus5_store(entry, 1);
+        nexus5_store(HEAP_INFO + 4, free + size);
+        nexus5_store(HEAP_INFO + 8, remaining - size);
+        address = SMEM + free;
+    }
+    __asm__ volatile("dsb" ::: "memory");
+    nexus5_store(MUTEX_SMEM, 0);
+    return address;
 }
 
 static uint32_t half(uintptr_t record, unsigned word) { return mmio_read32(record + 4 * word); }
@@ -109,7 +153,7 @@ static void set_state(uint32_t state) {
 
 static bool find_channel(void) {
     uint32_t size = 0;
-    uintptr_t table = item(ITEM_CHANNELS, &size);
+    uintptr_t table = nexus5_smem_item(ITEM_CHANNELS, &size);
     if (!table) return false;
     for (uint32_t at = 0; at + CHANNEL_ENTRY <= size; at += CHANNEL_ENTRY) {
         uintptr_t entry = table + at;
@@ -120,8 +164,8 @@ static bool find_channel(void) {
         if (!match) continue;
         uint32_t cid = mmio_read32(entry + 20), shared_size = 0, fifo_size = 0;
         if (cid >= 64) return false;
-        uintptr_t shared = item(ITEM_SHARED + cid, &shared_size);
-        uintptr_t fifo = item(ITEM_FIFO + cid, &fifo_size);
+        uintptr_t shared = nexus5_smem_item(ITEM_SHARED + cid, &shared_size);
+        uintptr_t fifo = nexus5_smem_item(ITEM_FIFO + cid, &fifo_size);
         if (!shared || shared_size < 2 * 4 * H_WORDS || !fifo || fifo_size < 256 ||
             fifo_size & (fifo_size - 1))
             return false;

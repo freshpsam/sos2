@@ -183,6 +183,16 @@ int smd_poll(struct smd_channel *c, uint64_t now) {
     if (c->state == OPENING && remote == OPENED && !read_word(c->info + tail) &&
         (!read_word(c->info + c->half + head) || c->peer_opening))
         state(c, OPENED);
+    /* A peer that waits in OPENING for ours to open first, as the Nexus 5's
+     * audio DSP does: ours opens, as mainline's qcom_smd_channel_open opens
+     * it, and the peer follows within the open's deadline. */
+    if (c->state == OPENING && remote == OPENING && !read_word(c->info + tail) &&
+        !read_word(c->info + c->half + head))
+        state(c, OPENED);
+    if (c->state == OPENED && remote == OPENING && c->deadline) {
+        if (now >= c->deadline) return fail(c);
+        return SMD_AGAIN;
+    }
     if (c->state == OPENED) {
         if (!remote_open(remote)) return fail(c);
         c->deadline = 0;

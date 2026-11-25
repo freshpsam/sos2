@@ -364,8 +364,9 @@ returned when it closes or its process ends. The mixer
 (`kernel/audio/audio.c`) sums the playing streams and saturates the total. A
 stream's `played` count grows as frames leave its queue and `latency` counts
 those still queued in the device, so what is heard is `played - latency`, the
-clock media playback follows. Without an audio device, as on the Nexus 5,
-streams play silently at the same rate, so the clock still keeps real time.
+clock media playback follows. Without an audio device (QEMU without one, or a
+device whose driver has not started or has failed), streams play silently at
+the same rate, so the clock still keeps real time.
 QEMU's virtio-sound device gets 10 ms periods, at most four at a time, and
 stops a quarter second after the streams run dry
 (`kernel/audio/virtio_snd.c`). The tablet's speakers, or headphones in its
@@ -377,7 +378,12 @@ The Redmi 2's loudspeaker plays the mix in mono from a 256 ms ring in RAM
 that the audio interface's DMA reads, filled up to 245 ms ahead, with the
 same volume steps (`boards/redmi2/audio.c`, [Redmi 2](redmi2.md#sound)); the
 volume steps and the keys' timing are shared (`audio_mix_volume`,
-`kernel/volume_keys.c`). `make run` plays through PulseAudio or
+`kernel/volume_keys.c`). The Nexus 5's loudspeaker plays the mix in mono
+through the audio DSP, which holds up to 240 ms of 20 ms periods from a ring
+in RAM, with the same volume steps (`boards/nexus5/audio.c`,
+[Nexus 5](nexus5.md#sound)); its driver's slow start, the DSP's firmware
+read from the eMMC, runs on the service worker (`audio_device`'s
+`pending`/`service`). `make run` plays through PulseAudio or
 PipeWire when one runs; `RUN_ARGS='--audio none'` leaves the device out, and
 `'--audio wav:FILE'` records it.
 

@@ -101,13 +101,94 @@ bool nexus5_cpu_clock_init(void);
 bool nexus5_cpu_clock_start(unsigned cpu);
 void nexus5_cpu_clock_poll(uint64_t user_us);
 void nexus5_cpu_clock_standby(bool on);
+/* A touch: interactive, so sustained work keeps the faster clocks. */
+void nexus5_cpu_clock_touch(void);
 /* The cores' temperature sensors (thermal.c): init takes their calibration
- * from the fuses; temperature gives the hottest core's, in degrees. */
-bool nexus5_thermal_init(void);
+ * from the fuses once the sensors are ready, waiting up to wait_us for
+ * them; temperature gives the hottest core's, in degrees. */
+bool nexus5_thermal_init(uint64_t wait_us);
 bool nexus5_cpu_temperature(int *degrees);
 /* The RPM (rpm.c): the logic rail's corner while the apps processor runs
- * (rpm-regulator-smd.h's: 5 normal, 7 super turbo), acknowledged. */
+ * (rpm-regulator-smd.h's: 5 normal, 7 super turbo), acknowledged. A
+ * shared memory item's address and size, 0 when it is absent; one
+ * allocated in the shared heap (or the one already there, if its size
+ * matches), 0 when it cannot be. */
 bool nexus5_rpm_logic_corner(unsigned corner);
+uintptr_t nexus5_smem_item(unsigned id, uint32_t *size);
+uintptr_t nexus5_smem_alloc(unsigned id, uint32_t size);
+
+/* Sound (docs/nexus5.md#sound): the loudspeaker through the audio DSP and
+ * the WCD9320 codec.
+ *
+ * The audio DSP (adsp.c): its firmware read from Android's system
+ * partition, then authenticated and started by TrustZone, a step at a time
+ * for the service worker: true once it is done (*error then NULL, or why
+ * the DSP did not start), false while steps remain or after a failure
+ * (*error set). One of the channels the DSP opened to this processor, by
+ * name, opening (smd.c: poll it until it is open); false while the DSP has
+ * not listed it. */
+bool nexus5_adsp_load_step(const char **error);
+struct smd_channel;
+bool nexus5_adsp_channel(const char *name, struct smd_channel *out, uint64_t now);
+
+/* The DSP's APR services (apr.c): a packet with its header filled in for
+ * service svc at port; a command and its answer, a basic result or a
+ * response whose payload is copied to out: 0 when it succeeded, negative
+ * when it went unsent or unanswered, 1 when the DSP refused it; events go
+ * to the handler. Poll keeps the channel read: false once it failed. */
+bool nexus5_apr_poll(void);
+bool nexus5_apr_send(uint8_t *packet, unsigned size, uint8_t svc, uint16_t port, uint32_t token,
+                     uint32_t opcode);
+int nexus5_apr_command(uint8_t *packet, unsigned size, uint8_t svc, uint16_t port, uint32_t token,
+                       uint32_t opcode, uint32_t response, void *out, unsigned out_size);
+void nexus5_apr_events(void (*handler)(const uint8_t *packet, unsigned size));
+
+/* The DSP's QMI services (qmi.c), over its IPC router link: a request's
+ * TLVs to a service, answered within wait_us: 0 when the response's result
+ * is success, else negative (no link, no service, no answer) or the QMI
+ * error with bit 16 set; whether the DSP has listed a service. */
+int nexus5_qmi_request(uint32_t service, uint32_t instance, uint16_t message, const uint8_t *tlvs,
+                       unsigned length, uint64_t wait_us);
+void nexus5_qmi_poll(void);
+bool nexus5_qmi_has(uint32_t service, uint32_t instance);
+
+/* SLIMbus as a satellite of the DSP's manager (slimbus.c): start has the
+ * DSP power the bus and announces this processor (NULL, or why not); a
+ * device's logical address by its enumeration address; a byte value
+ * element (a codec register) read or changed; a device's port connected as
+ * a channel's sink, the channel defined and activated with its properties,
+ * or removed; stop asks the bus off. */
+const char *nexus5_slimbus_start(void);
+bool nexus5_slimbus_address(const uint8_t enumeration[6], uint8_t *la);
+bool nexus5_slimbus_write(uint8_t la, uint16_t offset, uint8_t value);
+bool nexus5_slimbus_read(uint8_t la, uint16_t offset, uint8_t *value);
+bool nexus5_slimbus_connect_sink(uint8_t la, uint8_t port, uint8_t channel);
+bool nexus5_slimbus_define(uint8_t la, const uint8_t properties[4], uint8_t channel);
+bool nexus5_slimbus_remove(uint8_t la, uint8_t channel);
+bool nexus5_slimbus_stop(void);
+
+/* Playback through the DSP (q6audio.c): the AFE's SLIMbus port on the
+ * codec's channel, the stream and its route, the shared memory mapped,
+ * running, buffers written (done gets each one's token back), closed. */
+bool nexus5_q6_afe_start(uint8_t channel);
+bool nexus5_q6_afe_stop(void);
+bool nexus5_q6_open(void);
+bool nexus5_q6_map(uint32_t address, uint32_t size);
+bool nexus5_q6_run(void (*done)(uint32_t token));
+bool nexus5_q6_write(uint32_t address, uint32_t size, uint32_t token);
+bool nexus5_q6_close(void);
+
+/* The codec (wcd9320.c) and the whole loudspeaker path: on, the bus
+ * powered, the codec up with its speaker route, the DSP's port started and
+ * the codec's SLIMbus port on the shared channel (NULL, or why not); off,
+ * the reverse. */
+const char *nexus5_speaker(bool on);
+
+/* The loudspeaker's level (audio.c): the volume step after a key's step
+ * (+1, -1, or 0 to read it); the volume keys (keys.c): +1 for a Volume Up
+ * step, -1 for Volume Down, else 0. */
+unsigned nexus5_audio_volume(int step);
+int nexus5_volume_key(void);
 
 /* The other three cores (smp.c), for arch/arm/smp.c on CPU 0: prepare
  * gives the firmware their entry and returns how many cores there are (1

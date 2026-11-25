@@ -307,9 +307,10 @@ void qcom_scm_halt_pmic_arbiter(void) {
     barrier();
 }
 
-static bool pas(unsigned command, unsigned info, uint32_t second, uint32_t third) {
+static bool pas(unsigned peripheral, unsigned command, unsigned info, uint32_t second,
+                uint32_t third) {
     if (!ready || quarantined) return false;
-    uint32_t args[] = {6, second, third}, result = UINT32_MAX;
+    uint32_t args[] = {peripheral, second, third}, result = UINT32_MAX;
     const char *stage = command == 1   ? "metadata"
                         : command == 2 ? "memory"
                         : command == 5 ? "start"
@@ -326,18 +327,18 @@ bool qcom_scm_gpu_restore(unsigned context_bank) {
     return call(0x0c, 2, 2, args, &result, "GPU memory protection") && result == 0;
 }
 
-bool qcom_scm_pas_init(uintptr_t metadata) {
+bool qcom_scm_pas_init(unsigned peripheral, uintptr_t metadata) {
     /* PAS may protect the metadata pages. Match the vendor's page-aligned,
      * uncached allocation and SCM_ARGS(2, SCM_VAL, SCM_RW), not SCM_RO. */
     return metadata && !(metadata & 4095) && metadata <= UINT32_MAX &&
-           pas(1, 2 | (2u << 6), (uint32_t)metadata, 0);
+           pas(peripheral, 1, 2 | (2u << 6), (uint32_t)metadata, 0);
 }
 
-bool qcom_scm_pas_memory(uintptr_t memory, unsigned size) {
+bool qcom_scm_pas_memory(unsigned peripheral, uintptr_t memory, unsigned size) {
     return memory && !(memory & 0xfffff) && size && memory <= UINT32_MAX - size &&
-           pas(2, 3, (uint32_t)memory, size);
+           pas(peripheral, 2, 3, (uint32_t)memory, size);
 }
 
-bool qcom_scm_pas_start(void) { return pas(5, 1, 0, 0); }
+bool qcom_scm_pas_start(unsigned peripheral) { return pas(peripheral, 5, 1, 0, 0); }
 
-bool qcom_scm_pas_stop(void) { return pas(6, 1, 0, 0); }
+bool qcom_scm_pas_stop(unsigned peripheral) { return pas(peripheral, 6, 1, 0, 0); }

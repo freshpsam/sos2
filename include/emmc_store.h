@@ -1,5 +1,6 @@
 #ifndef SOS2_EMMC_STORE_H
 #define SOS2_EMMC_STORE_H
+#include "disk_partition.h"
 #include "fdt.h"
 
 /* The eMMC's two users on the devices (kernel/protection/emmc_store.c): the
@@ -35,4 +36,9 @@ struct emmc_card {
 
 /* The board's driver: boards/<board>/emmc.c. */
 extern const struct emmc_card emmc_card;
+
+/* Another partition, found by its GPT name, for reading only: Android's
+ * system partition on the Nexus 5, which holds the audio DSP's firmware. */
+bool emmc_store_find(const struct platform_devices *, const char *name, struct disk_partition *out);
+bool emmc_store_read(const struct disk_partition *, uint64_t sector, void *data, unsigned count);
 #endif

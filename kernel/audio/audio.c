@@ -54,8 +54,9 @@ void audio_init(const struct platform_devices *devices) {
 #elif defined(SOS2_BOARD_REDMI2)
     (void)devices;
     online = redmi2_audio_init(&device);
-#elif defined(SOS2_DEVICE)
-    (void)devices; /* the Nexus 5 has no sound driver yet */
+#elif defined(SOS2_BOARD_NEXUS5)
+    (void)devices;
+    online = nexus5_audio_init(&device);
 #else
     online = virtio_snd_init(devices, &device);
 #endif
@@ -76,6 +77,12 @@ void audio_poll(void) {
         struct stream *s = &streams[i];
         if (s->queue && !s->paused) consume(s, s->count < due ? s->count : (uint32_t)due);
     }
+}
+
+bool audio_service_pending(void) { return online && device.pending && device.pending(); }
+
+void audio_service(void) {
+    if (online && device.service) device.service();
 }
 
 uint32_t audio_ready(void) {

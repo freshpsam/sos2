@@ -36,10 +36,10 @@ static struct {
 } sensor[SENSORS];
 static bool calibrated;
 
-bool nexus5_thermal_init(void) {
+bool nexus5_thermal_init(uint64_t wait_us) {
     if (calibrated) return true;
     uint32_t control = mmio_read32(TSENS_CTRL);
-    if (!(control & TSENS_EN) || !nexus5_wait_bits(TSENS_TRDY, 1, true, 1000)) return false;
+    if (!(control & TSENS_EN) || !nexus5_wait_bits(TSENS_TRDY, 1, true, wait_us)) return false;
     for (unsigned i = 0; i < SENSORS; ++i)
         if (!(control & (1u << (SENSOR_EN_SHIFT + FIRST + i)))) return false;
     uint32_t c[6], b[4];

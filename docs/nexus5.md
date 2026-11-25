@@ -7,7 +7,8 @@ phone, keeping its data in the cache partition, or starts from the computer
 with `fastboot boot` as a RAM session, whose data clears when it restarts.
 The desktop draws on the phone's screen and responds to touch, with a buzz
 for buttons and keys; it joins open and WPA2 networks over [Wi-Fi](#wi-fi),
-where pages load on all four cores at up to 2.26 GHz; the header shows the
+where pages load on all four cores at up to 2.26 GHz; the loudspeaker plays
+their [sound](#sound), at a level the volume keys step; the header shows the
 battery; the power key's standby turns off the backlight, the panel and the
 radio; and its USB port is a fastboot link to the computer. Packaging only
 writes files on the computer; it never touches the phone.
@@ -48,8 +49,9 @@ The stock bootloader's fastboot and SOS2's link (below) are both fastboot
 devices, so with both possible on the bus, name one with `-s`. The phone's
 splash gives way to SOS2 within a second of the jump; the desktop takes
 input about 25 s later, of which expanding the resources takes about 17 s.
-A RAM session never touches the eMMC, so it can alternate with an installed
-system, or with Android.
+A RAM session never writes the eMMC (it reads one thing there: the audio
+DSP's firmware, from Android's system partition), so it can alternate with an
+installed system, or with Android.
 
 ## Installing
 
@@ -185,6 +187,63 @@ clock from the network, pages, idle minutes, and standby and back. Not
 yet: 5 GHz (the station scans channels 1 to 11), WPA3 and protected
 management frames (the firmware has neither).
 
+## Sound
+
+The loudspeaker plays what pages and apps play: their mix in mono, at the
+level the volume keys step from 12 of 15 at each start (the header shows it).
+It plays as the stock system plays it, through the audio DSP (LPASS's QDSP6)
+to the WCD9320 codec, whose own class-D driver drives the speaker
+(boards/nexus5/audio.c, with adsp.c, apr.c, q6audio.c, qmi.c, slimbus.c,
+wcd9320.c and keys.c).
+
+- **The DSP's firmware** is Android's: /system/vendor/firmware/adsp.mdt and
+  adsp.b00 to b12 (9.3 MB), read from the system partition, which SOS2 never
+  writes (kernel/protection/ext4.c reads ext4 as make_ext4fs writes it).
+  Once the desktop is up, the service worker loads it a megabyte a step,
+  about a second in all, at its fixed addresses (0x0DC00000-0x0F000000, in
+  the firmware hole), and TrustZone checks and starts it (the PAS calls the
+  Redmi 2's Wi-Fi also makes). Before it starts, the apps processor's SMP2P
+  item for it (shared memory item 429, allocated under TCSR's hardware
+  mutex 3) must exist, as the stock kernel publishes it at its own start:
+  otherwise the DSP serves none of the apps processor's channels. Without
+  the system partition or the firmware there is no sound, and pages' sound
+  plays silently, keeping time, as it did before.
+- **Links:** channels the DSP opens in shared memory (it waits in OPENING
+  for this side to open first, as mainline Linux's qcom_smd opens):
+  apr_audio_svc for APR, its services for playback, and IPCRTR for its IPC
+  router, through which its SLIMbus service (QMI) powers the bus on
+  request.
+- **SLIMbus:** the DSP manages the bus; this processor is a satellite
+  through its NGD (0xFE130000), with messages through its registers. The
+  codec appears on the bus after its reset (GPIO 63) and gets its logical
+  addresses from the DSP; its registers are value elements at 0x800 plus
+  the register. Its 9.6 MHz master clock is the PM8941's clock divider 1,
+  out of PM8941 GPIO 15.
+- **Playback:** when a stream has frames, the bus powers up, the codec takes
+  the stock "speaker" mixer path (SLIMbus RX1 into RX7, compander 0, the
+  speaker driver at 6 of 8, RX7's gain at +4 dB) in the order Linux's DAPM
+  powers it, the DSP starts its SLIMbus port on channel 144 for the codec's
+  port 16, and an ASM stream, which the ADM routes to that port, takes
+  16-bit mono at 48 kHz from a ring in uncached RAM: 20 ms periods, of which
+  the DSP holds 240 ms, each written again once the DSP has read it. Media
+  playback's clock subtracts what the DSP holds (SYS_AUDIO's latency). The
+  first start, which also brings the codec up, holds the main loop about
+  0.1 s. Three seconds after the last frame everything powers down; a
+  failure powers down what came up and is tried again 10 s later, three
+  times at most.
+- **Tried (2026-11-24):** YouTube's mobile site, a music video with its ads
+  and the switch between them: the video at its full rate, the DSP never
+  short of periods (the main loop fed it at least every 4.3 ms), the
+  codec's registers as the stock driver leaves them while playing. The
+  speaker was then heard by the phone's own bottom microphone, through a
+  capture path built for the test and not kept (the stock "handset-mic"
+  path: ADC1 into decimator 6, the codec's SLIMbus TX port 6 on channel 134,
+  the DSP's SLIMBUS_0_TX, an ASM read stream): tones played at 440 Hz and
+  1 kHz came back at their frequencies, about 60 dB over neighbouring ones,
+  16 dB quieter when played 18 dB quieter, and not at all with the speaker
+  driver off; the music video came back throughout, about 28 dB over
+  silence. Not yet: the earpiece, the headset jack and the microphones.
+
 ## Loader and hardware
 
 - **Loader:** the stock bootloader puts the kernel at 0x8000, its copy of
@@ -257,7 +316,12 @@ management frames (the firmware has neither).
   2265.6 MHz with the L2 at 1728 MHz (1050 mV), and goes back to the floor
   a second after: the browser's steady benchmark runs 1.5 times as fast,
   YouTube's mobile home page shows its first videos 4.9 s after OPEN, and
-  its watch page plays from 4.3 s.
+  its watch page plays from 4.3 s. Work that goes on for 15 s with no touch
+  for 3 s steps the cores down a point every 2 s, to the floor, until a
+  quiet second or a touch: a playing YouTube video keeps its page's main
+  thread busy at any rate (WebCore's compositing pass on each of the page's
+  frames) while the video itself plays its full 25 frames a second at the
+  floor too, with no audio short of data.
 - **Temperature:** TSENS's sensors 5 to 8, one in each core, which the
   bootloader leaves measuring, converted with the part's two-point
   calibration from the QFPROM as the stock msm8974-tsens.c does
@@ -266,9 +330,13 @@ management frames (the firmware has neither).
   floor; from 90 C (the stock kernel's own limit), or without a reading, to
   960 MHz with the L2 at 960 MHz; below 70 C it rises again. All four cores
   working reached 80 C within 15 s at the top and settled at the floor,
-  where they warmed from 77 to 82 C over five minutes; YouTube's video kept
-  the top for a minute at 64 C. In standby the cores wait at the floor or
-  below, CPU 0 and the L2 on 300 MHz with their HFPLLs off.
+  where they warmed from 77 to 82 C over five minutes. YouTube's video at
+  the top warmed them from 71 to 78 C in 30 s; at the floor, where the
+  sustained rule above puts it, they stay at 66 to 67 C. The sensors'
+  calibration is taken once they report ready, within a 62.5 ms round at
+  boot or else at a look each second after, the cores keeping the floor
+  until then. In standby the cores wait at the floor or below, CPU 0 and
+  the L2 on 300 MHz with their HFPLLs off.
 - **Display:** a command-mode DSI panel, 1080x1920. The bootloader's splash
   is MDP pipe RGB0, RGB888 at 0x0D200000, and becomes the screen, drawn at
   full resolution. A command-mode panel shows a new picture only when the
@@ -326,9 +394,11 @@ management frames (the firmware has neither).
   Redmi 2's, as both chips have the same QUP controller.
 - **PMIC:** the PM8941 and PM8841, through the SPMI arbiter's channel 0
   (boards/nexus5/pmic.c; a register's slave in bits 19:16 of its address):
-  the power key, which toggles standby; the RTC, the clock; L19 for the
-  vibrator; and restarts: a warm reset through PS_HOLD, with the restart
-  reason in IMEM (0x77665500 asks the bootloader for fastboot).
+  the power key, which toggles standby; the volume keys, GPIOs 2 (up) and 3
+  (down), read low while held (boards/nexus5/keys.c); the RTC, the clock;
+  L19 for the vibrator; the codec's master clock (above); and restarts: a
+  warm reset through PS_HOLD, with the restart reason in IMEM (0x77665500
+  asks the bootloader for fastboot).
 - **USB:** the ChipIdea controller at 0xF9A55000 (boards/nexus5/usb.c),
   polled by the main loop, set up as the bootloader's driver sets it up, its
   queue heads and buffers in uncached RAM at 0x02600000. A transfer is over
@@ -397,14 +467,13 @@ management frames (the firmware has neither).
   the DRAM. The startup test, a collector and 32 bytes take about 0.7 s at
   1497.6 MHz; with CPU 0 and the L2 parked at 300 MHz in standby a read may
   take several times that, and gets 8 s here.
-- **Not yet:** sound (the WCD9320 codec on SLIMbus behind the audio DSP,
-  whose firmware, its messaging and the codec's setup would all have to
-  run first); the GPU (an Adreno 330, the Redmi 2's family); the cores'
-  power-down in standby (TrustZone's power collapse through each core's
-  SPM, as on the Redmi 2); the Wi-Fi chip's own sleep in standby
+- **Not yet:** sound beyond the loudspeaker (the earpiece, the headset
+  jack, the microphones); the GPU (an Adreno 330, the Redmi 2's family);
+  the cores' power-down in standby (TrustZone's power collapse through each
+  core's SPM, as on the Redmi 2); the Wi-Fi chip's own sleep in standby
   (brcmfmac's KSO, with the HT clock released); the panel's sleep and wake
   commands run in steps rather than holding CPU 0's loop (about 150 ms
   entering standby, 120 ms leaving); and a received frame read in one
   CMD53 rather than its header first. The vibrator's buzz and the
   backlight's and panel's return are checked on their registers, not yet by
-  hand.
+  hand; the loudspeaker by the phone's own microphone, not yet by ear.
