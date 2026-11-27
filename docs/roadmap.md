@@ -43,10 +43,10 @@ Open work; the other documents describe what exists.
    PM8916's MBHC and the jack's switch, GPIO 8); on the tablet, its volumes
    kept across restarts, its headphones' microphone and buttons; on both,
    the codecs' power-up and power-down sequences (about 25-30 ms each) run
-   in steps rather than holding CPU 0's loop. The Nexus 5's pages play
-   silently. In the browser, sound for more than one element at a time (a
-   second video plays silently), and volume and mute that reach the half
-   second already queued, which needs `SYS_AUDIO` to take them.
+   in steps rather than holding CPU 0's loop. In the browser, sound for more
+   than one element at a time (a second video plays silently), and volume
+   and mute that reach the half second already queued, which needs
+   `SYS_AUDIO` to take them.
 9. **Power.** Standby draws 6.0 mA. The tablet and the Nexus 5 raise their
    CPU clocks only while pages work, the Nexus 5 within what its cores'
    temperature allows. Next: Wi-Fi's share in power save, the display's
@@ -84,3 +84,11 @@ Open work; the other documents describe what exists.
     in standby (KSO), once the phone's standby current can be measured; the
     Adreno 330; sound beyond the loudspeaker (earpiece, headset jack,
     microphones).
+12. **PCs.** The [x64](x64.md) system starts from a USB stick through
+    its own UEFI loader on QEMU's emulated PC (q35 with OVMF): the desktop in
+    the middle of the monitor, USB keyboards and mice, Intel's 82574L, HD
+    Audio, ACPI's power button, data on the stick and updates of its system.
+    Next, real PCs: Secure Boot, more network cards (Intel's I225 first),
+    NVMe and AHCI and installing onto them, real HD Audio codecs, USB hubs,
+    sticks larger than the image, split page tables (KPTI) on CPUs that
+    Meltdown affects; then a desktop laid out for monitors.

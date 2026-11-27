@@ -39,6 +39,8 @@ target_link_options(sos2-web PRIVATE "-Wl,-Map,${CMAKE_BINARY_DIR}/bin/sos2-web.
 # them build dependencies. Runtime-only fixes must still relink the browser.
 if (CMAKE_SYSTEM_PROCESSOR STREQUAL "arm")
     set(SOS2_LINKER_SCRIPT "${SOS2_ROOT}/sdk/runtime/linker.ld")
+elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+    set(SOS2_LINKER_SCRIPT "${SOS2_ROOT}/sdk/runtime/linker-x64.ld")
 else ()
     set(SOS2_LINKER_SCRIPT "${SOS2_ROOT}/sdk/runtime/linker-arm64.ld")
 endif ()

@@ -1,6 +1,6 @@
 # One browser kernel per board and architecture; no embedded experiments or
 # sample apps. ARM32 serves QEMU, the Redmi 2 and the Nexus 5; arm64 serves
-# QEMU and the Galaxy Tab A7 Lite.
+# QEMU and the Galaxy Tab A7 Lite; x64 serves QEMU's microvm and PCs.
 # On PATH, or an Arm GNU Toolchain unpacked into .tools/ (as tools/arch.py).
 ARM32_PREFIX ?= $(if $(shell command -v arm-none-eabi-gcc 2>/dev/null),arm-none-eabi-,$(CURDIR)/.tools/arm-none-eabi/bin/arm-none-eabi-)
 ARM32_CC := $(ARM32_PREFIX)gcc
@@ -103,6 +103,64 @@ build/resources-arm64/kernel.elf: $(ARM64_OBJECTS) arch/arm64/resources.ld
 build/resources-arm64/kernel.img: build/resources-arm64/kernel.elf
 	$(ARM64_OBJCOPY) -O binary $< $@
 
+# x64: the shared kernel with x64's entry, exceptions, MMU, local APIC
+# and SMP code (arch/x64), for QEMU's microvm, which keeps the ARM machines'
+# virtio-mmio devices. Kernel code runs with interrupts masked and general
+# registers only; -mno-red-zone keeps the convention all the same. QEMU loads
+# the ELF itself through its PVH note, so there is no binary image.
+X64_PREFIX ?= $(if $(shell command -v x86_64-elf-gcc 2>/dev/null),x86_64-elf-,$(CURDIR)/.tools/x86_64-elf/bin/x86_64-elf-)
+X64_CC := $(X64_PREFIX)gcc
+X64_FLAGS := $(subst -Iarch/arm/include,-Iarch/x64/include,$(filter-out -marm -mfloat-abi=soft -mno-unaligned-access,$(COMMON_FLAGS))) \
+    -m64 -march=x86-64-v2 -mtune=generic -mno-red-zone -mcmodel=small
+X64_SOURCES := $(filter-out $(ARM_SOURCES),$(QEMU_SOURCES)) $(wildcard arch/x64/*.c)
+X64_OBJECTS := $(patsubst %.c,build/resources-x64/%.o,$(X64_SOURCES)) \
+    $(patsubst %,build/resources-x64/arch/x64/%.o,boot entry)
+build/resources-x64/%.o: %.c Makefile tools/build.mk
+	@mkdir -p $(@D)
+	$(X64_CC) $(X64_FLAGS) -c $< -o $@
+build/resources-x64/%.o: %.S Makefile tools/build.mk
+	@mkdir -p $(@D)
+	$(X64_CC) $(X64_FLAGS) -c $< -o $@
+build/resources-x64/kernel.elf: $(X64_OBJECTS) arch/x64/kernel.ld
+	$(X64_CC) $(X64_FLAGS) -nostdlib -Wl,-T,arch/x64/kernel.ld,-Map,$(@:.elf=.map),--build-id=none,-z,noexecstack,-z,max-page-size=4096 $(X64_OBJECTS) -lgcc -o $@
+
+# A PC (SOS2_BOARD_PC), in QEMU's q35 with OVMF so far: the x64 kernel,
+# entered at uefi_start by SOS2's UEFI loader from a USB stick, with the
+# loader's GOP framebuffer as the screen and the PC's drivers (boards/pc)
+# in place of microvm's virtio display and input.
+PC_FAMILY := -DSOS2_DEVICE=1 -DSOS2_LOADER_FRAMEBUFFER=1 -DSOS2_NAVIGATION_BUTTONS=1
+PC_FLAGS := $(X64_FLAGS) -DSOS2_BOARD_PC=1 $(PC_FAMILY) -Iboards/pc
+PC_SOURCES := $(filter-out kernel/ramfb.c kernel/input.c kernel/virtio_gpu.c kernel/qemu_board.c \
+                kernel/protection/block.c kernel/protection/entropy.c kernel/net/virtio_net.c \
+                kernel/audio/virtio_snd.c,$(X64_SOURCES)) \
+    kernel/protection/emmc_store.c $(wildcard boards/pc/*.c)
+PC_OBJECTS := $(patsubst %.c,build/pc-x64/%.o,$(PC_SOURCES)) \
+    $(patsubst %,build/pc-x64/arch/x64/%.o,boot entry)
+build/pc-x64/%.o: %.c Makefile tools/build.mk
+	@mkdir -p $(@D)
+	$(X64_CC) $(PC_FLAGS) -c $< -o $@
+build/pc-x64/%.o: %.S Makefile tools/build.mk
+	@mkdir -p $(@D)
+	$(X64_CC) $(PC_FLAGS) -c $< -o $@
+build/pc-x64/kernel.elf: $(PC_OBJECTS) arch/x64/kernel.ld
+	$(X64_CC) $(PC_FLAGS) -nostdlib -Wl,-T,arch/x64/kernel.ld,-e,uefi_start,-Map,$(@:.elf=.map),--build-id=none,-z,noexecstack,-z,max-page-size=4096 $(PC_OBJECTS) -lgcc -o $@
+
+# SOS2's UEFI loader (boot/uefi): a position-independent ELF that
+# tools/elf2efi.py turns into the PE32+ EFI application on the stick. Calls
+# into the firmware use Microsoft's convention (boot/uefi/efi.h).
+UEFI_FLAGS := -std=c11 -O2 -g -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-stack-protector \
+    -fpie -mno-red-zone -mgeneral-regs-only -m64 -march=x86-64-v2 -fno-unwind-tables \
+    -fno-asynchronous-unwind-tables -Wall -Wextra -Werror -MMD -MP -Iinclude/boot -Iboot/uefi
+UEFI_OBJECTS := build/pc-x64/boot/uefi/loader.o
+build/pc-x64/boot/uefi/%.o: boot/uefi/%.c Makefile tools/build.mk
+	@mkdir -p $(@D)
+	$(X64_CC) $(UEFI_FLAGS) -c $< -o $@
+build/pc-x64/loader.elf: $(UEFI_OBJECTS) boot/uefi/loader.ld
+	$(X64_PREFIX)ld -pie --no-dynamic-linker -z text -z noexecstack -z max-page-size=4096 \
+	    -T boot/uefi/loader.ld -Map $(@:.elf=.map) -o $@ $(UEFI_OBJECTS)
+build/pc-x64/BOOTX64.EFI: build/pc-x64/loader.elf tools/elf2efi.py
+	$(PYTHON) tools/elf2efi.py $< $@
+
 # The Galaxy Tab A7 Lite (SM-T220): the arm64 kernel with the tablet's
 # interrupt controller, LK's framebuffer and its watchdog, its eMMC in place
 # of virtio's disk (boards/gta7lite), and the phone's CPU-jitter randomness.
@@ -166,5 +224,5 @@ build/host/fs-image: tools/fs_image.c include/apps.h include/runtime_files.h thi
 	@mkdir -p $(@D)
 	$(HOST_CC) $(HOST_CFLAGS) -Iinclude -Ithird_party/littlefs -DLFS_CONFIG=sos2_lfs_config.h -DSOS2_LFS_HOST tools/fs_image.c third_party/littlefs/lfs.c -o $@
 
--include $(QEMU_OBJECTS:.o=.d) $(PHONE_OBJECTS:.o=.d) $(ARM64_OBJECTS:.o=.d) $(GTA7LITE_OBJECTS:.o=.d) \
-    $(NEXUS5_OBJECTS:.o=.d)
+-include $(QEMU_OBJECTS:.o=.d) $(PHONE_OBJECTS:.o=.d) $(ARM64_OBJECTS:.o=.d) $(X64_OBJECTS:.o=.d) $(GTA7LITE_OBJECTS:.o=.d) \
+    $(NEXUS5_OBJECTS:.o=.d) $(PC_OBJECTS:.o=.d) $(UEFI_OBJECTS:.o=.d)

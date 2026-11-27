@@ -23,6 +23,10 @@
  * bank below it holds the boot data and the firmware. */
 #define SOS2_ARENA_START 0x40000000
 #define SOS2_ARENA_END   0x80000000
+#elif defined(__x86_64__)
+/* QEMU's microvm: RAM from address 0, the page pool below 4 GiB. */
+#define SOS2_RAM_START 0x00000000
+#define SOS2_RAM_END   0x100000000ull
 #else
 #define SOS2_RAM_START 0x40000000
 #ifdef __aarch64__

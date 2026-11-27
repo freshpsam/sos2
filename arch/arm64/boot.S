@@ -89,7 +89,7 @@ el1_entry:
     msr     sctlr_el1, x1
     isb
     cbnz    x20, secondary_stacks
-    ldr     x0, =arm_cpus
+    ldr     x0, =cpu_records
     msr     tpidr_el1, x0       /* This CPU's record. */
     ldr     x0, =arm_process_vectors
     msr     vbar_el1, x0

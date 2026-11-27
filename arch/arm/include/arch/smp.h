@@ -7,19 +7,19 @@
 #ifndef __ASSEMBLER__
 #include <stdint.h>
 
-struct arm_cpu;
+struct cpu_record;
 
 /* Fixed 32-byte records arch/arm/boot.S reads with translation off on a
  * secondary CPU's first entry: its MPIDR affinity, its record, and the tops of
  * its SVC, IRQ, abort and undefined-mode stacks. */
 struct cpu_boot_record {
     uint32_t mpidr;
-    struct arm_cpu *cpu;
+    struct cpu_record *cpu;
     uintptr_t svc, irq, abt, und;
     uint32_t reserved[2];
 };
 
-/* stack: the CPU's ARM_CPU_STACK_BYTES; each mode has two pages, the lower one
+/* stack: the CPU's CPU_STACK_BYTES; each mode has two pages, the lower one
  * an unmapped guard (arch/arm/mmu.c). */
 #define CPU_BOOT_RECORD(id, cpu, stack) \
     ((struct cpu_boot_record){(id), \

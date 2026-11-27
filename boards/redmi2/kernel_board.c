@@ -4,8 +4,8 @@
 #include "page_host.h"
 #include "haptics.h"
 #include "kernel_io.h"
-#include "arm_machine.h"
-#include "arm_smp.h"
+#include "machine.h"
+#include "smp.h"
 #include "phone_input.h"
 #include "redmi2_power.h"
 #include "redmi2_startup.h"
@@ -185,7 +185,7 @@ void board_standby_sleep(void) {
             chip_slept = false;
             redmi2_idle_devices_wake();
         }
-        arm_cpu_sleep_us(sleep_us);
+        cpu_sleep_us(sleep_us);
     }
     redmi2_idle_devices_poll();
     if (sleep_us == STANDBY_IDLE_US) standby_key_check();

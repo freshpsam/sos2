@@ -12,29 +12,40 @@ import arch
 
 ROOT = Path(__file__).resolve().parents[1]
 
-HELP = """SOS2 — native ARM web desktop
+HELP = """SOS2 — native web desktop
   make                 Build the QEMU kernel and storage tools
   make fetch           Download pinned engine dependencies and Adreno firmware
+                       (ARCH=x64: and the toolchain's sources)
+  make toolchain       Build the x86_64-elf GCC into .tools/x86_64-elf
+                       (ARCH=x64 only)
   make engine          Build native WebKit and its resource bundle (JOBS=8)
   make run             Launch the browser in QEMU
   make phone           Package Redmi 2 boot.img, the installed system and the
                        app packages; never accesses the phone
   make publish         Push each built device's installed system, update and
-                       apps to GitHub Pages (PUBLISH=redmi2, gta7lite or
-                       nexus5: one)
+                       apps to GitHub Pages (PUBLISH=redmi2, gta7lite, nexus5
+                       or x64: one)
   make tablet          Package the Galaxy Tab A7 Lite's boot image and installed
                        system (arm64); never accesses the tablet
   make nexus5          Package the Nexus 5's RAM boot image, installed system
                        and app packages (ARM32); never accesses the phone
+  make pc              Package a PC's USB stick image, installed system and
+                       app packages (x64); never writes a stick
+  make pc-run          Start that stick on QEMU's PC (q35 with OVMF)
   make clean           Delete build/ entirely, including downloads, caches and disks
   make help            Show this list
 
-ARCH=arm32 (default) or arm64: build and run QEMU's ARM or AArch64 system;
-          phone and nexus5 set ARM32 (the Redmi 2, the Nexus 5), tablet arm64
-run/phone: STORAGE=ram (default) or persistent; ENGINE=path/to/native-web.bundle
+ARCH=arm32 (default), arm64 or x64: build and run QEMU's ARM, AArch64 or
+          x64 (microvm) system; phone and nexus5 set ARM32 (the Redmi 2,
+          the Nexus 5), tablet arm64, pc and pc-run x64
+run/phone/pc: STORAGE=ram (default) or persistent; ENGINE=path/to/native-web.bundle
+pc-run:   RUN_ARGS='--pointer mouse' a relative USB mouse; '--accel tcg',
+          '--cpus N' and '--audio' as for run
 run:      ENGINE=none opens an empty desktop
           Four CPUs by default; RUN_ARGS='--cpus 1' selects a single CPU
           RUN_ARGS='--graphics virtio-gpu' selects experimental GPU display
+          (x64's default: its microvm has no RAM framebuffer)
+          RUN_ARGS='--accel tcg' emulates the x64 CPU instead of KVM
           RUN_ARGS='--graphics virgl' adds GPU composition and retained textures
           RUN_ARGS='--jsc useDFGJIT=false' sets JavaScriptCore options
           (useJIT=false: interpreter only; useDFGJIT=false: up to the baseline JIT)
@@ -172,6 +183,27 @@ def tablet(engine):
     run(*args)
 
 
+def pc(engine, storage):
+    """A PC's USB stick (tools/package_pc.py): STORAGE=persistent keeps data
+    on the stick, as an installed system does; the installed system for make
+    publish and the x64 apps go beside it."""
+    args = [sys.executable, ROOT / 'tools/package_pc.py',
+            '--kernel', ROOT / 'build/pc-x64/kernel.elf', '--loader', ROOT / 'build/pc-x64/BOOTX64.EFI',
+            '--resources', engine, '--release', release_name(),
+            '--storage', 'installed' if storage == 'persistent' else 'ram',
+            '--output-dir', ROOT / 'build/pc', '--install-dir', ROOT / 'build/pc-install',
+            '--apps-dir', ROOT / 'build/apps-x64']
+    run(*args)
+
+
+def pc_run(extra):
+    stick = ROOT / 'build/pc/sos2-pc.img'
+    if not stick.is_file():
+        raise OSError('no PC stick yet; run make pc')
+    run(sys.executable, ROOT / 'tools/run_qemu.py', '--arch', 'x64', '--machine', 'pc', '--stick', stick,
+        *extra)
+
+
 def nexus5(engine):
     args = [sys.executable, ROOT / 'tools/package_nexus5.py',
             '--kernel', ROOT / 'build/nexus5-arm32/kernel.img',
@@ -194,15 +226,16 @@ def nexus5(engine):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('help', 'clean', 'run', 'phone', 'publish', 'tablet', 'nexus5'))
+    parser.add_argument('command', choices=('help', 'clean', 'run', 'phone', 'publish', 'tablet', 'nexus5', 'pc',
+                                            'pc-run'))
     parser.add_argument('--engine', default=f'build/native-webkit{arch.SUFFIX}/native-web.bundle')
     parser.add_argument('--storage', choices=('ram', 'persistent'), default='ram')
     argv = sys.argv[1:]
     split = argv.index('--') if '--' in argv else len(argv)
     args = parser.parse_args(argv[:split])
     extra = argv[split + 1:]
-    if extra and args.command != 'run':
-        parser.error('additional launcher options are only supported by run')
+    if extra and args.command not in ('run', 'pc-run'):
+        parser.error('additional launcher options are only supported by run and pc-run')
     if args.command == 'help':
         print(HELP, end='')
         return
@@ -215,6 +248,14 @@ def main():
         parser.error('the Nexus 5 runs ARM32: nexus5 needs ARCH=arm32')
     if not arch.ARM64 and args.command == 'tablet':
         parser.error('the Galaxy Tab A7 Lite runs AArch64: tablet needs ARCH=arm64')
+    if not arch.X64 and args.command in ('pc', 'pc-run'):
+        parser.error(f'a PC runs x64: {args.command} needs ARCH=x64')
+    if args.command == 'pc-run':
+        try:
+            pc_run(extra)
+        except (OSError, subprocess.CalledProcessError) as error:
+            parser.exit(1, str(error) + '\n')
+        return
     if args.command == 'publish':
         try:
             devices = os.environ.get('PUBLISH', '').split()
@@ -223,7 +264,7 @@ def main():
             parser.exit(1, str(error) + '\n')
         return
     engine = None if args.engine == 'none' else ROOT / args.engine
-    if args.command in ('phone', 'tablet', 'nexus5') and engine is None:
+    if args.command in ('phone', 'tablet', 'nexus5', 'pc') and engine is None:
         parser.error(f'{args.command} requires an engine bundle; run make engine first')
     if engine is not None and not engine.is_file():
         parser.error('engine bundle is missing; run make engine or set ENGINE to an existing bundle')
@@ -237,6 +278,8 @@ def main():
             tablet(engine)
         elif args.command == 'nexus5':
             nexus5(engine)
+        elif args.command == 'pc':
+            pc(engine, args.storage)
         else:
             phone(engine, args.storage)
     except (OSError, subprocess.CalledProcessError) as error:

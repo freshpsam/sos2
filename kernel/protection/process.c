@@ -13,8 +13,8 @@
 #include "entropy.h"
 #include "network.h"
 #include "audio.h"
-#include "arm_machine.h"
-#include "arm_smp.h"
+#include "machine.h"
+#include "smp.h"
 #include "kernel_io.h"
 #include "boot_progress.h"
 #include "system_update.h"
@@ -45,8 +45,8 @@ struct memory_job {
 };
 
 struct thread {
-    struct arm_context context;
-    struct arm_runtime_context runtime;
+    struct user_context context;
+    struct user_runtime runtime;
     enum thread_state state;
     uint32_t id;
     user_ptr stack;
@@ -126,7 +126,7 @@ static unsigned next_cpu = 1;
 static struct {
     struct process *process;
     struct thread *thread;
-} dispatched[ARM_CPU_MAX];
+} dispatched[CPU_MAX];
 
 static bool continue_slice;
 static uint64_t user_us;
@@ -212,6 +212,11 @@ static bool spawn(struct process *p, uint32_t pid, const struct app *app) {
     p->threads[0].context.r[0] = 0;
     p->threads[0].context.r[1] = pid;
     p->threads[0].context.r[2] = options;
+#ifdef __x86_64__
+    /* r10: the counter's frequency, which x64 user code cannot read
+     * (sdk/runtime/start.S). */
+    p->threads[0].context.r[3] = arch_counter_frequency();
+#endif
 
     return true;
 failed:
@@ -229,10 +234,10 @@ bool process_init(struct platform_devices *devices, uintptr_t dtb) {
     apps_init();
     page_host_redraw();
     boot_progress_report(BOOT_MEMORY, 0, 0);
-    if (!arm_machine_init(devices) || !vm_init(devices, dtb)) return false;
-    if (!arm_timer_init(&arm_machine_get()->timer)) panic(arm_timer_error());
-    arm_runtime_init();
-    arm_smp_init(devices);
+    if (!machine_init(devices) || !vm_init(devices, dtb)) return false;
+    if (!timer_init(&machine_get()->timer)) panic(timer_error());
+    user_runtime_init();
+    smp_init(devices);
     boot_progress_report(BOOT_STORAGE, 0, 0);
     fs_init(devices);
     boot_progress_report(BOOT_SECURITY, 0, 0);
@@ -241,7 +246,7 @@ bool process_init(struct platform_devices *devices, uintptr_t dtb) {
     network_init(devices);
     audio_init(devices);
     boot_progress_report(BOOT_CLOCK, 0, 0);
-    const struct system_clock_ops clock = {arm_rtc_read, arm_rtc_kind()};
+    const struct system_clock_ops clock = {rtc_read, rtc_kind()};
     system_clock_init(&clock);
     battery_init();
     battery_service(0); /* First bus setup/sample belongs to the loading screen. */
@@ -294,8 +299,8 @@ static unsigned wake_word(struct process *p, user_ptr address, unsigned count) {
 }
 
 /* SYS_THREAD_CONTEXT's struct user_thread_context: the saved registers and,
- * on arm64, the SIMD and floating-point state, which garbage collectors also
- * scan for pointers. */
+ * on the 64-bit systems, the SIMD and floating-point state, which garbage
+ * collectors also scan for pointers. */
 static bool copy_thread_context(struct process *p, user_ptr address, const struct thread *t) {
 #ifdef __aarch64__
     struct user_thread_context out;
@@ -306,6 +311,17 @@ static bool copy_thread_context(struct process *p, user_ptr address, const struc
     memcpy(out.v, t->runtime.v, sizeof(out.v));
     out.fpsr = t->runtime.fpsr;
     out.fpcr = t->runtime.fpcr;
+    return vm_copy_to_user(&p->space, address, &out, sizeof(out));
+#elif defined(__x86_64__)
+    /* XMM0-15 and MXCSR from FXSAVE's image (zero for a thread never saved). */
+    struct user_thread_context out = {0};
+    _Static_assert(sizeof(out.r) + 3 * sizeof(out.sp) == sizeof(t->context),
+                   "thread context layout");
+    memcpy(&out, &t->context, sizeof(t->context));
+    if (t->runtime.valid) {
+        memcpy(out.xmm, t->runtime.fxsave + 160, sizeof(out.xmm));
+        memcpy(&out.mxcsr, t->runtime.fxsave + 24, sizeof(out.mxcsr));
+    }
     return vm_copy_to_user(&p->space, address, &out, sizeof(out));
 #else
     _Static_assert(sizeof(struct user_thread_context) == sizeof(t->context),
@@ -512,8 +528,8 @@ static void syscall(struct process *p) {
             break;
         case SYS_GETPID: r[0] = p->pid; break;
         case SYS_CPU_COUNT: {
-            unsigned mask = arm_smp_online(), count = 0;
-            for (unsigned i = 0; i < ARM_CPU_MAX; ++i)
+            unsigned mask = smp_online(), count = 0;
+            for (unsigned i = 0; i < CPU_MAX; ++i)
                 if (mask & (1u << i)) ++count;
             /* CPU 0 is reserved for services when worker CPUs are available. */
             r[0] = count > 1 ? count - 1 : 1;
@@ -863,7 +879,7 @@ static bool quiescence_pending(const struct process *p) {
     return false;
 }
 
-static void handle_trap(const struct arm_trap *trap, uint64_t elapsed) {
+static void handle_trap(const struct cpu_trap *trap, uint64_t elapsed) {
     /* All syscalls and mutable kernel services run on CPU 0. The worker has
      * switched to the kernel root before handing this context back to us. */
     continue_slice = false;
@@ -1187,9 +1203,9 @@ bool process_reclaiming(void) {
 }
 
 static bool collect(unsigned cpu) {
-    const struct arm_cpu *result = arm_cpu_result(cpu);
+    const struct cpu_record *result = cpu_result(cpu);
     if (!result) {
-        if (arm_cpu_failed(cpu)) panic("secondary CPU kernel exception");
+        if (cpu_failed(cpu)) panic("secondary CPU kernel exception");
         return false;
     }
     struct process *p = dispatched[cpu].process;
@@ -1211,7 +1227,7 @@ static bool collect(unsigned cpu) {
         t->resume = continue_slice && p->state == RUNNABLE && t->state == T_READY && !t->suspended;
         if (p->state != RUNNABLE) stop(p);
     }
-    arm_cpu_release(cpu);
+    cpu_release(cpu);
     return true;
 }
 
@@ -1257,7 +1273,7 @@ static struct thread *next_ready(struct process *p, uint64_t now) {
 }
 
 static void dispatch(unsigned cpu, uint64_t now) {
-    if (!arm_cpu_idle(cpu)) return;
+    if (!cpu_idle(cpu)) return;
     unsigned count = 0;
     for (struct process *p = processes; p; p = p->next) ++count;
     for (unsigned checked = 0; checked < count; ++checked) {
@@ -1278,7 +1294,7 @@ static void dispatch(unsigned cpu, uint64_t now) {
         dispatched[cpu].thread = t;
         now = time_us();
         unsigned budget = now < t->slice_deadline ? (unsigned)(t->slice_deadline - now) : 1;
-        arm_cpu_submit(cpu, &p->space, &t->context, &t->runtime, budget);
+        cpu_submit(cpu, &p->space, &t->context, &t->runtime, budget);
         return;
     }
 }
@@ -1287,11 +1303,11 @@ static void dispatch(unsigned cpu, uint64_t now) {
  * (first 0), else the workers in turn from first. */
 static void dispatch_idle(unsigned first) {
     if (frozen) return;
-    unsigned cpus = first ? ARM_CPU_MAX - 1 : 1, order[ARM_CPU_MAX];
+    unsigned cpus = first ? CPU_MAX - 1 : 1, order[CPU_MAX];
     bool idle = false;
     for (unsigned i = 0; i < cpus; ++i) {
-        order[i] = first ? 1 + (first - 1 + i) % (ARM_CPU_MAX - 1) : 0;
-        idle = idle || arm_cpu_idle(order[i]);
+        order[i] = first ? 1 + (first - 1 + i) % (CPU_MAX - 1) : 0;
+        idle = idle || cpu_idle(order[i]);
     }
     if (!idle) return;
     uint64_t now = time_us(), epoch = vm_epoch();
@@ -1309,9 +1325,9 @@ void process_freeze(bool freeze) { frozen = freeze; }
 /* A turn of the loop is 20-40 us and a thread waited for one at each end of
  * every system call, 5% of YouTube's main thread on the Nexus 5. */
 void process_turnaround(void) {
-    if (arm_smp_online() == 1) return; /* CPU 0 runs slices only in process_step */
+    if (smp_online() == 1) return; /* CPU 0 runs slices only in process_step */
     bool collected = false;
-    for (unsigned cpu = 1; cpu < ARM_CPU_MAX; ++cpu) collected = collect(cpu) || collected;
+    for (unsigned cpu = 1; cpu < CPU_MAX; ++cpu) collected = collect(cpu) || collected;
     if (!collected) return;
     for (struct process *p = processes; p; p = p->next) finish_quiescent(p);
     dispatch_idle(next_cpu);
@@ -1319,7 +1335,7 @@ void process_turnaround(void) {
 
 void process_step(void) {
     process_turnaround();
-    for (unsigned cpu = 0; cpu < ARM_CPU_MAX; ++cpu) collect(cpu);
+    for (unsigned cpu = 0; cpu < CPU_MAX; ++cpu) collect(cpu);
     for (struct process *p = processes; p; p = p->next) finish_quiescent(p);
     memory_step();
     network_poll();
@@ -1331,12 +1347,12 @@ void process_step(void) {
         random_ready = entropy_available();
         page_host_entropy_status(random_ready, entropy_error());
     }
-    if (arm_smp_online() == 1) {
+    if (smp_online() == 1) {
         dispatch_idle(0);
         collect(0);
         return;
     }
     unsigned first = next_cpu;
-    next_cpu = next_cpu % (ARM_CPU_MAX - 1) + 1;
+    next_cpu = next_cpu % (CPU_MAX - 1) + 1;
     dispatch_idle(first);
 }

@@ -3,9 +3,12 @@
 #include <stdint.h>
 /* For the jitter-entropy collector's guards; kernel C uses no FP registers.
  * The callee-saved registers, stack pointer and return address: r4-r11, sp
- * and lr on ARM32, x19-x30 and sp on arm64. */
+ * and lr on ARM32, x19-x30 and sp on arm64, rbx, rbp, r12-r15, rsp and rip on
+ * x64. */
 #ifdef __aarch64__
 typedef uint64_t jmp_buf[14];
+#elif defined(__x86_64__)
+typedef uint64_t jmp_buf[8];
 #else
 typedef uint32_t jmp_buf[10];
 #endif

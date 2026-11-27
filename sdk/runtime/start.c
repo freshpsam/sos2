@@ -11,11 +11,11 @@ void _init(void) { }
 
 void _fini(void) { }
 
-#ifdef __aarch64__
-/* AArch64 C++ unwinding finds .eh_frame through libgcc's registry, which
- * crtbegin.o would fill; programs link without it (sdk/runtime/linker-arm64.ld
- * ends the section with a zero terminator). The object is libgcc's struct
- * object. */
+#ifndef __arm__
+/* C++ unwinding without ARM32's EHABI finds .eh_frame through libgcc's
+ * registry, which crtbegin.o would fill; programs link without it (the 64-bit
+ * linker scripts, such as sdk/runtime/linker-arm64.ld, end the section with a
+ * zero terminator). The object is libgcc's struct object. */
 extern char __eh_frame_start[];
 extern void __register_frame_info(const void *, void *) __attribute__((weak));
 static void *eh_object[16];
@@ -43,8 +43,11 @@ const char *sos2_engine_options(void) { return engine_options; }
 
 /* x2 (r2): a web page's sos2.jsc= boot argument (include/user_abi.h). */
 void sos2_start(unsigned mode, unsigned pid, const char *options) {
+#ifdef __x86_64__
+    sos2_threads_bootstrap();
+#endif
     engine_options = options;
-#ifdef __aarch64__
+#ifndef __arm__
     if (__register_frame_info) __register_frame_info(__eh_frame_start, eh_object);
 #endif
     (void)mode;

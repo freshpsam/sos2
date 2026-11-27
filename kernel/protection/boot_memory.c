@@ -16,7 +16,7 @@ static struct memory_region obstacle(const struct platform_devices *d, unsigned 
 
 bool boot_memory_available(const struct platform_devices *d, uint64_t start, uint64_t size,
                            uintptr_t dtb, uintptr_t ks, uintptr_t ke, bool avoid_initrd) {
-#ifdef __aarch64__
+#ifdef __LP64__
     /* Up to 4 GiB inclusive: the Galaxy Tab A7 Lite's RAM ends there. */
     const uint64_t limit = 1ull << 32;
     if (!size || start & 4095 || start >= limit || size > limit - start || ke <= ks ||
@@ -106,7 +106,7 @@ bool phone_resource_arena(const struct platform_devices *d, uintptr_t dtb, uintp
 }
 #endif
 
-#ifdef __aarch64__
+#ifdef __LP64__
 /* Calls visit for each free stretch of RAM below 4 GiB, clear of the
  * firmware's reservations, the kernel, the DTB, the framebuffer, the initrd
  * and `extra`; false on an impossible region. */

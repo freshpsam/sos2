@@ -23,6 +23,23 @@ static inline sos2_status call4(unsigned number, sos2_word a, sos2_word b, sos2_
                      : "memory", "cc");
     return (sos2_status)x0;
 }
+#elif defined(__x86_64__)
+typedef uintptr_t sos2_word;
+typedef intptr_t sos2_status;
+
+/* syscall: the number in rax, arguments in rdi, rsi, rdx and r10, the result
+ * in rdi (SOS2's own convention: arch/x64/include/arch/context.h). SYSCALL
+ * itself overwrites rcx and r11. */
+static inline sos2_status call4(unsigned number, sos2_word a, sos2_word b, sos2_word c,
+                                sos2_word d) {
+    register sos2_word r10 __asm__("r10") = d;
+    sos2_word rax = number;
+    __asm__ volatile("syscall"
+                     : "+D"(a), "+S"(b), "+d"(c), "+r"(r10), "+a"(rax)
+                     :
+                     : "rcx", "r11", "memory", "cc");
+    return (sos2_status)a;
+}
 #else
 typedef uint32_t sos2_word;
 typedef int32_t sos2_status;

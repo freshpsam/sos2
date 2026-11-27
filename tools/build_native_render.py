@@ -138,7 +138,7 @@ def ffmpeg(source,output,jobs):
     # the WebCore port), which parses MSE's MP4 itself: H.264 and AAC with
     # their NEON code, swscale for frames and swresample for SYS_AUDIO.
     configure=[str(source/'configure'),'--prefix='+str(SYSROOT),'--enable-cross-compile','--target-os=none',
-        '--arch='+('aarch64' if arch.ARM64 else 'arm'),'--cc='+arch.tool('gcc'),'--ar='+arch.tool('ar'),
+        '--arch='+('aarch64' if arch.ARM64 else 'x86_64' if arch.X64 else 'arm'),'--cc='+arch.tool('gcc'),'--ar='+arch.tool('ar'),
         '--ranlib='+arch.tool('ranlib'),'--nm='+arch.tool('nm'),'--strip='+arch.tool('strip'),
         '--extra-cflags='+' '.join([*sdk_flags(),'-I'+str(output/'include')]),
         # Link tests need the CPU flags too: they pick ARM32's hard-float libgcc.
@@ -146,9 +146,13 @@ def ffmpeg(source,output,jobs):
         '--extra-libs='+' '.join(link_libraries()),'--enable-static','--disable-shared','--disable-debug',
         '--disable-everything','--disable-programs','--disable-doc','--disable-network','--disable-autodetect',
         '--disable-avformat','--disable-avdevice','--disable-avfilter','--enable-swscale','--enable-swresample',
-        '--enable-decoder=h264,aac','--enable-pthreads','--disable-runtime-cpudetect',
+        '--enable-decoder=h264,aac','--enable-pthreads',
         # The Cortex-A53 has NEON and nothing later (no SVE, dot product or I8MM).
-        *(['--disable-dotprod','--disable-i8mm','--disable-sve','--disable-sve2'] if arch.ARM64 else ['--enable-neon'])]
+        # x64's assembly (NASM) is position-independent, as programs are
+        # linked above 4 GiB, and picks its SIMD at run time: CPUID shows no
+        # AVX while the kernel leaves its state off (arch/x64/cpu.c).
+        *(['--disable-runtime-cpudetect','--disable-dotprod','--disable-i8mm','--disable-sve','--disable-sve2'] if arch.ARM64
+          else ['--enable-pic'] if arch.X64 else ['--disable-runtime-cpudetect','--enable-neon'])]
     # The SDK's -isystem sysroot puts Newlib's <stdatomic.h>, FreeBSD's
     # struct-wrapped atomics, ahead of GCC's C11 one, which FFmpeg needs.
     compiler=subprocess.run([arch.tool('gcc'),'-print-file-name=include'],check=True,capture_output=True,text=True)

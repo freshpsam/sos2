@@ -4,9 +4,11 @@
 #include "platform.h"
 #include "LzmaDec.h"
 /* Only where the loader hands the resources over as a SORZ ramdisk: the
- * phones and arm64 (runtime_files.c). */
-#if defined(SOS2_PHONE) || defined(__aarch64__)
+ * phones and the 64-bit systems (runtime_files.c). */
+#if defined(SOS2_PHONE) || defined(__LP64__)
+#ifndef __x86_64__
 #include "arm_cache.h"
+#endif
 
 static uint32_t word(const unsigned char *p) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
@@ -234,10 +236,11 @@ static bool boot_bundle_decode(const void *source, size_t size, void *out, size_
     return crc32(out, expanded, BOOT_VERIFY_ENGINE) == word(p + 24);
 }
 
-#ifdef __aarch64__
-/* The ramdisk lies wherever the DTB says (QEMU's -initrd, an Android boot
- * image's ramdisk). Its output goes to the smallest free stretch of RAM that
- * holds it, decoded through arch/arm64/boot_cache.c's cached mapping. */
+#ifdef __LP64__
+/* The ramdisk lies wherever the DTB (or x64's start info) says (QEMU's
+ * -initrd, an Android boot image's ramdisk). Its output goes to the smallest
+ * free stretch of RAM that holds it, decoded on arm64 through
+ * arch/arm64/boot_cache.c's cached mapping; x64's caches are always on. */
 bool boot_bundle_prepare(struct platform_devices *d, uintptr_t dtb, uintptr_t ks, uintptr_t ke) {
     boot_progress_report(BOOT_CHECK_ENGINE, 0, 0);
     if (!d->has_initrd_start || !d->has_initrd_end || d->initrd_end <= d->initrd_start)
@@ -247,12 +250,17 @@ bool boot_bundle_prepare(struct platform_devices *d, uintptr_t dtb, uintptr_t ks
     const unsigned char *source = (const void *)(uintptr_t)d->initrd_start;
     uintptr_t destination;
     if (!header(source, size) ||
-        !boot_memory_resources(d, dtb, ks, ke, word(source + 16), &destination) ||
-        !arm_boot_cache_begin(d, dtb, (uintptr_t)source, size, destination, word(source + 16)))
+        !boot_memory_resources(d, dtb, ks, ke, word(source + 16), &destination)
+#ifndef __x86_64__
+        || !arm_boot_cache_begin(d, dtb, (uintptr_t)source, size, destination, word(source + 16))
+#endif
+    )
         return false;
     bool decoded = boot_bundle_decode(source, size, (void *)destination, word(source + 16));
+#ifndef __x86_64__
     /* This includes failure paths: no dirty output or cached alias survives. */
     arm_boot_cache_end();
+#endif
     if (!decoded) return false;
     d->initrd_start = destination;
     d->initrd_end = destination + word(source + 16);

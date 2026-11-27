@@ -39,6 +39,9 @@ static const struct device {
 } devices[] = {
 #ifdef __aarch64__
     {"gta7litewifi", "https://freshpsam.github.io/sos2/gta7lite/sos2-gta7lite.update", "tablet"},
+#elif defined(__x86_64__)
+    /* PCs; QEMU's microvm checks it too. */
+    {"x64", "https://freshpsam.github.io/sos2/x64/sos2-x64.update", "PC"},
 #else
     {"redmi2-wt88047", "https://freshpsam.github.io/sos2/redmi2/sos2-redmi2.update", "phone"},
     {"lge-hammerhead", "https://freshpsam.github.io/sos2/nexus5/sos2-nexus5.update", "phone"},
@@ -46,6 +49,8 @@ static const struct device {
 };
 #ifdef __aarch64__
 #define APPS_URL "https://freshpsam.github.io/sos2/apps-arm64/"
+#elif defined(__x86_64__)
+#define APPS_URL "https://freshpsam.github.io/sos2/apps-x64/"
 #else
 #define APPS_URL "https://freshpsam.github.io/sos2/apps/"
 #endif
@@ -709,7 +714,11 @@ static bool request(const char *url, enum sink sink) {
 static bool network_ready(void) {
     struct user_net_info network;
     if (sos2_net_info(&network) || !(network.flags & NET_ADDRESS)) {
+#ifdef __x86_64__
+        say(true, "Connect to a network first");
+#else
         say(true, "Connect to Wi-Fi first");
+#endif
         render();
         return false;
     }

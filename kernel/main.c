@@ -7,6 +7,7 @@
 #include "page_host.h"
 #include "battery.h"
 #include "haptics.h"
+#include "machine.h"
 static struct framebuffer screen;
 
 /* Standby: a power-button tap turns the screen off, cancels input, hides and
@@ -44,13 +45,20 @@ static void leave_standby(void) {
 }
 
 void kernel_main(const void *dtb) {
+    static struct platform_devices devices;
+#ifdef __x86_64__
+    /* x64 has QEMU's PVH start info in place of a device tree
+     * (arch/x64/machine.c), copied out here: no DTB stays in memory. */
+    uintptr_t dtb_address = 0;
+    if (!machine_discover(dtb, &devices)) panic("invalid boot information");
+#else
     /* Board RAM window: verify the maximum DTB span before parsing its header. */
     uintptr_t dtb_address = (uintptr_t)dtb;
     if ((dtb_address & 7) || (uint64_t)dtb_address - SOS2_RAM_START >
                                  (uint64_t)SOS2_RAM_END - SOS2_RAM_START - 2 * 1024 * 1024)
         panic("DTB outside board RAM window");
-    static struct platform_devices devices;
     if (!fdt_discover(dtb, &devices)) panic("invalid device tree");
+#endif
     board_handoff(&devices, dtb_address, &screen);
     board_before_pages(&devices);
     if (!gfx_framebuffer_valid(&screen)) panic("browser framebuffer invalid");

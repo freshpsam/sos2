@@ -1,18 +1,19 @@
 # Architecture
 
-SOS2 is a native ARM kernel with the desktop and drivers built in, for ARM32
-(QEMU and the Redmi 2) or AArch64 (QEMU, and the
-[Galaxy Tab A7 Lite](gta7lite.md) in progress), chosen at build time. Apps are
+SOS2 is a native kernel with the desktop and drivers built in, for ARM32
+(QEMU, the Redmi 2 and the Nexus 5), AArch64 (QEMU and the
+[Galaxy Tab A7 Lite](gta7lite.md)) or [x64](x64.md) (QEMU's microvm,
+and PCs, so far QEMU's), chosen at build time. Apps are
 web pages, plus [native apps](#native-apps). The system's own programs are the
 engine, `/bin/sos2-web`, which runs once per open page, and the
 [updater](#updates), `/bin/sos2-updater`.
 
 ## Processes and CPUs
 
-- Each page or app is a static ARM ELF process in its own address space. The
+- Each page or app is a static ELF process in its own address space. The
   kernel preempts user code every 5 ms; a fault ends only that process, and
   **Close** reclaims even a hung page.
-- Free RAM and, per process, a 544 MiB quota (1 GiB on AArch64) and 64
+- Free RAM and, per process, a 544 MiB quota (1 GiB on the 64-bit systems) and 64
   threads limit what runs. A page left with under 64 MiB, of its quota or of
   free RAM, has WebKit release its caches, decoded images and compiled code
   and collect garbage, again only once it has grown by 32 MiB or has under
@@ -26,7 +27,7 @@ engine, `/bin/sos2-web`, which runs once per open page, and the
   while a stopped page's memory is still coming back, and never one whose
   address was too long to keep. When the last page closes, free memory must
   be back at its post-boot baseline, or the kernel panics.
-- Up to four CPUs run, eight on AArch64. CPU 0 owns the desktop, scheduler,
+- Up to four CPUs run, eight on the 64-bit systems. CPU 0 owns the desktop, scheduler,
   syscalls and drivers; the others run page threads, a page's own threads
   side by side (its GC markers, compiler threads, image decoders and
   workers). Only unmapping or protecting memory and suspending a thread
@@ -41,11 +42,12 @@ engine, `/bin/sos2-web`, which runs once per open page, and the
 
 Page permissions protect kernel and device memory and keep code read-only.
 Writable memory is never executable, except in the engine's JIT window (32 MiB
-on ARM32, 64 MiB on AArch64), which only page processes may map. JavaScriptCore
-maps its whole JIT pool there when a page starts (4 MiB on ARM32, 16 MiB on
-AArch64), writes its code into it and then synchronizes the instruction cache
-(`sos2_icache_sync`). AArch64 user code does that itself; ARM32 user code can't,
-so a system call does it on the calling CPU, which already has the page's
+on ARM32, 64 MiB on the 64-bit systems), which only page processes may map.
+JavaScriptCore maps its whole JIT pool there when a page starts (4 MiB on
+ARM32, 16 MiB on the 64-bit systems), writes its code into it and then
+synchronizes the instruction cache (`sos2_icache_sync`). AArch64 user code
+does that itself, and x64's needs nothing; ARM32 user code can't, so a
+system call does it on the calling CPU, which already has the page's
 mappings, and returns straight to the page.
 User memory and the kernel's code, constants and private data are
 write-back and inner shareable, as Linux sets ARMv7 and AArch64 up. ARM32
@@ -56,20 +58,21 @@ times slower. The kernel's other mutable data is uncached, since devices read
 some of it, except the page allocator's, the network stack's (`kernel/net`,
 `kernel/wifi`, lwIP and the Nexus 5's Wi-Fi driver, which moves data by PIO)
 and the audio mixer's: only CPU 0 uses it, so the linker scripts place it
-with the private data. Free pages are zeroed through their uncached alias in
+with the private data. On x64, whose devices' DMA is coherent, all RAM is
+write-back ([x64](x64.md#memory)). Free pages are zeroed through their uncached alias in
 32-byte bursts, 5.8 GB/s on the Nexus 5 against 1.5 for word stores. Translation tables are cached too, and the MMU walks them
 through the caches, so a TLB miss costs no trip to DRAM: layout-heavy work ran
 36% faster on the Nexus 5.
 Stacks have guard pages, and kernel faults run on stacks of their own, so a
 kernel stack overflow is still reported. Syscalls validate every user buffer,
-and devices never DMA into user memory. AArch64 user space lies above 4 GiB.
+and devices never DMA into user memory. 64-bit user space lies above 4 GiB.
 Read-only ELF segments (the engine's code and constants) are loaded once and
 shared by every page. The engine's isn't even copied: the packager starts it
 on a megabyte of the resources (`tools/package_redmi2.py`), and the kernel
 maps it where it lies. ARM32 maps that block with 1 MiB sections, as it does
 every whole aligned megabyte of a big private mapping (the heaps', the JIT
 pool's) that finds a run of free pages, taken from the pool's top, away from
-single pages; AArch64 maps the shared block with 2 MiB blocks. With 4 KiB
+single pages; the 64-bit systems map the shared block with 2 MiB blocks. With 4 KiB
 pages alone the Nexus 5 spent much of its time walking tables. A private
 section keeps its page table aside, in step, and whatever changes part of it
 (protecting, unmapping) turns it back into that table first
@@ -94,7 +97,8 @@ device tree or resource uses, with the gaps between them withheld, and the
 resources arrive as the initrd. A compressed
 (SORZ) one, as on the tablet, expands at boot into the smallest free stretch
 that holds it, through a temporary cached mapping (`arch/arm64/boot_cache.c`),
-since the data cache is still off.
+since the data cache is still off. On x64, QEMU's PVH start information
+and ACPI do ([x64](x64.md#boot)).
 
 ## Services and SDK
 
@@ -232,7 +236,7 @@ layout the sockets would otherwise go unread until TCP's window closed.
 ## Web platform and rendering
 
 JavaScriptCore compiles page scripts with its baseline and DFG JIT tiers on
-both architectures. SOS2 pins WPE WebKit 2.52.6 to retain the ARMv7 JIT and
+all three architectures. SOS2 pins WPE WebKit 2.52.6 to retain the ARMv7 JIT and
 backports selected upstream security fixes. Each security patch in
 `tools/browser/patches/` identifies its upstream commit. A performance
 patch of SOS2's own (`wpe-2.52.6-native-jsc-profiles.patch`) keeps the LLInt
@@ -413,7 +417,8 @@ through the RPM. Standby draws 6.0 mA, about two weeks on the battery.
 
 ## Time
 
-The kernel's clock (`time_us`) converts the generic timer's count exactly,
+The kernel's clock (`time_us`) converts the generic timer's count (x64's
+TSC, shifted right by 4) exactly,
 multiplying by the frequency's reciprocal, since ARM32 has no 64-bit
 division. Reading the count costs 0.3 µs on the Nexus 5, so CPU 0's main
 loop reads it once a turn (`loop_time_us`), and the loop's periodic checks

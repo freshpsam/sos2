@@ -98,7 +98,7 @@ svc_entry:
     beq     secondary_stacks
     cmp     r9, #2
     beq     cpu0_resume
-    ldr     r0, =arm_cpus
+    ldr     r0, =cpu_records
     mcr     p15, 0, r0, c13, c0, 4  @ TPIDRPRW: privileged per-CPU continuation.
     cps     #0x12
     ldr     sp, =__irq_stack_top
@@ -237,7 +237,7 @@ arm_cpu0_suspend:
     pop     {r4-r12, pc}
 
 cpu0_resume:
-    ldr     r0, =arm_cpus
+    ldr     r0, =cpu_records
     mcr     p15, 0, r0, c13, c0, 4       @ TPIDRPRW: CPU 0's record.
     cps     #0x12
     ldr     sp, =__irq_stack_top

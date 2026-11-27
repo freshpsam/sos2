@@ -13,8 +13,8 @@ bool phone_browser_arena(const struct platform_devices *, uintptr_t dtb, uintptr
 bool phone_resource_arena(const struct platform_devices *, uintptr_t dtb, uintptr_t kernel_start,
                           uintptr_t kernel_end, size_t size, uintptr_t *start);
 #endif
-#ifdef __aarch64__
-/* arm64's page pool: up to BOOT_POOL_REGIONS free stretches of RAM below
+#ifdef __LP64__
+/* A 64-bit system's page pool: up to BOOT_POOL_REGIONS free stretches of RAM below
  * 4 GiB, the largest of at least 1 MiB, in address order and within `span`
  * bytes from the first's start to the last's end; clear of the resources as
  * well (QEMU's loader may place them outside any initrd). How many, or 0. */

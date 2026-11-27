@@ -6,7 +6,9 @@ port) runs as one process per page on SOS2's own kernel, with no Linux, and
 JavaScriptCore's JIT compiles page scripts. The ARM32 system runs in QEMU, on
 the Xiaomi Redmi 2 (MSM8916, WT88047) and on the [Nexus 5](docs/nexus5.md)
 (hammerhead); the AArch64 system runs in QEMU and on the
-[Galaxy Tab A7 Lite](docs/gta7lite.md) (SM-T220).
+[Galaxy Tab A7 Lite](docs/gta7lite.md) (SM-T220), and the
+[x64](docs/x64.md) system in QEMU's microvm and, from a USB stick, on
+QEMU's emulated PC.
 
 The desktop is the browser shell: **WI-FI** and **UPDATES** buttons, an
 address field with **Open** above the open pages, an **Apps** launcher and a
@@ -30,7 +32,12 @@ Needs Linux with Python 3.12+, GNU Make, `arm-none-eabi-` GCC/G++ with C++23
 also needs CMake, Ninja, Meson, Ruby, Perl with JSON::PP, gperf, Bison, flex,
 Python's Mako, pkg-config and patch. `ARCH=arm64` builds and runs the AArch64
 system instead, with `aarch64-none-elf-` GCC/G++ 14.2 (the Arm GNU Toolchain,
-on `PATH` or unpacked in `.tools/aarch64-none-elf`) and `qemu-system-aarch64`.
+on `PATH` or unpacked in `.tools/aarch64-none-elf`) and `qemu-system-aarch64`;
+`ARCH=x64` the x64 system, with the `x86_64-elf-` GCC/G++ 14.2 that
+`make ARCH=x64 toolchain` builds into `.tools/x86_64-elf` (from the sources
+`make ARCH=x64 fetch` downloads),
+`qemu-system-x86_64`, NASM and, for KVM, access to `/dev/kvm`; `make pc` and
+`make pc-run` also need OVMF.
 
 ```sh
 make          # QEMU kernel and filesystem tools
@@ -41,6 +48,8 @@ make phone    # build the phone's boot.img, installed system and app packages
 make publish  # push the installed system and apps to the gh-pages branch
 make tablet   # the Galaxy Tab A7 Lite's kernel, ramdisk and boot.img (arm64)
 make nexus5   # the Nexus 5's boot.img, installed system and apps (arm32)
+make pc       # a PC's USB stick image, installed system and apps (x64)
+make pc-run   # that stick on QEMU's emulated PC (q35 with OVMF)
 ```
 
 Only `make fetch` downloads, and nothing touches a phone or tablet. `make help` lists
@@ -52,8 +61,8 @@ QEMU disk.
 
 ## Source map
 
-- `arch/arm`, `arch/arm64`, `kernel`, `include`: the kernel (ARM32 and
-  AArch64) and the desktop. `kernel/main.c` starts the kernel and runs its
+- `arch/arm`, `arch/arm64`, `arch/x64`, `kernel`, `include`: the kernel
+  (ARM32, AArch64 and x64) and the desktop. `kernel/main.c` starts the kernel and runs its
   main loop, each board's part in its `kernel_board.c`
   (`include/kernel_board.h`), QEMU's in `kernel/qemu_board.c`; the devices
   share the bootloader handoff's checks (`kernel/boot_handoff.c`) and the
@@ -61,6 +70,9 @@ QEMU disk.
 - `boards/redmi2`: the Redmi 2's drivers, their headers and its linker script.
 - `boards/gta7lite`: the Galaxy Tab A7 Lite's drivers: bootloader handoff,
   watchdog, PMIC, touch, eMMC, USB and Wi-Fi.
+- `boards/pc` and `boot/uefi`: a PC's drivers (PCI, xHCI with USB keyboards,
+  mice and the stick, Intel's 82574L, HD Audio, ACPI's power button) and
+  SOS2's UEFI loader.
 - `boards/nexus5`: the Nexus 5's drivers: bootloader handoff, display,
   backlight, touch, PMIC, battery, vibrator, the other cores and the CPU
   clocks, USB, the eMMC, Wi-Fi's SDIO with the BCM4339's firmware, and its
@@ -92,4 +104,6 @@ QEMU disk.
   the tablet's hardware.
 - [Nexus 5](docs/nexus5.md): booting, installing, Wi-Fi, the USB link and
   the hardware.
+- [x64](docs/x64.md): the x64 system in QEMU's microvm and on a
+  PC: its stick, loader and drivers, and what real PCs still need.
 - [Roadmap](docs/roadmap.md): open work.

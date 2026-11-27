@@ -3,7 +3,7 @@
  * Kernel services are serialized on the boot CPU. A user slice is a bounded
  * call, arm_user_run, which saves the kernel's callee-saved registers on
  * SP_EL1 and enters EL0; every exception from EL0 then builds a struct
- * arm_trap (arch/arm64/include/arch/context.h) below them on the same stack,
+ * cpu_trap (arch/arm64/include/arch/context.h) below them on the same stack,
  * calls arm_trap_dispatch and returns from arm_user_run. The kernel runs with
  * D, A, I and F masked, so an exception taken at EL1 is a fault, which
  * arm_trap_dispatch reports, on the CPU's exception stack.
@@ -91,8 +91,8 @@ user_sync:
 
     /* A kernel exception never returns, and the stack that faulted may have
      * overflowed into its guard page: save the trap on this CPU's exception
-     * stack (struct arm_cpu's exception_sp), or on the faulting stack before
-     * arm_smp_init sets one. TPIDRRO_EL0 holds x0 meanwhile, and SP_EL0 the
+     * stack (struct cpu_record's exception_sp), or on the faulting stack before
+     * smp_init sets one. TPIDRRO_EL0 holds x0 meanwhile, and SP_EL0 the
      * faulting SP, which save_frame records as the trap's SP. */
 kernel_exception:
     msr     tpidrro_el0, x0
@@ -122,7 +122,7 @@ dispatch:
     add     sp, sp, #96
     ret
 
-    /* void arm_user_run(struct arm_context *): runs a user slice. */
+    /* void arm_user_run(struct user_context *): runs a user slice. */
     .global arm_user_run
     .type arm_user_run, %function
 arm_user_run:
@@ -135,7 +135,7 @@ arm_user_run:
     stp     x29, x30, [sp, #80]
     mrs     x1, tpidr_el1
     mov     x2, sp
-    str     x2, [x1]            /* struct arm_cpu's kernel_sp */
+    str     x2, [x1]            /* struct cpu_record's kernel_sp */
     clrex
     ldp     x1, x2, [x0, #256]
     msr     elr_el1, x1
@@ -164,9 +164,9 @@ arm_user_run:
 /* Cooperative kernel-only stack switch, with interrupts masked; kernel C is
  * built with general registers only. The frame matches arch_kernel_frame
  * (arch/arm64/include/arch/kernel_switch.h): x19-x30 upwards from SP. */
-    .global arm_kernel_switch
-    .type arm_kernel_switch, %function
-arm_kernel_switch:
+    .global kernel_switch
+    .type kernel_switch, %function
+kernel_switch:
     sub     sp, sp, #96
     stp     x19, x20, [sp, #0]
     stp     x21, x22, [sp, #16]
@@ -185,7 +185,7 @@ arm_kernel_switch:
     ldp     x29, x30, [sp, #80]
     add     sp, sp, #96
     ret
-    .size arm_kernel_switch, .-arm_kernel_switch
+    .size kernel_switch, .-kernel_switch
 
     /* jmp_buf (include/boot/setjmp.h): x19-x30, then SP. */
     .global sos2_boot_setjmp, sos2_boot_longjmp
@@ -217,18 +217,18 @@ sos2_boot_longjmp:
     ret
     .size sos2_boot_longjmp, .-sos2_boot_longjmp
 
-    /* User FP/SIMD state and TLS pointer (struct arm_runtime_context). The
+    /* User FP/SIMD state and TLS pointer (struct user_runtime). The
      * kernel never uses these registers, so they hold the user's between
      * restore and save. */
-    .global arm_runtime_init, arm_runtime_save, arm_runtime_restore
-    .type arm_runtime_init, %function
-arm_runtime_init:
+    .global user_runtime_init, user_runtime_save, user_runtime_restore
+    .type user_runtime_init, %function
+user_runtime_init:
     mov     x0, #(3 << 20)      /* CPACR_EL1.FPEN: no FP/SIMD traps */
     msr     cpacr_el1, x0
     isb
     ret
-    .type arm_runtime_save, %function
-arm_runtime_save:
+    .type user_runtime_save, %function
+user_runtime_save:
     stp     q0, q1, [x0, #0]
     stp     q2, q3, [x0, #32]
     stp     q4, q5, [x0, #64]
@@ -252,8 +252,8 @@ arm_runtime_save:
     mrs     x1, tpidr_el0
     str     x1, [x0, #520]
     ret
-    .type arm_runtime_restore, %function
-arm_runtime_restore:
+    .type user_runtime_restore, %function
+user_runtime_restore:
     ldp     q0, q1, [x0, #0]
     ldp     q2, q3, [x0, #32]
     ldp     q4, q5, [x0, #64]

@@ -1,5 +1,8 @@
 #include "audio.h"
 #include "platform.h"
+#ifdef SOS2_BOARD_PC
+#include "pc.h"
+#endif
 
 /* A fixed table of streams, each with its queue in cached kernel pages from
  * the pool, taken at OPEN and returned at CLOSE or when the process stops.
@@ -57,6 +60,9 @@ void audio_init(const struct platform_devices *devices) {
 #elif defined(SOS2_BOARD_NEXUS5)
     (void)devices;
     online = nexus5_audio_init(&device);
+#elif defined(SOS2_BOARD_PC)
+    (void)devices;
+    online = hda_init(&device);
 #else
     online = virtio_snd_init(devices, &device);
 #endif

@@ -5,8 +5,8 @@
 #include "page_host.h"
 #include "process.h"
 #include "boot_progress.h"
-#include "arm_machine.h"
-#include "arm_smp.h"
+#include "machine.h"
+#include "smp.h"
 #include "gta7lite.h"
 #include "wifi_setup.h"
 #include "wifi_device.h"
@@ -121,5 +121,5 @@ void board_standby_step(struct pointer_event *scratch) { (void)scratch; }
 
 void board_standby_sleep(void) {
     arm_smp_standby_poll();
-    arm_cpu_sleep_us(BOARD_STANDBY_POLL_US);
+    cpu_sleep_us(BOARD_STANDBY_POLL_US);
 }

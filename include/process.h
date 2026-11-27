@@ -3,13 +3,13 @@
 #include "fdt.h"
 #include "arch/context.h"
 
-void arm_runtime_init(void);
-void arm_runtime_save(struct arm_runtime_context *context);
-void arm_runtime_restore(const struct arm_runtime_context *context);
-void arm_user_run(struct arm_context *context);
+void user_runtime_init(void);
+void user_runtime_save(struct user_runtime *context);
+void user_runtime_restore(const struct user_runtime *context);
+void arm_user_run(struct user_context *context);
 /* True when the trap was handled on this CPU and its user context resumes at
  * once (ARM32's SYS_ICACHE_SYNC); otherwise the slice ends. */
-bool arm_trap_dispatch(struct arm_trap *trap);
+bool arm_trap_dispatch(struct cpu_trap *trap);
 bool process_init(struct platform_devices *devices, uintptr_t dtb);
 /* Collect worker completions and dispatch bounded slices between UI iterations.
  * On one CPU, executes one slice locally. Kernel services stay on the boot CPU. */

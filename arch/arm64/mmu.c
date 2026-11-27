@@ -3,10 +3,10 @@
 #include "kernel_io.h"
 #include "boot_memory.h"
 #include "runtime_files.h"
-#include "arm_machine.h"
+#include "machine.h"
 #include "boot_progress.h"
 #include "arm_cache.h"
-#include "arm_smp.h"
+#include "smp.h"
 
 /* VMSAv8-64 stage 1 with 4 KiB pages and 39-bit addresses (TCR_EL1.T0SZ 25):
  * level 1 entries cover 1 GiB, level 2 2 MiB, level 3 one page. Each address
@@ -273,7 +273,7 @@ static void cache_table(pte_t *table) {
 }
 
 bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
-    const struct arm_machine *machine = arm_machine_get();
+    const struct machine *machine = machine_get();
     uintptr_t start = (uintptr_t)__image_start, end = (uintptr_t)__image_end;
     uintptr_t resources = runtime_files_base();
     uint32_t resource_size = runtime_files_size();
@@ -302,7 +302,7 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
             return false;
     }
     for (unsigned i = 0; i < machine->device_count; ++i) {
-        const struct arm_mapping *r = &machine->devices[i];
+        const struct machine_mapping *r = &machine->devices[i];
         if (overlap(start, end, r->start, (uint64_t)r->start + r->size)) return false;
     }
     uint64_t total = 0;
@@ -321,7 +321,7 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
             if (overlap(lower, upper, r->start, r->start + r->size)) return false;
         }
         for (unsigned i = 0; i < machine->device_count; ++i) {
-            const struct arm_mapping *r = &machine->devices[i];
+            const struct machine_mapping *r = &machine->devices[i];
             if (overlap(lower, upper, r->start, (uint64_t)r->start + r->size)) return false;
         }
         total += upper - lower;
@@ -356,16 +356,14 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
     if (resource_size && !kernel_map(resources, resource_size, CACHED | KERNEL_RO | XN))
         return false;
     for (unsigned i = 0; i < machine->device_count; ++i) {
-        const struct arm_mapping *r = &machine->devices[i];
+        const struct machine_mapping *r = &machine->devices[i];
         if (!kernel_map(r->start, r->size, DEVICE | KERNEL_RW | XN)) return false;
     }
     if (fb_size && !kernel_map(fb, fb_size, NORMAL | KERNEL_RW | XN)) return false;
     kernel_unmap((uintptr_t)__stack_guard);
     kernel_unmap((uintptr_t)kernel_io_stack);
-    for (unsigned cpu = 1; cpu < ARM_CPU_MAX; ++cpu)
-        kernel_unmap((uintptr_t)arm_cpu_stacks[cpu - 1]);
-    for (unsigned cpu = 0; cpu < ARM_CPU_MAX; ++cpu)
-        kernel_unmap((uintptr_t)arm_exception_stacks[cpu]);
+    for (unsigned cpu = 1; cpu < CPU_MAX; ++cpu) kernel_unmap((uintptr_t)cpu_stacks[cpu - 1]);
+    for (unsigned cpu = 0; cpu < CPU_MAX; ++cpu) kernel_unmap((uintptr_t)arm_exception_stacks[cpu]);
     /* The kernel's own tables came from the pool with the data cache off;
      * like every table from here on, they are cached (the root is in the
      * cached CPU-private section). */

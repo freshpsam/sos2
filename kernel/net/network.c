@@ -20,6 +20,9 @@
 #include "nexus5.h"
 #include "wifi_device.h"
 #define network_entropy_read wifi_device_random
+#elif defined(SOS2_BOARD_PC)
+#include "pc.h"
+#define network_entropy_read entropy_read
 #else
 #define network_entropy_read entropy_read
 #endif
@@ -281,6 +284,9 @@ void network_init(const struct platform_devices *devices) {
 #elif defined(SOS2_BOARD_NEXUS5)
     (void)devices;
     nexus5_wifi_init(&device);
+#elif defined(SOS2_BOARD_PC)
+    (void)e1000e_init(devices, &device);
+    wifi_setup_init(0, 0);
 #else
     (void)virtio_net_init(devices, &device);
     wifi_setup_init(0, 0);

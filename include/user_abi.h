@@ -1,8 +1,9 @@
 #ifndef SOS2_USER_ABI_H
 #define SOS2_USER_ABI_H
-/* The user address window. arm64's lies above 4 GiB, where truncating an
- * address to 32 bits faults instead of reaching other memory. */
-#ifdef __aarch64__
+/* The user address window. A 64-bit system's (__LP64__: AArch64 and x64)
+ * lies above 4 GiB, where truncating an address to 32 bits faults instead of
+ * reaching other memory. */
+#ifdef __LP64__
 #define USER_BASE        0x1000000000
 #define USER_END         0x1100000000
 #define WEB_IMAGE_BASE   0x1010000000
@@ -39,7 +40,7 @@
  * 135 MiB on ARM32 and 340 MiB on AArch64 within two minutes, and YouTube
  * playing a video holds 475 MiB on ARM32 (481 MiB at its peak) and 581 MiB on
  * AArch64. */
-#ifdef __aarch64__
+#ifdef __LP64__
 #define USER_PAGE_QUOTA      262144u
 #else
 #define USER_PAGE_QUOTA      139264u
@@ -119,7 +120,7 @@
  * and its sites' workers. */
 #define USER_THREAD_LIMIT       64u
 /* A thread's stack pointer and stack size alignment. */
-#ifdef __aarch64__
+#ifdef __LP64__
 #define USER_STACK_ALIGN 16u
 #else
 #define USER_STACK_ALIGN 8u
@@ -148,14 +149,20 @@
 #include <stdint.h>
 
 /* A user address, and the ABI's pointer-sized fields: 32 bits on ARM32 and
- * 64 bits on arm64. Structures the kernel fills hold only pointer-sized
- * fields, so they have no padding on arm64 either. */
-#ifdef __aarch64__
+ * 64 bits on 64-bit systems. Structures the kernel fills hold only
+ * pointer-sized fields, so they have no padding there either. */
+#ifdef __LP64__
 typedef uint64_t user_ptr;
 #else
 typedef uint32_t user_ptr;
 #endif
 
+#ifdef __x86_64__
+/* x64's counter is the TSC shifted right by this (arch/x64), so that its
+ * frequency fits 32 bits for any TSC; a process gets that frequency in r10 at
+ * entry (sdk/runtime/start.S), since x86 has nothing to read it from. */
+#define USER_COUNTER_SHIFT 4
+#endif
 /* Microseconds from a generic timer count. The kernel's clock and wait
  * deadlines and the SDK's CLOCK_MONOTONIC both convert with it, so they agree. */
 static inline uint64_t user_timer_us(uint64_t ticks, uint32_t frequency) {
@@ -212,12 +219,21 @@ struct user_thread_info {
 };
 
 /* The registers: on arm64 x0-x30, sp, pc and pstate, then v0-v31 (two words
- * each), FPSR and FPCR; on ARM32 r0-r12, sp, lr, pc and cpsr. */
+ * each), FPSR and FPCR; on x64 rdi, rsi, rdx, r10, r8, r9, rax, rbx, rcx,
+ * rbp, r11 and r12-r15 (arch/x64/include/arch/context.h), sp, pc and
+ * rflags, then xmm0-xmm15 (two words each) and MXCSR; on ARM32 r0-r12, sp,
+ * lr, pc and cpsr. */
 #ifdef __aarch64__
 struct user_thread_context {
     uint64_t r[31], sp, pc, pstate;
     uint64_t v[64];
     uint32_t fpsr, fpcr;
+};
+#elif defined(__x86_64__)
+struct user_thread_context {
+    uint64_t r[15], sp, pc, flags;
+    uint64_t xmm[32];
+    uint32_t mxcsr, padding;
 };
 #else
 struct user_thread_context {
@@ -365,12 +381,15 @@ struct user_present_frame {
 #define USER_APP_STALE   4u
 /* The ABI native apps are built for (include/app_store.h): the kernel starts
  * only apps built for its own. Raise it when a change breaks programs built
- * before it. arm64's carries EM_AARCH64 (183) above it, so the two never
- * match. tools/package_redmi2.py reads both from these defines. */
-#ifndef __aarch64__
-#define USER_ABI_VERSION 1
-#else
+ * before it. arm64's carries EM_AARCH64 (183) above it and x64's EM_X86_64
+ * (62), so no two match. tools/package_redmi2.py reads them from these
+ * defines. */
+#ifdef __aarch64__
 #define USER_ABI_VERSION ((183u << 16) | 1)
+#elif defined(__x86_64__)
+#define USER_ABI_VERSION ((62u << 16) | 1)
+#else
+#define USER_ABI_VERSION 1
 #endif
 
 struct user_update_info {

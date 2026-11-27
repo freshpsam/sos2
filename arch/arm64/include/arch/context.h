@@ -12,31 +12,31 @@ typedef uint64_t user_reg;
 typedef int64_t user_result;
 #define SYSCALL_NUMBER 8
 
-struct arm_context {
+struct user_context {
     uint64_t r[31], sp, pc, pstate;
 };
 
 /* vector uses arch/arm's codes (2 SVC, 6 IRQ, others faults); status is
  * ESR_EL1 and address FAR_EL1. A kernel exception's context.sp is the kernel
  * SP that faulted (arch/arm64/entry.S), not SP_EL0. */
-struct arm_trap {
-    struct arm_context context;
+struct cpu_trap {
+    struct user_context context;
     uint64_t vector, status, address, padding;
 };
 
 /* The SIMD and floating-point registers, FPSR and FPCR, and TPIDR_EL0: the
  * SDK's TLS pointer, which user code may also change. */
-struct arm_runtime_context {
+struct user_runtime {
     uint64_t v[64];
     uint32_t fpsr, fpcr;
     uint64_t thread_pointer;
 };
 
-_Static_assert(sizeof(struct arm_trap) == 304, "assembly trap size");
-_Static_assert(offsetof(struct arm_context, sp) == 248, "assembly user SP");
-_Static_assert(offsetof(struct arm_context, pc) == 256, "assembly PC");
-_Static_assert(offsetof(struct arm_context, pstate) == 264, "assembly PSTATE");
-_Static_assert(sizeof(struct arm_runtime_context) == 528, "assembly runtime size");
+_Static_assert(sizeof(struct cpu_trap) == 304, "assembly trap size");
+_Static_assert(offsetof(struct user_context, sp) == 248, "assembly user SP");
+_Static_assert(offsetof(struct user_context, pc) == 256, "assembly PC");
+_Static_assert(offsetof(struct user_context, pstate) == 264, "assembly PSTATE");
+_Static_assert(sizeof(struct user_runtime) == 528, "assembly runtime size");
 
 /* Designated initializers for a new user thread's context, after any .r:
  * EL0t, AArch64, IRQs unmasked; SError and FIQ stay masked, as ARM32's user CPSR
@@ -47,7 +47,7 @@ _Static_assert(sizeof(struct arm_runtime_context) == 528, "assembly runtime size
 static inline int arch_user_entry_valid(user_reg entry) { return !(entry & 3); }
 
 /* Whether the trap interrupted EL0 in AArch64 (EL0t). */
-static inline int arch_trap_from_user(const struct arm_trap *trap) {
+static inline int arch_trap_from_user(const struct cpu_trap *trap) {
     return (trap->context.pstate & 0x1f) == 0;
 }
 #endif

@@ -40,7 +40,8 @@ struct audio_device {
 
 /* QEMU's virtio-sound (kernel/audio/virtio_snd.c), the tablet's speakers
  * (boards/gta7lite/audio.c), the Redmi 2's loudspeaker
- * (boards/redmi2/audio.c) and the Nexus 5's (boards/nexus5/audio.c). */
+ * (boards/redmi2/audio.c) and the Nexus 5's (boards/nexus5/audio.c); a
+ * PC's HD Audio is boards/pc/hda.c. */
 bool virtio_snd_init(const struct platform_devices *, struct audio_device *);
 bool gta7lite_audio_init(struct audio_device *);
 bool redmi2_audio_init(struct audio_device *);

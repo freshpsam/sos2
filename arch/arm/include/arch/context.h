@@ -11,25 +11,25 @@ typedef uint32_t user_reg;
 typedef int32_t user_result;
 #define SYSCALL_NUMBER 7
 
-struct arm_context {
+struct user_context {
     uint32_t r[13], sp, lr, pc, cpsr;
 };
 
-struct arm_trap {
-    struct arm_context context;
+struct cpu_trap {
+    struct user_context context;
     uint32_t vector, status, address;
 };
 
 /* thread_pointer is TPIDRURO, the SDK's TLS pointer; tls is TPIDRURW. */
-struct arm_runtime_context {
+struct user_runtime {
     uint64_t d[32];
     uint32_t fpscr, tls, thread_pointer, padding;
 };
 
-_Static_assert(sizeof(struct arm_trap) == 80, "assembly trap size");
-_Static_assert(offsetof(struct arm_context, sp) == 52, "assembly user SP");
-_Static_assert(offsetof(struct arm_context, pc) == 60, "assembly PC");
-_Static_assert(offsetof(struct arm_context, cpsr) == 64, "assembly CPSR");
+_Static_assert(sizeof(struct cpu_trap) == 80, "assembly trap size");
+_Static_assert(offsetof(struct user_context, sp) == 52, "assembly user SP");
+_Static_assert(offsetof(struct user_context, pc) == 60, "assembly PC");
+_Static_assert(offsetof(struct user_context, cpsr) == 64, "assembly CPSR");
 
 /* Designated initializers for a new user thread's context, after any .r:
  * user mode, asynchronous aborts and FIQs masked, in the instruction set the
@@ -43,7 +43,7 @@ _Static_assert(offsetof(struct arm_context, cpsr) == 64, "assembly CPSR");
 static inline int arch_user_entry_valid(user_reg entry) { return (entry & 3) != 2; }
 
 /* Whether the trap interrupted user mode. */
-static inline int arch_trap_from_user(const struct arm_trap *trap) {
+static inline int arch_trap_from_user(const struct cpu_trap *trap) {
     return (trap->context.cpsr & 31) == 16;
 }
 #endif

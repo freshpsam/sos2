@@ -94,8 +94,15 @@ def prepare():
                          ('svg-repeat', '.sos2-svg-repeat-port'),
                          # WebKit 2.54's universal pseudo-element rule bucket.
                          ('rules', '.sos2-rules-port'),
-                         # Each architecture's JIT glue.
-                         *((('arm64', '.sos2-arm64-port'),) if arch.ARM64 else (('jit', '.sos2-jit-port'),))):
+                         # Each architecture's JIT glue. x64 takes arm64's patch for
+                         # its 64-bit fixes (the structure heap, mimalloc's TLS, the
+                         # baseline JIT's for-of profile); its AArch64 hunks touch only
+                         # files x64 never compiles.
+                         *((('arm64', '.sos2-arm64-port'),) if arch.ARM64 or arch.X64 else
+                           (('jit', '.sos2-jit-port'),)),
+                         # x64's JIT takes AVX only where the system saves its
+                         # state, which SOS2's FXSAVE does not.
+                         *((('x64', '.sos2-x64-port'),) if arch.X64 else ())):
         apply_patch(SOURCE, ROOT / 'tools/browser/patches' / ('wpe-' + RECORD['version'] + '-native-' + name + '.patch'), marker,
                     'WebKit ' + name)
     overlay=ROOT/'tools/browser/native-port'

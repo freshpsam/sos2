@@ -58,6 +58,27 @@ struct platform_devices {
     uint32_t ram_console_start, ram_console_size;
     bool has_ram_console;
 #endif
+#ifdef __x86_64__
+    /* A PC: the GPT GUID of the disk SOS2's UEFI loader started it from
+     * (include/boot/sos2_boot_info.h), where its system and data are. */
+    uint8_t boot_disk_guid[16];
+    bool has_boot_disk;
+    /* PCI Express configuration space (ACPI's MCFG) for segment 0: buses
+     * ecam_first_bus to ecam_last_bus, 1 MiB each from ecam. */
+    uint64_t ecam;
+    uint8_t ecam_first_bus, ecam_last_bus;
+    /* The MMIO a PC's drivers use (boards/pc/pci.c), which the kernel maps
+     * uncached beside its own devices (arch/x64/machine.c). */
+    struct memory_region mmio[24];
+    size_t mmio_count;
+    /* ACPI's fixed hardware (the FADT): the PM1 event and control blocks
+     * (I/O ports), whether the power button is a fixed one, and the SMI
+     * command that turns ACPI mode on. */
+    uint16_t pm1a_event, pm1b_event, pm1a_control;
+    uint8_t pm1_event_length, acpi_enable;
+    uint16_t smi_command;
+    bool fixed_power_button;
+#endif
 };
 
 /* Fills devices from a flattened device tree. */

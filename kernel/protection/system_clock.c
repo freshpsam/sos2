@@ -97,14 +97,13 @@ void system_clock_init(const struct system_clock_ops *ops) {
         if (!calibration.valid) goto done;
     }
     uint32_t counter = 0;
-    if (!rtc.read || (rtc.kind != ARM_RTC_UNIX && rtc.kind != ARM_RTC_PMIC) ||
-        !rtc.read(&counter)) {
+    if (!rtc.read || (rtc.kind != RTC_UNIX && rtc.kind != RTC_PMIC) || !rtc.read(&counter)) {
         if (have_record) invalidate();
         goto done;
     }
     uint64_t sample = time_us(), us = 0;
     if (!have_record) {
-        if (rtc.kind != ARM_RTC_UNIX || !in_range((uint64_t)counter * 1000000)) goto done;
+        if (rtc.kind != RTC_UNIX || !in_range((uint64_t)counter * 1000000)) goto done;
         calibration = (struct calibration){counter, counter, (uint64_t)counter * 1000000, true};
     }
     if (!restored_time(&calibration, counter, &us)) {
@@ -151,8 +150,8 @@ void system_clock_service(void *unused) {
     if (requested) {
         requested = false;
         uint32_t counter = 0;
-        bool rtc_available = rtc.read && (rtc.kind == ARM_RTC_UNIX || rtc.kind == ARM_RTC_PMIC) &&
-                             rtc.read(&counter);
+        bool rtc_available =
+            rtc.read && (rtc.kind == RTC_UNIX || rtc.kind == RTC_PMIC) && rtc.read(&counter);
         uint64_t sample = time_us(), us = requested_us + (sample - requested_at);
         if (sample >= requested_at && in_range(us)) {
             /* A missing/failing disk or RTC must not prevent a RAM boot from

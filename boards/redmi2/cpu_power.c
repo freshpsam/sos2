@@ -66,7 +66,7 @@
  * - back, CPU 0's SAW gets its value from before and the L2's SAW is
  *   disabled again. */
 #include "arm_cache.h"
-#include "arm_smp.h"
+#include "smp.h"
 #include "qcom_scm.h"
 
 static uint32_t read32(uintptr_t address) {
@@ -84,7 +84,7 @@ static void write32(uintptr_t address, uint32_t value) {
 #define clean_l1     arm_dcache_clean_invalidate_local
 #define power_down   qcom_scm_cpu_power_down
 #define cpu0_suspend arm_cpu0_suspend
-#define runtime_init arm_runtime_init
+#define runtime_init user_runtime_init
 
 enum {
     SAW = 0x0b089000,

@@ -3,7 +3,7 @@
  * 1.5% of YouTube's main thread on the Nexus 5. SOS2 loads words from any
  * address (SCTLR.A off), so this compares words and orders the first that
  * differ by their bytes. AArch64's Newlib already does as much. */
-#ifndef __aarch64__
+#ifdef __arm__
 #include <stddef.h>
 #include <stdint.h>
 

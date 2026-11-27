@@ -100,8 +100,8 @@ bool system_store_init(const struct platform_devices *devices) {
     struct disk_partition boot, cache;
     unsigned kept = emmc_card.loader_sectors;
     if (!emmc_card.adopt(devices, &card_sectors) ||
-        !disk_partition_named(read_sector, 0, card_sectors, "boot", &boot) ||
-        !disk_partition_named(read_sector, 0, card_sectors, "cache", &cache) ||
+        !disk_partition_named(read_sector, 0, card_sectors, SYSTEM_BOOT_NAME, &boot) ||
+        !disk_partition_named(read_sector, 0, card_sectors, SYSTEM_CACHE_NAME, &cache) ||
         boot.sectors < kept + SYSTEM_BOOT_LIMIT / 512 || cache.sectors < SYSTEM_DATA_START)
         return false;
     regions[SYSTEM_BOOT] = (struct disk_partition){boot.start + kept, boot.sectors - kept};

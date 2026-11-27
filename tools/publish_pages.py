@@ -31,10 +31,13 @@ ROOT = Path(__file__).resolve().parents[1]
 BRANCH = 'gh-pages'
 APP = ROOT/'programs/updater/updater.c'
 # Each device: its folder on Pages and name, its build's install and apps
-# folders, and its architecture's apps folder on Pages.
+# folders, and its architecture's apps folder on Pages. PCs (x64) update
+# over Ethernet, without Wi-Fi firmware.
 DEVICES = (('redmi2', 'Redmi 2', 'build/redmi2-install', 'build/apps', 'apps'),
            ('gta7lite', 'Galaxy Tab A7 Lite', 'build/gta7lite-install', 'build/apps-arm64', 'apps-arm64'),
-           ('nexus5', 'Nexus 5', 'build/nexus5-install', 'build/apps', 'apps'))
+           ('nexus5', 'Nexus 5', 'build/nexus5-install', 'build/apps', 'apps'),
+           ('x64', 'PC', 'build/pc-install', 'build/apps-x64', 'apps-x64'))
+WIRED = {'x64'}
 
 
 def git(*args, env=None, data=None):
@@ -55,13 +58,13 @@ def pages_url():
     return f'https://{owner.lower()}.github.io/{repository}/'
 
 
-def load(directory):
+def load(directory, wired=False):
     """install.json and the files it lists, checked against their sizes and SHA-256s."""
     manifest = json.loads((directory/'install.json').read_text())
     if manifest.get('wifi_profile') is not False:
         raise RuntimeError(f'{directory} carries a Wi-Fi profile, and Pages is public; '
                            'build it without REDMI2_WIFI_PROFILE, GTA7LITE_WIFI_PROFILE or NEXUS5_WIFI_PROFILE')
-    if manifest.get('wifi_firmware') is not True:
+    if not wired and manifest.get('wifi_firmware') is not True:
         raise RuntimeError(f'{directory}/install.json does not list the Wi-Fi firmware, and a device without it '
                            'could not update again; build it again with REDMI2_WIFI_FIRMWARE, GTA7LITE_STOCK '
                            'or NEXUS5_STOCK')
@@ -104,14 +107,15 @@ def device_section(device, title, apps_folder, manifest, apps):
                    f'<td>{entry["bytes"]:,}</td><td><code>{entry["sha256"]}</code></td></tr>\n'
                    for name, entry in manifest['files'].items())
     commands = '\n'.join(html.escape(command) for command in manifest['flash'])
+    first = (manifest['first_install'] if 'first_install' in manifest else
+             'a first install flashes its boot image from fastboot, after checking its SHA-256:')
     app_rows = ''.join(f'<tr><td><a href="{apps_folder}/{html.escape(app_id)}.sos2app">{html.escape(name)}</a></td>'
                        f'<td>{size:,}</td><td><code>{digest}</code></td></tr>\n'
                        for app_id, name, size, digest in apps)
     update = f'{device}/sos2-{device}.update'
     return f'''<h1>SOS2 for the {title}</h1>
 <p>Release {html.escape(manifest['release'])}. Its updater installs
-<a href="{update}">sos2-{device}.update</a>; a first install flashes its boot image
-from fastboot, after checking its SHA-256:</p>
+<a href="{update}">sos2-{device}.update</a>; {html.escape(first)}</p>
 <pre>{commands}</pre>
 <table>
 <tr><th>File</th><th>Bytes</th><th>SHA-256</th></tr>
@@ -165,10 +169,10 @@ def publish(only=()):
              if (not only or device in only) and
              (ROOT/install/'install.json').is_file() and (ROOT/apps/'index.txt').is_file()]
     if not built:
-        raise RuntimeError('nothing to publish: run make phone, make tablet or make nexus5 first')
+        raise RuntimeError('nothing to publish: run make phone, make tablet, make nexus5 or make pc first')
     entries, releases, current = {}, {}, {}
     for device, title, install, apps_directory, folder in built:
-        manifest, files = load(install)
+        manifest, files = load(install, device in WIRED)
         check_updater(url, device, folder, manifest['board'])
         apps, app_files = load_apps(apps_directory)
         entries.update({f'{device}/{name}': content for name, content in files.items()})
@@ -224,7 +228,8 @@ def publish(only=()):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--device', action='append', default=[], help='publish only this device (redmi2, gta7lite, nexus5)')
+    parser.add_argument('--device', action='append', default=[],
+                        help='publish only this device (redmi2, gta7lite, nexus5, x64)')
     args = parser.parse_args()
     try:
         publish(args.device)

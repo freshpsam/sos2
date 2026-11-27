@@ -1,6 +1,6 @@
 #ifndef SOS2_SYSTEM_CLOCK_H
 #define SOS2_SYSTEM_CLOCK_H
-#include "arm_machine.h"
+#include "machine.h"
 /* Wall time may be corrected; monotonic time, sleeps and CPU accounting never
  * use this service. No user syscall can set time or access its saved record. */
 #define SYSTEM_CLOCK_MIN_SECONDS 946684800ull
@@ -8,7 +8,7 @@
 
 struct system_clock_ops {
     bool (*read)(uint32_t *);
-    enum arm_rtc_kind kind;
+    enum rtc_kind kind;
 };
 
 void system_clock_init(const struct system_clock_ops *);

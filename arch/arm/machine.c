@@ -1,4 +1,4 @@
-#include "arm_machine.h"
+#include "machine.h"
 #include "platform.h"
 #include "user_abi.h"
 #ifdef SOS2_BOARD_REDMI2
@@ -11,21 +11,21 @@
 #include "nexus5.h"
 #endif
 
-static struct arm_machine machine;
+static struct machine machine;
 
 static bool device(uintptr_t start, uint32_t size) {
     if (!start || !size || start > UINT32_MAX - (size - 1) ||
         (start<USER_END &&(uint64_t)start + size> USER_BASE) ||
         machine.device_count >= sizeof(machine.devices) / sizeof(machine.devices[0]))
         return false;
-    machine.devices[machine.device_count++] = (struct arm_mapping){start, size};
+    machine.devices[machine.device_count++] = (struct machine_mapping){start, size};
     return true;
 }
 
-const struct arm_machine *arm_machine_get(void) { return &machine; }
+const struct machine *machine_get(void) { return &machine; }
 
-bool arm_machine_init(const struct platform_devices *d) {
-    machine = (struct arm_machine){0};
+bool machine_init(const struct platform_devices *d) {
+    machine = (struct machine){0};
     if (!d) return false;
 #ifdef SOS2_BOARD_REDMI2
     if (!d->redmi2_wt88047 || !d->has_framebuffer) return false;
@@ -34,8 +34,8 @@ bool arm_machine_init(const struct platform_devices *d) {
      * No QEMU peripheral or secure firmware reservation is mapped.
      * https://github.com/torvalds/linux/blob/master/arch/arm64/boot/dts/qcom/msm8916.dtsi
      */
-    machine.timer = (struct arm_timer_route){0x0b000000, 0x0b002000, 20, true};
-    static const struct arm_mapping phone[] = {
+    machine.timer = (struct timer_route){0x0b000000, 0x0b002000, 20, true};
+    static const struct machine_mapping phone[] = {
         {0x01000000,0x7a000}, /* TLMM GPIO 0-121: drivers' pins, unused devices' pins in their sleep states */
         {0x01109000,0x1000}, /* TLMM SDC2 pad control: the unused SD card's pads */
         {0x00060000,0x8000}, /* RPM message RAM, explicit SMEM auxiliary region */
@@ -80,8 +80,8 @@ bool arm_machine_init(const struct platform_devices *d) {
     if (!d->nexus5_hammerhead || !d->has_framebuffer) return false;
     /* MSM8974's QGIC2 and the virtual timer's PPI 4 (INTID 20), from Google's
      * hammerhead msm8974.dtsi and Linux's qcom-msm8974.dtsi. */
-    machine.timer = (struct arm_timer_route){0xf9000000, 0xf9002000, 20, true};
-    static const struct arm_mapping phone[] = {
+    machine.timer = (struct timer_route){0xf9000000, 0xf9002000, 20, true};
+    static const struct machine_mapping phone[] = {
         {0xfd8c2000, 0x2000},  /* MMCC: the display's clocks, the vibrator's PWM */
         {0xfd900000, 0x23000}, /* MDSS: MDP 1.2, the splash's CTL and DSI0 (display.c) */
         {0xfc4cf000, 0x1000},  /* SPMI arbiter core, channel 0: PM8941 (pmic.c) */
@@ -113,11 +113,11 @@ bool arm_machine_init(const struct platform_devices *d) {
      * redistributors' 2 MiB window, one 128 KiB frame per CPU; the virtual
      * timer's PPI 11 (INTID 27). TOPRGU, whose watchdog LK leaves running. */
     if (!d->gicv3) return false;
-    machine.timer = (struct arm_timer_route){.distributor = 0x0c000000,
-                                             .interrupt = 27,
-                                             .gicv3 = true,
-                                             .redistributor = 0x0c100000,
-                                             .redistributor_size = 0x200000};
+    machine.timer = (struct timer_route){.distributor = 0x0c000000,
+                                         .interrupt = 27,
+                                         .gicv3 = true,
+                                         .redistributor = 0x0c100000,
+                                         .redistributor_size = 0x200000};
     if (!device(0x10007000, 0x1000)) return false;
     /* The touch screen (boards/gta7lite/touch.c): topckgen's and infracfg's
      * SPI clock controls, the GPIO pins, the external interrupt controller
@@ -162,7 +162,7 @@ bool arm_machine_init(const struct platform_devices *d) {
            device(machine.timer.redistributor, machine.timer.redistributor_size);
 #else
     /* QEMU virt's GICv2 and the virtual timer's PPI 11 (INTID 27). */
-    machine.timer = (struct arm_timer_route){0x08000000, 0x08010000, 27, false};
+    machine.timer = (struct timer_route){0x08000000, 0x08010000, 27, false};
     machine.rtc = 0x09010000;
     if (!device(d->fwcfg, 0x1000) || !device(machine.rtc, 0x1000)) return false;
     if (d->power_key && !device(d->gpio, 0x1000)) return false;
@@ -173,15 +173,15 @@ bool arm_machine_init(const struct platform_devices *d) {
     return device(machine.timer.distributor, 0x1000) && device(machine.timer.cpu, 0x2000);
 }
 
-enum arm_rtc_kind arm_rtc_kind(void) {
+enum rtc_kind rtc_kind(void) {
 #ifdef SOS2_PHONE
-    return ARM_RTC_PMIC;
+    return RTC_PMIC;
 #else
-    return ARM_RTC_UNIX;
+    return RTC_UNIX;
 #endif
 }
 
-bool arm_rtc_read(uint32_t *seconds) {
+bool rtc_read(uint32_t *seconds) {
     if (!seconds) return false;
 #ifdef SOS2_BOARD_REDMI2
     return redmi2_rtc_read(seconds);

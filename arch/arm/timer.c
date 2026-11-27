@@ -1,10 +1,10 @@
-#include "arm_machine.h"
+#include "machine.h"
 
 /* ARM GICv2 Non-secure interface and architectural virtual timer. The phone's
  * qcom,msm-qgic2 route is selected by machine.c, not inferred from QEMU addresses.
  * Match the Linux qgic2 binding rather than requiring ARM's optional peripheral
  * identity layout. In both cases a bounded live timer-route probe must pass
- * before any user IRQ is unmasked. Only standby sleeps (arm_cpu_sleep_us),
+ * before any user IRQ is unmasked. Only standby sleeps (cpu_sleep_us),
  * powering CPU 0 down on the phone.
  * https://documentation-service.arm.com/static/5f8ff21df86e16515cdbfafe
  * https://github.com/torvalds/linux/blob/master/drivers/irqchip/irq-gic.c
@@ -14,7 +14,7 @@
 #include "redmi2_cpu_power.h"
 #endif
 #ifdef SOS2_BOARD_GTA7LITE
-#include "arm_smp.h"
+#include "smp.h"
 #endif
 #define read32  mmio_read32
 #define write32 mmio_write32
@@ -38,13 +38,13 @@ enum {
     C_RPR = 0x14,
     C_HPPIR = 0x18
 };
-static struct arm_timer_route route;
+static struct timer_route route;
 static bool ready, changed;
 static unsigned banks;
 static uint32_t hz, bit, priority_offset, priority_shift, edge;
 static const char *error;
 #ifdef SOS2_BOARD_GTA7LITE
-static uintptr_t gicv3_frames[ARM_CPU_MAX];
+static uintptr_t gicv3_frames[CPU_MAX];
 static uintptr_t gicv3_local(void);
 #endif
 
@@ -53,7 +53,7 @@ static struct {
     uint64_t compare;
 } saved;
 
-const char *arm_timer_error(void) { return error; }
+const char *timer_error(void) { return error; }
 
 static void stop(void) {
     arch_timer_set_control(0);
@@ -170,7 +170,7 @@ static uintptr_t gicv3_cpu(void) {
         if (typer & (1u << 4)) break;                /* Last */
         at += typer & (1u << 1) ? 0x40000 : 0x20000; /* GICv4 adds two frames */
     }
-    if (!frame || index >= ARM_CPU_MAX) return 0;
+    if (!frame || index >= CPU_MAX) return 0;
     write32(frame + R_WAKER, read32(frame + R_WAKER) & ~2u); /* ProcessorSleep */
     if (!gicv3_settled(frame + R_WAKER, 4)) return 0;        /* ChildrenAsleep */
     icc_write(icc_sre_el1, icc_read(icc_sre_el1) | 1);
@@ -232,7 +232,7 @@ static bool gicv3_routed(uintptr_t sgi) {
     return false;
 }
 
-static bool gicv3_init(const struct arm_timer_route *configuration) {
+static bool gicv3_init(const struct timer_route *configuration) {
     if (!configuration->distributor || !configuration->redistributor ||
         ((configuration->distributor | configuration->redistributor) & 0xffff) ||
         configuration->redistributor_size < 0x20000 || configuration->interrupt < 16 ||
@@ -279,7 +279,7 @@ static bool gicv3_init(const struct arm_timer_route *configuration) {
 }
 #endif
 
-bool arm_timer_init(const struct arm_timer_route *configuration) {
+bool timer_init(const struct timer_route *configuration) {
     if (ready)
         return configuration && configuration->distributor == route.distributor &&
                configuration->cpu == route.cpu && configuration->interrupt == route.interrupt &&
@@ -387,7 +387,7 @@ bool arm_timer_init(const struct arm_timer_route *configuration) {
     return true;
 }
 
-bool arm_timer_secondary_init(void) {
+bool timer_secondary_init(void) {
 #ifdef SOS2_BOARD_GTA7LITE
     if (route.gicv3) {
         if (!ready || arch_counter_frequency() != hz || !arch_kernel_masked() ||
@@ -461,7 +461,7 @@ bool arm_timer_secondary_init(void) {
     return false;
 }
 
-void arm_timer_arm_us(uint32_t microseconds) {
+void timer_arm_us(uint32_t microseconds) {
     if (!ready) panic("scheduler timer not initialized");
     if (!microseconds || microseconds > 5000) microseconds = 5000;
     arch_timer_set_control(0);
@@ -482,7 +482,7 @@ static _Noreturn void unexpected(uint32_t id) {
     panic(text);
 }
 
-void arm_timer_stop(bool acknowledge) {
+void timer_stop(bool acknowledge) {
 #ifdef SOS2_BOARD_GTA7LITE
     if (route.gicv3) {
         if (acknowledge) {
@@ -519,7 +519,7 @@ void arm_timer_stop(bool acknowledge) {
  * rising: 3.4 ms at 19.2 MHz): WFI could start a power-collapse sequence that
  * an inherited SPM configuration may arm.
  * https://developer.arm.com/documentation/ddi0406/c (B8.1.5 event streams) */
-void arm_cpu_sleep_us(uint32_t microseconds) {
+void cpu_sleep_us(uint32_t microseconds) {
     if (!ready || !microseconds) return;
     if (microseconds > 1000000) microseconds = 1000000;
     uint64_t deadline = arch_counter_synchronized() + ticks(microseconds);

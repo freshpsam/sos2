@@ -87,8 +87,10 @@ APP_PACKAGE_MAX = 6144 * 512 - 4096
 APP_INDEX = b"SOS2 apps 1"
 USER_ABI = (Path(__file__).resolve().parents[1] / "include/user_abi.h").read_text()
 ABI = int(re.search(r"#define USER_ABI_VERSION (\d+)", USER_ABI).group(1))
-# AArch64's carries EM_AARCH64 (183) above its version, so the two never match.
+# AArch64's carries EM_AARCH64 (183) above its version, and x64's EM_X86_64
+# (62), so none of them match.
 ABI_ARM64 = 183 << 16 | int(re.search(r"#define USER_ABI_VERSION \(\(183u << 16\) \| (\d+)\)", USER_ABI).group(1))
+ABI_X64 = 62 << 16 | int(re.search(r"#define USER_ABI_VERSION \(\(62u << 16\) \| (\d+)\)", USER_ABI).group(1))
 
 
 class PackagingError(ValueError):
@@ -469,24 +471,26 @@ def app_ids(files):
     return sorted(ids)
 
 
-# Programs by architecture: ELF class, ARM's (40) or AArch64's (183) machine.
+# Programs by architecture: ELF class, ARM's (40), AArch64's (183) or x64's
+# (62) machine.
 ELF_ARM32 = (1, 40)
 ELF_ARM64 = (2, 183)
+ELF_X64 = (2, 62)
+ELF_NAMES = {ELF_ARM32: "ARM32", ELF_ARM64: "AArch64", ELF_X64: "x64"}
 
 
 def app_package(app_id, name, icon, program, abi=None, elf=ELF_ARM32):
     """An app's .sos2app: header, icon and program (include/app_store.h),
     whose program is for elf's architecture, built for its ABI by default."""
     if abi is None:
-        abi = ABI_ARM64 if elf == ELF_ARM64 else ABI
+        abi = {ELF_ARM64: ABI_ARM64, ELF_X64: ABI_X64}.get(elf, ABI)
     if not re.fullmatch(r"[a-z0-9-]{1,15}", app_id):
         raise PackagingError(f"app id {app_id!r} is not 1-15 lowercase letters, digits and hyphens")
     if not 1 <= len(name) <= 12 or not all(32 <= c < 127 for c in name):
         raise PackagingError(f"app {app_id}: the name must be 1-12 printable ASCII characters")
     if (len(icon) != APP_ICON_BYTES or len(program) < 64 or program[:4] != b"\x7fELF" or
             program[4:7] != bytes((elf[0], 1, 1)) or struct.unpack_from("<H", program, 18)[0] != elf[1]):
-        raise PackagingError(f"app {app_id}: needs a 48x48 icon and an "
-                             f"{'AArch64' if elf == ELF_ARM64 else 'ARM32'} ELF program")
+        raise PackagingError(f"app {app_id}: needs a 48x48 icon and an {ELF_NAMES[elf]} ELF program")
     payload = icon + program
     fields = struct.pack("<8sII16s16sIIIII32s", b"SOS2APP1", 1, abi, app_id.encode("ascii"), name,
                          APP_PACKAGE_HEADER, len(icon), APP_PACKAGE_HEADER + len(icon), len(program),

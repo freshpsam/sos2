@@ -41,7 +41,7 @@ bool vm_create(struct vm_space *space);
 void vm_destroy(struct vm_space *space);
 bool vm_map(struct vm_space *space, user_ptr address, unsigned permissions);
 bool vm_mapped(const struct vm_space *space, user_ptr address);
-#ifndef __aarch64__
+#ifdef __arm__
 /* SYS_ICACHE_SYNC (arch/arm/mmu.c): on the CPU running space's process. */
 int32_t vm_icache_sync(const struct vm_space *space, user_ptr address, uint32_t size);
 #endif

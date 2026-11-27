@@ -1,6 +1,17 @@
 /* The program entry: sos2_start(mode, pid, options) (start.c), with the stack
  * the kernel provides. ARM32 also has the EABI's thread pointer helper. */
-#ifdef __aarch64__
+#ifdef __x86_64__
+    /* rdi, rsi and rdx hold sos2_start's arguments and r10 the counter's
+     * frequency (include/user_abi.h); the stack is as a call leaves it. */
+    .text
+    .global _start
+    .type _start, @function
+_start:
+    movq    %r10, sos2_counter_frequency(%rip)
+    xorl    %ebp, %ebp
+    jmp     sos2_start
+    .size _start, .-_start
+#elif defined(__aarch64__)
     .text
     .balign 4
     .global _start

@@ -24,6 +24,10 @@
 #include <stdarg.h>
 #include <signal.h>
 #include <malloc.h>
+/* ARM's Newlib has O_BINARY (its sys/fcntl.h), x64's generic one none. */
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
 
 int sos2_errno(int e) {
     switch (e) {
@@ -80,8 +84,19 @@ void sos2_wake(uint32_t *word, unsigned count) { call(SYS_WAKE_WORD, sos2_ptr(wo
 /* Monotonic time is the generic timer's virtual count, readable from user
  * mode (CNTKCTL.PL0VCTEN), converted as the kernel's time_us() converts it;
  * other clocks need the kernel. */
+#ifdef __x86_64__
+/* The counter's frequency, from r10 at entry (start.S). */
+uint64_t sos2_counter_frequency;
+#endif
+
 static uint64_t monotonic_us(void) {
-#ifdef __aarch64__
+#ifdef __x86_64__
+    /* The TSC, which user mode may read, shifted as the kernel's counter. */
+    uint32_t low, high;
+    __asm__ volatile("lfence\n rdtsc" : "=a"(low), "=d"(high));
+    return user_timer_us((((uint64_t)high << 32) | low) >> USER_COUNTER_SHIFT,
+                         (uint32_t)sos2_counter_frequency);
+#elif defined(__aarch64__)
     uint64_t count, frequency;
     __asm__ volatile("isb\n mrs %0, cntvct_el0" : "=r"(count));
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
@@ -153,6 +168,12 @@ void sos2_icache_sync(const void *code, size_t size) {
     for (uintptr_t at = start & ~(instruction - 1); at < end; at += instruction)
         __asm__ volatile("ic ivau, %0" : : "r"(at) : "memory");
     __asm__ volatile("dsb ish\n isb" ::: "memory");
+}
+#elif defined(__x86_64__)
+/* x86's instruction fetch sees stores by itself, on every CPU. */
+void sos2_icache_sync(const void *code, size_t size) {
+    (void)code;
+    (void)size;
 }
 #else
 /* AArch32 user mode cannot maintain caches: the kernel does it on this CPU
@@ -1356,3 +1377,50 @@ int mincore(void *address, size_t length, unsigned char *resident) {
     memset(resident, 1, pages);
     return 0;
 }
+
+#ifdef __x86_64__
+/* x64's Newlib leaves the POSIX calls to the system, where ARM's wraps
+ * them itself (its libc/syscalls): its reentrant layer (_read_r and the
+ * others) calls these names. */
+int close(int fd) { return _close(fd); }
+
+int fstat(int fd, struct stat *out) { return _fstat(fd, out); }
+
+pid_t getpid(void) { return _getpid(); }
+
+int gettimeofday(struct timeval *restrict out, void *restrict zone) {
+    return _gettimeofday(out, zone);
+}
+
+int isatty(int fd) { return _isatty(fd); }
+
+int kill(pid_t pid, int signal) { return _kill(pid, signal); }
+
+int link(const char *old, const char *new) { return _link(old, new); }
+
+off_t lseek(int fd, off_t offset, int whence) { return _lseek(fd, offset, whence); }
+
+int open(const char *path, int flags, ...) {
+    va_list arguments;
+    va_start(arguments, flags);
+    int mode = flags & O_CREAT ? va_arg(arguments, int) : 0;
+    va_end(arguments);
+    return _open(path, flags, mode);
+}
+
+_READ_WRITE_RETURN_TYPE read(int fd, void *buffer, size_t length) {
+    return _read(fd, buffer, length);
+}
+
+void *sbrk(ptrdiff_t change) { return _sbrk(change); }
+
+int stat(const char *restrict path, struct stat *restrict out) { return _stat(path, out); }
+
+clock_t times(struct tms *out) { return _times(out); }
+
+int unlink(const char *path) { return _unlink(path); }
+
+_READ_WRITE_RETURN_TYPE write(int fd, const void *buffer, size_t length) {
+    return _write(fd, buffer, length);
+}
+#endif

@@ -3,7 +3,7 @@
 #include "display.h"
 #include "input.h"
 #include "page_host.h"
-#include "arm_machine.h"
+#include "machine.h"
 
 /* QEMU's machines' part of the kernel's start and main loop (kernel/main.c):
  * the loader's kernel and device tree checked, virtio's display, tablet,
@@ -81,4 +81,4 @@ void board_standby_step(struct pointer_event *scratch) {
     for (unsigned budget = 0; budget < 32 && keyboard_poll(&key); ++budget) { }
 }
 
-void board_standby_sleep(void) { arm_cpu_sleep_us(BOARD_STANDBY_POLL_US); }
+void board_standby_sleep(void) { cpu_sleep_us(BOARD_STANDBY_POLL_US); }

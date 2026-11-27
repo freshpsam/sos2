@@ -12,6 +12,9 @@
 #ifdef SOS2_BOARD_NEXUS5
 #include "nexus5.h"
 #endif
+#ifdef SOS2_BOARD_PC
+#include "pc.h"
+#endif
 #ifndef SOS2_BOARD_REDMI2
 static struct framebuffer *screen;
 #endif
@@ -118,7 +121,15 @@ bool display_bands(void) {
 
 bool display_draw_region(struct framebuffer *visible, const struct framebuffer *source, unsigned x,
                          unsigned y, unsigned width, unsigned height) {
+#ifdef SOS2_BOARD_PC
+    /* A PC's cursor, drawn over the screen, goes back over what each band
+     * drew under it, before the pointer can move it off again. */
+    if (!gfx_present_scaled_region(visible, source, x, y, width, height)) return false;
+    if (visible == screen) pc_cursor_presented(visible, source, x, y, width, height);
+    return true;
+#else
     return gfx_present_scaled_region(visible, source, x, y, width, height);
+#endif
 }
 
 void display_show_region(struct framebuffer *visible, const struct framebuffer *source, unsigned x,

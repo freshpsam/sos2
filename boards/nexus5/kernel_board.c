@@ -4,7 +4,7 @@
 #include "display.h"
 #include "page_host.h"
 #include "boot_progress.h"
-#include "arm_machine.h"
+#include "machine.h"
 #include "nexus5.h"
 #include "wifi_setup.h"
 #include "wifi_device.h"
@@ -120,4 +120,4 @@ void board_system_standby(bool on) {
 
 void board_standby_step(struct pointer_event *scratch) { (void)scratch; }
 
-void board_standby_sleep(void) { arm_cpu_sleep_us(BOARD_STANDBY_POLL_US); }
+void board_standby_sleep(void) { cpu_sleep_us(BOARD_STANDBY_POLL_US); }

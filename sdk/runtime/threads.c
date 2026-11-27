@@ -19,8 +19,47 @@ extern char __tls_start[], __tls_data_end[], __tls_end[], __tls_align[];
 
 /* Variant 1 TLS, as both ARM ABIs specify: the thread pointer addresses a
  * TCB_SIZE-byte TCB, whose first word points to the thread's struct
- * sos2_thread, and the TLS block follows it at the block's alignment. */
-#ifdef __aarch64__
+ * sos2_thread, and the TLS block follows it at the block's alignment.
+ * x64's is variant 2: the TLS block ends at the thread pointer (FS's base),
+ * aligned, and the TCB's first word there points to itself, its second to
+ * the thread's struct sos2_thread. */
+#ifdef __x86_64__
+#define TCB_SIZE 16
+
+static inline void *thread_pointer(void) {
+    void *pointer;
+    __asm__("movq %%fs:0, %0" : "=r"(pointer));
+    return pointer;
+}
+
+/* __tls_align is an absolute symbol, out of RIP-relative reach of the image
+ * window: an absolute immediate. */
+static inline unsigned tls_align(void) {
+    uintptr_t value;
+    __asm__("movabsq $__tls_align, %0" : "=r"(value));
+    return (unsigned)value;
+}
+
+/* The TLS block's size, rounded to the segment's alignment as ld rounds it:
+ * the thread pointer's offset from the block's start. */
+static inline uintptr_t tls_block(void) {
+    uintptr_t alignment = tls_align();
+    return ((uintptr_t)(__tls_end - __tls_start) + alignment - 1) & ~(alignment - 1);
+}
+
+/* The thread pointer's alignment: the segment's, and the TCB's 16. */
+static inline uintptr_t tls_pointer_align(void) {
+    uintptr_t alignment = tls_align();
+    return alignment > 16 ? alignment : 16;
+}
+
+/* The thread pointer in a thread's TLS pages: the first aligned address
+ * with room for the block below it. */
+static inline void *tls_pointer(const struct sos2_thread *t) {
+    uintptr_t alignment = tls_pointer_align();
+    return (void *)(((uintptr_t)t->tls + tls_block() + alignment - 1) & ~(alignment - 1));
+}
+#elif defined(__aarch64__)
 #define TCB_SIZE 16
 
 static inline void *thread_pointer(void) {
@@ -49,6 +88,24 @@ static inline unsigned tls_align(void) { return (uintptr_t)__tls_align; }
 
 /* ARM ELF general-dynamic TLS uses a module/offset pair even in static PIC
  * libraries. There is exactly one TLS module in a native SOS2 executable. */
+#ifdef __x86_64__
+void *__tls_get_addr(const sos2_word index[2]) {
+    char *pointer = thread_pointer();
+    if (index[0] != 1 || index[1] > (uintptr_t)(__tls_end - __tls_start)) abort();
+    return pointer - tls_block() + index[1];
+}
+
+static inline struct sos2_thread *self_thread(void) {
+    struct sos2_thread *thread;
+    __asm__("movq %%fs:8, %0" : "=r"(thread));
+    return thread;
+}
+
+void sos2_threads_bootstrap(void) {
+    static void *tcb[2] __attribute__((aligned(16))) = {tcb, NULL};
+    if (call(SYS_THREAD_TLS, sos2_ptr(tcb), 0)) finish(121);
+}
+#else
 void *__tls_get_addr(const sos2_word index[2]) {
     unsigned alignment = tls_align();
     unsigned header = (TCB_SIZE + alignment - 1) & ~(alignment - 1);
@@ -61,6 +118,7 @@ static inline struct sos2_thread *self_thread(void) {
     void *pointer = thread_pointer();
     return pointer ? *(struct sos2_thread **)pointer : NULL;
 }
+#endif
 
 /* Inline below: every lock and key lookup asks, 1.5% of YouTube's main
  * thread on the Nexus 5 as calls. */
@@ -261,6 +319,19 @@ static void emutls_release(struct sos2_thread *t) {
 static int init_tls(struct sos2_thread *thread) {
     unsigned alignment = tls_align();
     if (alignment > 4096) return ENOTSUP;
+#ifdef __x86_64__
+    uintptr_t block = tls_block();
+    thread->tls_pages = (block + tls_pointer_align() + TCB_SIZE + 4095) / 4096;
+    sos2_status mapped = sos2_map(thread->tls_pages, 3);
+    if (mapped < 0) return sos2_errno(mapped);
+    thread->tls = (void *)(uintptr_t)mapped;
+    void **tcb = tls_pointer(thread);
+    tcb[0] = tcb;
+    tcb[1] = thread;
+    memcpy((char *)tcb - block, __tls_start, __tls_data_end - __tls_start);
+    _REENT_INIT_PTR(&thread->reent);
+    return 0;
+#endif
     unsigned header = (TCB_SIZE + alignment - 1) & ~(alignment - 1), size = __tls_end - __tls_start;
     thread->tls_pages = (header + size + 4095) / 4096;
     sos2_status result = sos2_map(thread->tls_pages, 3);
@@ -288,7 +359,11 @@ void sos2_threads_init(void) {
     main->emutls_count = emutls_early.emutls_count;
     main->emutls_chunks = emutls_early.emutls_chunks;
 #endif
+#ifdef __x86_64__
+    if (call(SYS_THREAD_TLS, sos2_ptr(tls_pointer(main)), 0)) finish(121);
+#else
     if (call(SYS_THREAD_TLS, sos2_ptr(main->tls), 0)) finish(121);
+#endif
 }
 
 /* A thread's own ID never changes while it runs, so a plain load: every lock
@@ -368,9 +443,15 @@ int pthread_create(pthread_t *id, const pthread_attr_t *attr, void *(*entry)(voi
     }
     if (!result) result = init_tls(t);
     if (!result) {
+#ifdef __x86_64__
+        struct user_thread_start start = {sos2_ptr(trampoline),     sos2_ptr(t),
+                                          sos2_ptr(stack),          size,
+                                          sos2_ptr(tls_pointer(t)), sos2_ptr(&t->completion)};
+#else
         struct user_thread_start start = {sos2_ptr(trampoline), sos2_ptr(t),
                                           sos2_ptr(stack),      size,
                                           sos2_ptr(t->tls),     sos2_ptr(&t->completion)};
+#endif
         int created = call(SYS_THREAD_CREATE, sos2_ptr(&start), 0);
         if (created < 0) result = sos2_errno(created);
         else {

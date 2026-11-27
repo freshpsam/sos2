@@ -98,14 +98,14 @@ arm_user_run:
 
 /* Cooperative kernel-only stack switch. Both callers run in SVC mode with
  * interrupts masked; kernel C is built with general registers only. */
-    .global arm_kernel_switch
-    .type arm_kernel_switch, %function
-arm_kernel_switch:
+    .global kernel_switch
+    .type kernel_switch, %function
+kernel_switch:
     push    {r4-r12, lr}
     str     sp, [r0]
     mov     sp, r1
     pop     {r4-r12, pc}
-    .size arm_kernel_switch, .-arm_kernel_switch
+    .size kernel_switch, .-kernel_switch
 
     .global sos2_boot_setjmp, sos2_boot_longjmp
     .type sos2_boot_setjmp, %function
@@ -123,14 +123,14 @@ sos2_boot_longjmp:
     bx      lr
     .size sos2_boot_longjmp, .-sos2_boot_longjmp
 
-    .global arm_runtime_init, arm_runtime_save, arm_runtime_restore
-    .type arm_runtime_init, %function
-arm_runtime_init:
+    .global user_runtime_init, user_runtime_save, user_runtime_restore
+    .type user_runtime_init, %function
+user_runtime_init:
     mov     r0, #0x40000000
     vmsr    fpexc, r0
     bx      lr
-    .type arm_runtime_save, %function
-arm_runtime_save:
+    .type user_runtime_save, %function
+user_runtime_save:
     vstmia  r0!, {d0-d15}
     vstmia  r0!, {d16-d31}
     vmrs    r1, fpscr
@@ -140,8 +140,8 @@ arm_runtime_save:
     mrc     p15, 0, r1, c13, c0, 3
     str     r1, [r0, #8]
     bx      lr
-    .type arm_runtime_restore, %function
-arm_runtime_restore:
+    .type user_runtime_restore, %function
+user_runtime_restore:
     vldmia  r0!, {d0-d15}
     vldmia  r0!, {d16-d31}
     ldr     r1, [r0]

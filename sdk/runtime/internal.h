@@ -11,9 +11,9 @@
 /* Keep malloc's growing break separate from mmap, stacks and TLS. These are
  * virtual address limits; all allocations still share the process quota. The
  * engine maps everything (programs/browser/web_malloc.c), so mmap's range
- * spans the quota: 2 GiB of the heap window on AArch64, 544 MiB on ARM32,
- * which leaves programs' malloc a 48 MiB break. */
-#ifdef __aarch64__
+ * spans the quota: 2 GiB of the heap window on 64-bit systems, 544 MiB on
+ * ARM32, which leaves programs' malloc a 48 MiB break. */
+#ifdef __LP64__
 #define SOS2_BRK_BASE 0x10c0000000ul
 #else
 #define SOS2_BRK_BASE 0x3c000000u
@@ -45,6 +45,11 @@ struct sos2_lock {
     uint32_t owner, depth, waiters;
 };
 struct sos2_thread *sos2_self(void);
+#ifdef __x86_64__
+/* FS's first base, a TCB without a thread, before anything reads it: x64
+ * code reads the thread pointer through FS, which starts at 0. */
+void sos2_threads_bootstrap(void);
+#endif
 void sos2_threads_init(void);
 void sos2_lock(struct sos2_lock *);
 int sos2_trylock(struct sos2_lock *);

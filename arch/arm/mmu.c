@@ -3,10 +3,10 @@
 #include "kernel_io.h"
 #include "boot_memory.h"
 #include "runtime_files.h"
-#include "arm_machine.h"
+#include "machine.h"
 #include "boot_progress.h"
 #include "arm_cache.h"
-#include "arm_smp.h"
+#include "smp.h"
 
 /* ARMv7-A short descriptors, domain 0 Client, SCTLR.AFE=0, TEX remap on
  * (include/arm_cache.h: the types are those without remap, with shareable
@@ -309,7 +309,7 @@ static bool enable_translation(bool secondary) {
 bool vm_secondary_init(void) { return enable_translation(true); }
 
 bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
-    const struct arm_machine *machine = arm_machine_get();
+    const struct machine *machine = machine_get();
     uintptr_t start = (uintptr_t)__image_start, end = (uintptr_t)__image_end;
     uintptr_t pool_start = (uintptr_t)__page_pool_start, pool_end = (uintptr_t)__page_pool_end;
 #ifdef SOS2_PHONE
@@ -334,7 +334,7 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
     if (dtb < end && start < dtb + d->dtb_size) return false;
     if (dtb < pool_end && pool_start < dtb + d->dtb_size) return false;
     for (unsigned i = 0; i < machine->device_count; ++i) {
-        const struct arm_mapping *r = &machine->devices[i];
+        const struct machine_mapping *r = &machine->devices[i];
         uint64_t finish = (uint64_t)r->start + r->size;
         if ((r->start < end && start < finish) || (r->start < pool_end && pool_start < finish))
             return false;
@@ -373,7 +373,7 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
     if (resource_size && !kernel_map(resources, resource_size, CACHED | KERNEL_RO | XN))
         return false;
     for (unsigned i = 0; i < machine->device_count; ++i) {
-        const struct arm_mapping *r = &machine->devices[i];
+        const struct machine_mapping *r = &machine->devices[i];
         if (!kernel_map(r->start, r->size, DEVICE | KERNEL_RW | XN)) return false;
     }
 #ifdef SOS2_PHONE
@@ -384,9 +384,9 @@ bool vm_init(const struct platform_devices *d, uintptr_t dtb) {
     kernel_unmap((uintptr_t)__abort_guard);
     kernel_unmap((uintptr_t)__undef_guard);
     kernel_unmap((uintptr_t)kernel_io_stack);
-    for (unsigned cpu = 1; cpu < ARM_CPU_MAX; ++cpu)
+    for (unsigned cpu = 1; cpu < CPU_MAX; ++cpu)
         for (unsigned page = 0; page < 8; page += 2)
-            kernel_unmap((uintptr_t)arm_cpu_stacks[cpu - 1] + page * PAGE_SIZE);
+            kernel_unmap((uintptr_t)cpu_stacks[cpu - 1] + page * PAGE_SIZE);
     /* The kernel's own tables came from the pool with the data cache off;
      * like every table from here on, they are cached (the root is in the
      * cached CPU-private section). */

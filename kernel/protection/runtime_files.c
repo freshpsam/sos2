@@ -26,7 +26,7 @@ bool runtime_files_init(struct platform_devices *devices, uintptr_t dtb, uintptr
         devices->initrd_end > SOS2_ARENA_END)
         return false;
 #endif
-#ifdef __aarch64__
+#ifdef __LP64__
     /* A SORZ ramdisk expands into free RAM first; a SORB one is used in place. */
     if (devices->has_initrd_start && devices->has_initrd_end &&
         devices->initrd_end > devices->initrd_start &&

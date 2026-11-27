@@ -17,8 +17,18 @@
  *          259 MiB of the Redmi 2's 320 MiB, 139 MiB of the tablet's 200 MiB,
  *          639 MiB of the Nexus 5's 700 MiB.
  * An update writes the boot image (kernel/protection/system_update.c). SOS2
- * never writes lk2nd or any other partition. */
+ * never writes lk2nd or any other partition. A PC's stick (tools/package_pc.py)
+ * names its two sos2-system, which holds the system image
+ * (include/boot/pc_image.h) that SOS2's UEFI loader starts, and sos2-data,
+ * laid out as cache. */
 enum system_region { SYSTEM_BOOT, SYSTEM_CACHE, SYSTEM_REGIONS };
+#ifdef SOS2_BOARD_PC
+#define SYSTEM_BOOT_NAME  "sos2-system"
+#define SYSTEM_CACHE_NAME "sos2-data"
+#else
+#define SYSTEM_BOOT_NAME  "boot"
+#define SYSTEM_CACHE_NAME "cache"
+#endif
 
 enum {
     SYSTEM_LK2ND_SECTORS = 1024,
@@ -29,6 +39,9 @@ enum {
 #ifdef SOS2_BOARD_NEXUS5
     /* The largest boot image: the Nexus 5's whole 22 MiB boot partition. */
     SYSTEM_BOOT_LIMIT = 22 * 1024 * 1024,
+#elif defined(SOS2_BOARD_PC)
+    /* The largest system image: a PC stick's 64 MiB sos2-system partition. */
+    SYSTEM_BOOT_LIMIT = 64 * 1024 * 1024,
 #else
     /* The largest boot image: what lk2nd leaves of the phone's 32 MiB boot
      * partition, which the tablet's 32 MiB hold too. */
@@ -44,7 +57,7 @@ enum {
 struct system_update_header {
     char magic[8];                   /* "SOS2UPDT" */
     uint32_t version, header_size;   /* 2, 4096 */
-    char board[16];                  /* "redmi2-wt88047", "gta7litewifi", "lge-hammerhead" */
+    char board[16];                  /* "redmi2-wt88047", "gta7litewifi", "lge-hammerhead", "x64" */
     char release[48];                /* 1-47 printable ASCII characters */
     uint32_t boot_offset, boot_size; /* 4096 and a whole number of 2 KiB pages */
     uint8_t boot_sha256[32];

@@ -106,11 +106,11 @@ static inline void arm_instruction_sync(void) {
 /* A translation table entry (arch/arm/mmu.c). */
 typedef uint32_t pte_t;
 
-struct arm_cpu;
+struct cpu_record;
 
 /* This CPU's record (TPIDRPRW). */
-static inline struct arm_cpu *arch_cpu_local(void) {
-    struct arm_cpu *cpu;
+static inline struct cpu_record *arch_cpu_local(void) {
+    struct cpu_record *cpu;
     __asm__ volatile("mrc p15, 0, %0, c13, c0, 4" : "=r"(cpu));
     return cpu;
 }

@@ -38,8 +38,12 @@ OPTIONS = [
 def compile_flags(cxx=False):
     """Flags for Mesa and the shim. arm-none-eabi defaults to short enums,
     which Mesa's enum bitfields do not fit; the GL and EGL interfaces pass no
-    enum types, so programs may mix either size."""
-    return [*CPU, *(['-fno-short-enums'] if arch.SHORT_ENUMS else []), '-DEGL_NO_PLATFORM_SPECIFIC_TYPES',
+    enum types, so programs may mix either size. On x64, Mesa's C++ reads
+    its thread_local GL context (statically initialized) without TLS-init
+    wrappers: their undefined weak calls would resolve to address 0, out of a
+    call's reach from the engine at 0x1010000000."""
+    return [*CPU, *(['-fno-short-enums'] if arch.SHORT_ENUMS else []),
+            *(['-fno-extern-tls-init'] if cxx and arch.X64 else []), '-DEGL_NO_PLATFORM_SPECIFIC_TYPES',
             '-ffunction-sections', '-fdata-sections', *sdk_includes(cxx)]
 
 

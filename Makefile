@@ -3,28 +3,30 @@ PYTHON ?= python3
 .DELETE_ON_ERROR:
 
 # Public interface. Internal build rules use file paths, not command aliases.
-# ARCH=arm64 builds and runs QEMU's AArch64 system (tools/arch.py). The
-# devices have one architecture each, so their targets set ARCH themselves:
+# ARCH=arm64 builds and runs QEMU's AArch64 system, ARCH=x64 its x64
+# microvm (tools/arch.py). The devices have one architecture each, so their
+# targets set ARCH themselves:
 # phone ARM32 (the Redmi 2), tablet arm64 (the Galaxy Tab A7 Lite), nexus5
-# ARM32.
+# ARM32, pc and pc-run x64.
 DEVICE_ARCH := $(sort $(if $(filter phone nexus5,$(MAKECMDGOALS)),arm32) \
-                      $(if $(filter tablet,$(MAKECMDGOALS)),arm64))
+                      $(if $(filter tablet,$(MAKECMDGOALS)),arm64) \
+                      $(if $(filter pc pc-run,$(MAKECMDGOALS)),x64))
 ifneq ($(word 2,$(DEVICE_ARCH)),)
-$(error phone is ARM32 and tablet arm64: run them separately)
+$(error phone and nexus5 are ARM32, tablet arm64 and pc x64: run them separately)
 endif
 ifneq ($(DEVICE_ARCH),)
 ifeq ($(origin ARCH),command line)
 ifneq ($(ARCH),$(DEVICE_ARCH))
-$(error $(filter phone tablet nexus5,$(MAKECMDGOALS)) builds for $(DEVICE_ARCH): leave out ARCH=$(ARCH))
+$(error $(filter phone tablet nexus5 pc pc-run,$(MAKECMDGOALS)) builds for $(DEVICE_ARCH): leave out ARCH=$(ARCH))
 endif
 endif
 ARCH := $(DEVICE_ARCH)
 endif
 ARCH ?= arm32
-ifeq ($(filter $(ARCH),arm32 arm64),)
-$(error ARCH must be arm32 or arm64)
+ifeq ($(filter $(ARCH),arm32 arm64 x64),)
+$(error ARCH must be arm32, arm64 or x64)
 endif
-ENGINE ?= build/native-webkit$(if $(filter arm64,$(ARCH)),-arm64)/native-web.bundle
+ENGINE ?= build/native-webkit$(if $(filter-out arm32,$(ARCH)),-$(ARCH))/native-web.bundle
 STORAGE ?= ram
 JOBS ?= 8
 RUN_ARGS ?=
@@ -41,21 +43,32 @@ NEXUS5_STOCK ?= $(if $(wildcard build/nexus5-stock/wifi-firmware),build/nexus5-s
 NEXUS5_WIFI_FIRMWARE ?= $(if $(NEXUS5_STOCK),$(NEXUS5_STOCK)/wifi-firmware)
 include tools/build.mk
 export SOS2_ARCH := $(ARCH)
-export ARM32_PREFIX ARM64_PREFIX REDMI2_WIFI_FIRMWARE REDMI2_WIFI_PROFILE REDMI2_ADRENO_FIRMWARE REDMI2_JSC GTA7LITE_STOCK GTA7LITE_TOUCH_FIRMWARE GTA7LITE_WIFI_FIRMWARE GTA7LITE_WIFI_PROFILE GTA7LITE_JSC NEXUS5_STOCK NEXUS5_WIFI_FIRMWARE NEXUS5_WIFI_PROFILE NEXUS5_JSC PUBLISH
+export ARM32_PREFIX ARM64_PREFIX X64_PREFIX REDMI2_WIFI_FIRMWARE REDMI2_WIFI_PROFILE REDMI2_ADRENO_FIRMWARE REDMI2_JSC GTA7LITE_STOCK GTA7LITE_TOUCH_FIRMWARE GTA7LITE_WIFI_FIRMWARE GTA7LITE_WIFI_PROFILE GTA7LITE_JSC NEXUS5_STOCK NEXUS5_WIFI_FIRMWARE NEXUS5_WIFI_PROFILE NEXUS5_JSC PUBLISH
 
-.PHONY: all help fetch engine run phone publish tablet nexus5 clean
-all: build/resources-$(ARCH)/kernel.img build/host/mkfs build/host/fs-image
+.PHONY: all help fetch toolchain engine run phone publish tablet nexus5 pc pc-run clean
+# QEMU boots the x64 kernel's ELF itself (PVH); the ARM ones are images.
+all: build/resources-$(ARCH)/kernel.$(if $(filter x64,$(ARCH)),elf,img) build/host/mkfs build/host/fs-image
 
 help:
 	@$(PYTHON) tools/project.py help
 
 # Downloads are explicit; building or packaging never fetches dependencies.
+# ARCH=x64 also fetches its cross toolchain's sources.
 fetch:
+	$(if $(filter x64,$(ARCH)),$(PYTHON) tools/build_x64_toolchain.py fetch)
 	$(PYTHON) tools/build_native_runtime.py fetch
 	$(PYTHON) tools/build_native_render.py fetch
 	$(PYTHON) tools/build_native_webkit.py fetch
 	$(PYTHON) tools/build_native_mesa.py fetch
 	$(PYTHON) tools/adreno_firmware.py fetch build/redmi2-adreno
+
+# The x86_64-elf cross toolchain, into .tools/x86_64-elf: binutils and GCC
+# from the sources make ARCH=x64 fetch brings (tools/build_x64_toolchain.py).
+toolchain:
+ifneq ($(ARCH),x64)
+	$(error make toolchain builds the x64 cross toolchain: run it with ARCH=x64)
+endif
+	$(PYTHON) tools/build_x64_toolchain.py build -j $(JOBS)
 
 engine:
 	$(PYTHON) tools/build_native_runtime.py newlib -j $(JOBS)
@@ -79,6 +92,15 @@ tablet: build/gta7lite-arm64/kernel.img
 # installed system.
 nexus5: build/nexus5-arm32/kernel.img build/nexus5/boot.dtb
 	$(PYTHON) tools/project.py nexus5 --engine "$(ENGINE)"
+
+# A PC, x64: a USB stick image with SOS2's UEFI loader and the system,
+# STORAGE=persistent keeping data on the stick (tools/package_pc.py); pc-run
+# starts it in QEMU's q35 with OVMF.
+pc: build/pc-x64/kernel.elf build/pc-x64/BOOTX64.EFI
+	$(PYTHON) tools/project.py pc --engine "$(ENGINE)" --storage "$(STORAGE)"
+
+pc-run:
+	$(PYTHON) tools/project.py pc-run -- $(RUN_ARGS)
 
 # Publishing is explicit and pushes only what make phone, make tablet and
 # make nexus5 last wrote; PUBLISH=gta7lite (redmi2, nexus5) limits it to that

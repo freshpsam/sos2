@@ -11,6 +11,7 @@
 #include "sha256.h"
 #include "platform.h"
 #include "wire.h"
+#include "machine.h"
 #include <stddef.h>
 #ifdef SOS2_BOARD_REDMI2
 #include "redmi2_power.h"
@@ -18,6 +19,8 @@
 #include "gta7lite.h"
 #elif defined(SOS2_BOARD_NEXUS5)
 #include "nexus5.h"
+#elif defined(SOS2_BOARD_PC)
+#include "pc_image.h"
 #endif
 #ifdef SOS2_DEVICE
 #define SYSTEM_INSTALLS 1 /* QEMU's machines install nothing */
@@ -59,6 +62,8 @@ enum {
 static const char board[16] = "gta7litewifi";
 #elif defined(SOS2_BOARD_NEXUS5)
 static const char board[16] = "lge-hammerhead";
+#elif defined(__x86_64__)
+static const char board[16] = "x64";
 #else
 static const char board[16] = "redmi2-wt88047";
 #endif
@@ -196,7 +201,11 @@ static int32_t failure(const char *text, int32_t error) {
 }
 
 static const char storage_failed[] = "Storage failed; restart to try again";
+#ifdef SOS2_BOARD_PC
+static const char boot_failed[] = "System write failed; write sos2-pc.img to the stick";
+#else
 static const char boot_failed[] = "Boot image write failed; flash flash-boot.img";
+#endif
 
 int32_t system_update_info(struct vm_space *space, user_ptr address, uint32_t size) {
     struct user_update_info info = {.state = update.state,
@@ -320,7 +329,43 @@ static int32_t receive(uint32_t pid, struct vm_space *space, user_ptr address, u
     return 0;
 }
 
-#ifndef SOS2_BOARD_GTA7LITE
+#ifdef SOS2_BOARD_PC
+/* tools/package_pc.py's system image (include/boot/pc_image.h), as SOS2's
+ * UEFI loader starts it: its header whole, the x64 kernel's ELF and the
+ * compressed resources, a SORZ header of their size, in order at 4 KiB
+ * boundaries and ending the image, and a command line that keeps data on
+ * the stick, within the 255 bytes of sos2.* arguments the kernel keeps. */
+static bool pc_image_valid(void) {
+    static struct pc_image_header h;
+    static unsigned char header[PC_IMAGE_HEADER];
+    memcpy(header, update.image[0], sizeof(header));
+    memcpy(&h, header, sizeof(h));
+    memset(header + offsetof(struct pc_image_header, header_crc), 0, sizeof(h.header_crc));
+    uint64_t ramdisk_at = (h.kernel_offset + h.kernel_size + 4095) & ~(uint64_t)4095;
+    if (memcmp(h.magic, PC_IMAGE_MAGIC, 8) || h.version != PC_IMAGE_VERSION ||
+        h.header_size != PC_IMAGE_HEADER || crc32_ieee(header, sizeof(header)) != h.header_crc ||
+        h.kernel_offset != PC_IMAGE_HEADER || h.kernel_size < 64 ||
+        h.kernel_size > SYSTEM_BOOT_LIMIT || h.ramdisk_offset != ramdisk_at ||
+        h.ramdisk_size <= BOOT_BUNDLE_HEADER || h.ramdisk_size > SYSTEM_BOOT_LIMIT ||
+        h.image_size != ((h.ramdisk_offset + h.ramdisk_size + 4095) & ~(uint64_t)4095) ||
+        h.image_size != update.header.boot_size)
+        return false;
+    const unsigned char *kernel = image_at((uint32_t)h.kernel_offset);
+    const unsigned char *resources = image_at((uint32_t)h.ramdisk_offset);
+    if (memcmp(kernel,
+               "\x7f"
+               "ELF\x02\x01\x01",
+               7) ||
+        kernel[18] != 62 || kernel[19] || le32(resources) != BOOT_BUNDLE_MAGIC ||
+        le32(resources + 4) != BOOT_BUNDLE_VERSION || le32(resources + 8) != BOOT_BUNDLE_HEADER ||
+        le32(resources + 12) != h.ramdisk_size - BOOT_BUNDLE_HEADER)
+        return false;
+    const char *end = memchr(h.command_line, 0, sizeof(h.command_line));
+    return end &&
+           (size_t)(end - h.command_line) < sizeof(((struct platform_devices *)0)->bootargs) &&
+           storage_installed(h.command_line, sizeof(h.command_line));
+}
+#elif !defined(SOS2_BOARD_GTA7LITE)
 /* An image the phone's loader (lk2nd on the Redmi 2, the stock bootloader
  * on the Nexus 5) starts as the installed system: the kernel at its address
  * with the DTB after it, the compressed resources as the ramdisk, where the
@@ -455,6 +500,8 @@ static int32_t finish(uint32_t pid) {
             return failure("Boot image does not match its SHA-256", USER_EIO);
 #ifdef SOS2_BOARD_GTA7LITE
         if (!tablet_update_valid()) return failure("Boot image not for this device", USER_EINVAL);
+#elif defined(SOS2_BOARD_PC)
+        if (!pc_image_valid()) return failure("System image not for this PC", USER_EINVAL);
 #else
         if (!boot_image_valid()) return failure("Boot image not for this device", USER_EINVAL);
 #endif
@@ -471,6 +518,8 @@ static int32_t restart(void) {
     say("Did not restart; hold Power for 10 s");
 #elif defined(SOS2_BOARD_NEXUS5)
     nexus5_restart(false);
+#elif defined(__x86_64__)
+    machine_restart();
 #else
     if (psci_method == CPU_BOOT_HVC || psci_method == CPU_BOOT_SMC)
         (void)arm_psci_call(psci_method, 0x84000009 /* PSCI SYSTEM_RESET */, 0, 0);

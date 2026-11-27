@@ -1,5 +1,5 @@
 #include "gta7lite.h"
-#include "arm_smp.h"
+#include "smp.h"
 #include "platform.h"
 
 /* Standby's CPU power-down on MT6765. PSCI's CPU_OFF only parks a CPU in
@@ -42,7 +42,7 @@ void gta7lite_cpu_off(void) { (void)smc(PSCI_CPU_OFF, 0, 0); }
 bool gta7lite_cpu_cut(uint32_t mpidr) {
     int n = linear(mpidr);
     /* CPU 0 boots the system and stays on, so cluster 0 does. */
-    if (n <= 0 || linear(arm_cpus[0].mpidr) != 0) return false;
+    if (n <= 0 || linear(cpu_records[0].mpidr) != 0) return false;
     if (cut & 1u << n) return true;
     if (smc(PSCI_AFFINITY_INFO, mpidr, 0) != AFFINITY_OFF) return false;
     delay_us(SETTLE_US);

@@ -29,10 +29,10 @@ void kernel_io_start(void (*work)(void *), void *argument) {
 void kernel_io_step(void) {
     if (!busy) return;
     active = true;
-    arm_kernel_switch(&caller_sp, worker_sp);
+    kernel_switch(&caller_sp, worker_sp);
     active = false;
 }
 
 void kernel_io_wait(void) {
-    if (active) arm_kernel_switch(&worker_sp, caller_sp);
+    if (active) kernel_switch(&worker_sp, caller_sp);
 }

@@ -1,5 +1,5 @@
-#include "arm_smp.h"
-#include "arm_machine.h"
+#include "smp.h"
+#include "machine.h"
 #include "arm_cache.h"
 #include "boot_progress.h"
 #include "platform.h"
@@ -25,16 +25,16 @@
 #define native_release       nexus5_smp_release
 #endif
 
-struct arm_cpu arm_cpus[ARM_CPU_MAX];
-unsigned char arm_cpu_stacks[ARM_CPU_MAX - 1][ARM_CPU_STACK_BYTES] __attribute__((aligned(4096)));
+struct cpu_record cpu_records[CPU_MAX];
+unsigned char cpu_stacks[CPU_MAX - 1][CPU_STACK_BYTES] __attribute__((aligned(4096)));
 
-struct cpu_boot_record arm_cpu_boot[ARM_CPU_MAX];
+struct cpu_boot_record arm_cpu_boot[CPU_MAX];
 _Static_assert(sizeof(struct cpu_boot_record) == 32, "secondary boot assembly record");
-_Static_assert(offsetof(struct arm_cpu, kernel_sp) == 0, "per-CPU continuation ABI");
+_Static_assert(offsetof(struct cpu_record, kernel_sp) == 0, "per-CPU continuation ABI");
 #ifdef __aarch64__
-unsigned char arm_exception_stacks[ARM_CPU_MAX][ARCH_EXCEPTION_STACK_BYTES]
+unsigned char arm_exception_stacks[CPU_MAX][ARCH_EXCEPTION_STACK_BYTES]
     __attribute__((aligned(4096)));
-_Static_assert(offsetof(struct arm_cpu, exception_sp) == ARCH_CPU_EXCEPTION_SP,
+_Static_assert(offsetof(struct cpu_record, exception_sp) == ARCH_CPU_EXCEPTION_SP,
                "exception stack ABI");
 #define EXCEPTION_SP(cpu) ((uintptr_t)(arm_exception_stacks[cpu] + ARCH_EXCEPTION_STACK_BYTES))
 #endif
@@ -54,32 +54,32 @@ static void publish(uint32_t *p, uint32_t value) {
     __asm__ volatile("dsb sy\n sev" ::: "memory");
 }
 
-unsigned arm_smp_online(void) { return online_mask; }
+unsigned smp_online(void) { return online_mask; }
 
-bool arm_cpu_idle(unsigned cpu) {
-    return cpu < ARM_CPU_MAX && (online_mask & (1u << cpu)) &&
-           load(&arm_cpus[cpu].state) == CPU_IDLE;
+bool cpu_idle(unsigned cpu) {
+    return cpu < CPU_MAX && (online_mask & (1u << cpu)) &&
+           load(&cpu_records[cpu].state) == CPU_IDLE;
 }
 
-bool arm_cpu_failed(unsigned cpu) {
-    return cpu < ARM_CPU_MAX && (online_mask & (1u << cpu)) &&
-           load(&arm_cpus[cpu].state) == CPU_FAILED;
+bool cpu_failed(unsigned cpu) {
+    return cpu < CPU_MAX && (online_mask & (1u << cpu)) &&
+           load(&cpu_records[cpu].state) == CPU_FAILED;
 }
 
-const struct arm_cpu *arm_cpu_result(unsigned cpu) {
-    return cpu < ARM_CPU_MAX && load(&arm_cpus[cpu].state) == CPU_DONE ? &arm_cpus[cpu] : 0;
+const struct cpu_record *cpu_result(unsigned cpu) {
+    return cpu < CPU_MAX && load(&cpu_records[cpu].state) == CPU_DONE ? &cpu_records[cpu] : 0;
 }
 
-void arm_cpu_release(unsigned cpu) {
-    if (!arm_cpu_result(cpu)) panic("CPU result released before completion");
-    publish(&arm_cpus[cpu].state, CPU_IDLE);
+void cpu_release(unsigned cpu) {
+    if (!cpu_result(cpu)) panic("CPU result released before completion");
+    publish(&cpu_records[cpu].state, CPU_IDLE);
 }
 /* Each CPU's last user space and the mapping epoch it ran at. */
-static const struct vm_space *last_space[ARM_CPU_MAX];
-static uint64_t last_epoch[ARM_CPU_MAX];
+static const struct vm_space *last_space[CPU_MAX];
+static uint64_t last_epoch[CPU_MAX];
 
-static void execute(struct arm_cpu *cpu) {
-    unsigned id = (unsigned)(cpu - arm_cpus);
+static void execute(struct cpu_record *cpu) {
+    unsigned id = (unsigned)(cpu - cpu_records);
     uint64_t epoch = vm_epoch();
     /* Code can be replaced after a Close, or made executable by mprotect on
      * another core (both advance the epoch). Re-entering the same space at the
@@ -88,8 +88,8 @@ static void execute(struct arm_cpu *cpu) {
     bool flush = cpu->space != last_space[id] || epoch != last_epoch[id];
     vm_enter(cpu->space, flush);
     if (flush) arm_instruction_sync();
-    arm_runtime_restore(&cpu->runtime);
-    arm_timer_arm_us(cpu->budget);
+    user_runtime_restore(&cpu->runtime);
+    timer_arm_us(cpu->budget);
     uint64_t start = time_us();
     cpu->active = true;
     arm_user_run(&cpu->context);
@@ -103,11 +103,11 @@ static void execute(struct arm_cpu *cpu) {
     publish(&cpu->state, CPU_DONE);
 }
 
-void arm_cpu_submit(unsigned id, const struct vm_space *space, const struct arm_context *context,
-                    const struct arm_runtime_context *runtime, unsigned budget) {
-    if (!arm_cpu_idle(id) || !space || !space->root || !budget || budget > 5000)
+void cpu_submit(unsigned id, const struct vm_space *space, const struct user_context *context,
+                const struct user_runtime *runtime, unsigned budget) {
+    if (!cpu_idle(id) || !space || !space->root || !budget || budget > 5000)
         panic("invalid CPU dispatch");
-    struct arm_cpu *cpu = &arm_cpus[id];
+    struct cpu_record *cpu = &cpu_records[id];
     cpu->space = space;
     cpu->context = *context;
     cpu->runtime = *runtime;
@@ -129,7 +129,7 @@ static char *hex(char *out, uint32_t value) {
  * vector numbers), the trapped instruction, the caller's return address when
  * it came from SVC mode, the mode, and for an abort the faulting address and
  * the fault status, which locate it in kernel.elf. */
-static const char *kernel_trap_text(const struct arm_trap *trap) {
+static const char *kernel_trap_text(const struct cpu_trap *trap) {
     static const char *const kinds[] = {
         "reset", "undefined instruction", "SVC", "prefetch abort", "data abort", "reserved", "IRQ",
         "FIQ"};
@@ -153,8 +153,8 @@ static const char *kernel_trap_text(const struct arm_trap *trap) {
 }
 #endif
 
-bool arm_trap_dispatch(struct arm_trap *trap) {
-    struct arm_cpu *cpu = arch_cpu_local();
+bool arm_trap_dispatch(struct cpu_trap *trap) {
+    struct cpu_record *cpu = arch_cpu_local();
     if (!cpu || !cpu->active || !arch_trap_from_user(trap)) {
         if (cpu && cpu->index) {
             cpu->trap = *trap;
@@ -177,8 +177,8 @@ bool arm_trap_dispatch(struct arm_trap *trap) {
         return true;
     }
 #endif
-    arm_timer_stop(trap->vector == 6);
-    arm_runtime_save(&cpu->runtime);
+    timer_stop(trap->vector == 6);
+    user_runtime_save(&cpu->runtime);
     cpu->trap = *trap;
     return false;
 }
@@ -196,9 +196,9 @@ enum { SLEEP_ATTEMPTS = 8, WAKE_US = 200000, WAKE_RETRY_US = 10000 };
 static uint32_t sleep_request;
 static unsigned sleepers;
 
-static void cpu_sleep(struct arm_cpu *cpu) {
+static void cpu_sleep(struct cpu_record *cpu) {
     publish(&cpu->state, CPU_ASLEEP);
-    arm_timer_stop(false);
+    timer_stop(false);
 #ifdef SOS2_BOARD_REDMI2
     for (unsigned i = 0; i < SLEEP_ATTEMPTS && load(&sleep_request); ++i)
         redmi2_cpu_power_off(cpu->index);
@@ -215,8 +215,8 @@ void arm_smp_sleep(void) {
 
 static unsigned in_state(uint32_t a, uint32_t b) {
     unsigned mask = 0;
-    for (unsigned i = 1; i < ARM_CPU_MAX; ++i) {
-        uint32_t state = load(&arm_cpus[i].state);
+    for (unsigned i = 1; i < CPU_MAX; ++i) {
+        uint32_t state = load(&cpu_records[i].state);
         if ((online_mask & (1u << i)) && (state == a || state == b)) mask |= 1u << i;
     }
     return mask;
@@ -226,8 +226,8 @@ static unsigned in_state(uint32_t a, uint32_t b) {
 void arm_smp_standby_poll(void) {
     if (!load(&sleep_request)) return;
     unsigned asleep = in_state(CPU_ASLEEP, CPU_ASLEEP) & sleepers;
-    for (unsigned i = 1; i < ARM_CPU_MAX; ++i)
-        if (asleep & (1u << i)) (void)gta7lite_cpu_cut(arm_cpus[i].mpidr);
+    for (unsigned i = 1; i < CPU_MAX; ++i)
+        if (asleep & (1u << i)) (void)gta7lite_cpu_cut(cpu_records[i].mpidr);
 }
 #endif
 
@@ -256,15 +256,15 @@ void arm_smp_wake(void) {
 #else
         /* A CPU the firmware refused to turn off wakes from its wait by
          * itself; one still on its way off is restarted once it is off. */
-        for (unsigned i = 1; i < ARM_CPU_MAX; ++i)
+        for (unsigned i = 1; i < CPU_MAX; ++i)
             if ((asleep & ~restarted & (1u << i)) &&
-                gta7lite_cpu_on(arm_cpus[i].mpidr, (uintptr_t)arm_secondary_entry))
+                gta7lite_cpu_on(cpu_records[i].mpidr, (uintptr_t)arm_secondary_entry))
                 restarted |= 1u << i;
 #endif
     }
 }
 #endif
-_Noreturn void arm_cpu_secondary(struct arm_cpu *cpu) {
+_Noreturn void arm_cpu_secondary(struct cpu_record *cpu) {
     /* Also the warm entry after a standby power-down. A failed restart then
      * leaves the CPU asleep, out of service, rather than failing the system. */
     uint32_t failed = cpu->mmu_enabled ? CPU_ASLEEP : CPU_FAILED;
@@ -281,13 +281,13 @@ _Noreturn void arm_cpu_secondary(struct arm_cpu *cpu) {
         goto park;
     }
     cpu->mmu_enabled = true;
-    if (!arm_timer_secondary_init()) {
+    if (!timer_secondary_init()) {
         publish(&cpu->state, failed);
         goto park;
     }
     /* TLBs, caches and branch history start empty after power-up. */
     last_space[cpu->index] = 0;
-    arm_runtime_init();
+    user_runtime_init();
     publish(&cpu->state, CPU_IDLE);
     for (;;) {
         uint32_t state = load(&cpu->state);
@@ -302,32 +302,32 @@ park:
     for (;;) __asm__ volatile("wfe");
 }
 
-void arm_smp_init(const struct platform_devices *devices) {
+void smp_init(const struct platform_devices *devices) {
     uint32_t boot = arch_cpu_affinity();
-    arm_cpus[0] =
-        (struct arm_cpu){.index = 0, .mpidr = boot, .state = CPU_IDLE, .mmu_enabled = true};
+    cpu_records[0] =
+        (struct cpu_record){.index = 0, .mpidr = boot, .state = CPU_IDLE, .mmu_enabled = true};
 #ifdef __aarch64__
-    arm_cpus[0].exception_sp = EXCEPTION_SP(0);
+    cpu_records[0].exception_sp = EXCEPTION_SP(0);
 #endif
-    for (unsigned i = 0; i < ARM_CPU_MAX; ++i) arm_cpu_boot[i].mpidr = UINT32_MAX;
+    for (unsigned i = 0; i < CPU_MAX; ++i) arm_cpu_boot[i].mpidr = UINT32_MAX;
     unsigned next = 1;
     unsigned count = devices->psci_method && devices->psci_cpu_on ? devices->cpu_count : 0;
 #ifdef native_prepare
     bool native = !count;
     if (native) count = native_prepare(boot);
 #endif
-    for (unsigned i = 0; i < count && next < ARM_CPU_MAX; ++i) {
+    for (unsigned i = 0; i < count && next < CPU_MAX; ++i) {
         uint32_t id = devices->cpu_mpidr[i];
 #ifdef native_prepare
         if (native) id = i;
 #endif
         if (id == boot) continue;
-        struct arm_cpu *cpu = &arm_cpus[next];
-        *cpu = (struct arm_cpu){.index = next, .mpidr = id, .state = CPU_STARTING};
+        struct cpu_record *cpu = &cpu_records[next];
+        *cpu = (struct cpu_record){.index = next, .mpidr = id, .state = CPU_STARTING};
 #ifdef __aarch64__
         cpu->exception_sp = EXCEPTION_SP(next);
 #endif
-        uintptr_t stack = (uintptr_t)arm_cpu_stacks[next - 1];
+        uintptr_t stack = (uintptr_t)cpu_stacks[next - 1];
         arm_cpu_boot[next] = CPU_BOOT_RECORD(id, cpu, stack);
         barrier();
         int32_t result;
