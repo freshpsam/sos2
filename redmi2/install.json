@@ -1,0 +1,21 @@
+{
+  "release": "2026-11-28 08:27 26b33c8+",
+  "board": "redmi2-wt88047",
+  "boot_cmdline": "lk2nd.pass-simplefb=autorefresh,relocate sos2.storage=installed",
+  "wifi_firmware": true,
+  "wifi_profile": false,
+  "files": {
+    "flash-boot.img": {
+      "bytes": 23287808,
+      "sha256": "87d94557eaee8298166627df1a741c24ac19fbee03c561e3197df0df5772e114"
+    },
+    "sos2-redmi2.update": {
+      "bytes": 23291904,
+      "sha256": "3ad4820b9e024cca0fcf9aa4d962206f68a99b7a9a858dc3fae6728b19cdc47d"
+    }
+  },
+  "flash": [
+    "fastboot flash boot flash-boot.img",
+    "fastboot reboot"
+  ]
+}

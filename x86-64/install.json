@@ -1,0 +1,21 @@
+{
+  "release": "2026-11-27 17:36 4133c58+",
+  "board": "x86-64",
+  "wifi_firmware": false,
+  "wifi_profile": false,
+  "files": {
+    "sos2-pc.img.xz": {
+      "bytes": 29469948,
+      "sha256": "1e1ad64af14b49b9abc86b576208cc90465f0e1859a20d76090e323532588367"
+    },
+    "sos2-x86-64.update": {
+      "bytes": 30535680,
+      "sha256": "686f2d7db566f319cd5922d335e85a0abf9854ce2f75bc85601b2643069fc099"
+    }
+  },
+  "first_install": "a first install writes sos2-pc.img, uncompressed, to a USB stick of exactly 322 MiB (everything on it is lost) and starts the PC from it, Secure Boot off; so far it runs only on QEMU's emulated PC (make pc-run):",
+  "flash": [
+    "xz -dk sos2-pc.img.xz",
+    "(then write sos2-pc.img to the stick with a disk imaging tool)"
+  ]
+}
